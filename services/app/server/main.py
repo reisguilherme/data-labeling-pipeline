@@ -70,7 +70,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
-install_request_observability(app)
 
 # Só existe para o `npm run dev` (porta 5173) falar com o backend em dev.
 # Em produção o SPA é servido por este mesmo processo, ou seja, mesma origem —
@@ -82,7 +81,9 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Server-Timing"],
 )
+install_request_observability(app)
 
 app.include_router(objects.router)
 app.include_router(objects.user_router)

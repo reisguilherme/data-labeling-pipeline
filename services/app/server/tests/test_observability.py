@@ -9,9 +9,11 @@ import unittest
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 from starlette.datastructures import Headers
+from starlette.responses import StreamingResponse
 
 from server.observability import install_request_observability
 
@@ -21,16 +23,19 @@ class _Response:
     status_code: int
     headers: Headers
     body: bytes
+    exception: Exception | None = None
 
     def json(self) -> Any:
         return json.loads(self.body)
 
 
-async def _asgi_get(
+async def _asgi_request(
     app: FastAPI,
     path: str,
     *,
+    method: str = "GET",
     headers: dict[str, str] | None = None,
+    raise_server_exceptions: bool = True,
 ) -> _Response:
     request_messages = [
         {"type": "http.request", "body": b"", "more_body": False},
@@ -40,7 +45,8 @@ async def _asgi_get(
     async def receive() -> dict[str, Any]:
         if request_messages:
             return request_messages.pop(0)
-        return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     async def send(message: dict[str, Any]) -> None:
         response_messages.append(message)
@@ -49,32 +55,38 @@ async def _asgi_get(
         (name.lower().encode("ascii"), value.encode("ascii"))
         for name, value in (headers or {}).items()
     ]
-    await app(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.3"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": path,
-            "raw_path": path.encode("ascii"),
-            "query_string": b"",
-            "root_path": "",
-            "headers": raw_headers,
-            "client": ("testclient", 50000),
-            "server": ("testserver", 80),
-            "state": {},
-        },
-        receive,
-        send,
-    )
+    caught: Exception | None = None
+    try:
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("ascii"),
+                "query_string": b"",
+                "root_path": "",
+                "headers": raw_headers,
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+    except Exception as exc:  # ServerErrorMiddleware sends 500, then re-raises.
+        if raise_server_exceptions:
+            raise
+        caught = exc
     start = next(message for message in response_messages if message["type"] == "http.response.start")
     body = b"".join(
         message.get("body", b"")
         for message in response_messages
         if message["type"] == "http.response.body"
     )
-    return _Response(start["status"], Headers(raw=start["headers"]), body)
+    return _Response(start["status"], Headers(raw=start["headers"]), body, caught)
 
 
 class RequestObservabilityTests(unittest.TestCase):
@@ -99,6 +111,20 @@ class RequestObservabilityTests(unittest.TestCase):
         async def handled_error() -> None:
             raise HTTPException(status_code=418, detail="expected")
 
+        @app.get("/runtime-error/{item_id}")
+        async def runtime_error(item_id: str) -> None:
+            await asyncio.sleep(0.01)
+            raise RuntimeError("expected server failure")
+
+        @app.get("/stream/{filename}")
+        async def stream(filename: str) -> StreamingResponse:
+            async def body():
+                yield b"first"
+                await asyncio.sleep(0.02)
+                yield b"second"
+
+            return StreamingResponse(body())
+
         @app.get("/api/health")
         async def health() -> dict[str, bool]:
             return {"ok": True}
@@ -106,7 +132,7 @@ class RequestObservabilityTests(unittest.TestCase):
         return app
 
     def test_generates_uuid_and_parseable_non_negative_server_timing(self) -> None:
-        response = asyncio.run(_asgi_get(self._app(), "/ok"))
+        response = asyncio.run(_asgi_request(self._app(), "/ok"))
 
         request_id = uuid.UUID(response.headers["X-Request-ID"])
         self.assertEqual(request_id.version, 4)
@@ -121,19 +147,21 @@ class RequestObservabilityTests(unittest.TestCase):
         app = self._app()
         safe_id = "client.Request_01-abc"
 
-        accepted = asyncio.run(_asgi_get(app, "/ok", headers={"X-Request-ID": safe_id}))
+        accepted = asyncio.run(
+            _asgi_request(app, "/ok", headers={"X-Request-ID": safe_id})
+        )
         self.assertEqual(accepted.headers["X-Request-ID"], safe_id)
 
         for unsafe_id in ("contains space", "contains/slash", "x" * 129, ""):
             with self.subTest(unsafe_id=unsafe_id):
                 response = asyncio.run(
-                    _asgi_get(app, "/ok", headers={"X-Request-ID": unsafe_id})
+                    _asgi_request(app, "/ok", headers={"X-Request-ID": unsafe_id})
                 )
                 self.assertNotEqual(response.headers["X-Request-ID"], unsafe_id)
                 self.assertEqual(uuid.UUID(response.headers["X-Request-ID"]).version, 4)
 
     def test_handled_errors_receive_observability_headers(self) -> None:
-        response = asyncio.run(_asgi_get(self._app(), "/handled-error"))
+        response = asyncio.run(_asgi_request(self._app(), "/handled-error"))
 
         self.assertEqual(response.status_code, 418)
         self.assertEqual(uuid.UUID(response.headers["X-Request-ID"]).version, 4)
@@ -143,9 +171,11 @@ class RequestObservabilityTests(unittest.TestCase):
         app = self._app(slow_request_ms=0)
 
         with self.assertLogs("server.observability", level="WARNING") as captured:
-            item_response = asyncio.run(_asgi_get(app, "/items/private-item-8675309"))
+            item_response = asyncio.run(
+                _asgi_request(app, "/items/private-item-8675309")
+            )
             file_response = asyncio.run(
-                _asgi_get(app, "/files/customer-recording-2026.mp4")
+                _asgi_request(app, "/files/customer-recording-2026.mp4")
             )
 
         self.assertEqual(item_response.status_code, 200)
@@ -160,7 +190,9 @@ class RequestObservabilityTests(unittest.TestCase):
         raw_path = "/private/customer-recording-2026.mp4"
 
         with self.assertLogs("server.observability", level="WARNING") as captured:
-            response = asyncio.run(_asgi_get(self._app(slow_request_ms=0), raw_path))
+            response = asyncio.run(
+                _asgi_request(self._app(slow_request_ms=0), raw_path)
+            )
 
         self.assertEqual(response.status_code, 404)
         messages = "\n".join(captured.output)
@@ -169,11 +201,98 @@ class RequestObservabilityTests(unittest.TestCase):
         self.assertNotIn("customer-recording-2026.mp4", messages)
 
     def test_health_remains_dependency_free_and_observable(self) -> None:
-        response = asyncio.run(_asgi_get(self._app(), "/api/health"))
+        response = asyncio.run(_asgi_request(self._app(), "/api/health"))
 
         self.assertEqual(response.json(), {"ok": True})
         self.assertIn("X-Request-ID", response.headers)
         self.assertIn("Server-Timing", response.headers)
+
+    def test_slow_runtime_error_gets_headers_and_propagates_without_path_leak(self) -> None:
+        raw_id = "private-object-8675309"
+        app = self._app(slow_request_ms=0)
+
+        with self.assertLogs("server.observability", level="WARNING") as captured:
+            response = asyncio.run(
+                _asgi_request(
+                    app,
+                    f"/runtime-error/{raw_id}",
+                    raise_server_exceptions=False,
+                )
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIsInstance(response.exception, RuntimeError)
+        self.assertIn("X-Request-ID", response.headers)
+        self.assertRegex(response.headers["Server-Timing"], r"^app;dur=\d+(?:\.\d+)?$")
+        messages = "\n".join(captured.output)
+        self.assertIn("route=/runtime-error/{item_id}", messages)
+        self.assertNotIn(raw_id, messages)
+
+    def test_streaming_header_measures_response_start_and_log_measures_full_body(self) -> None:
+        filename = "private-recording-2026.mp4"
+        app = self._app(slow_request_ms=0)
+
+        with self.assertLogs("server.observability", level="WARNING") as captured:
+            response = asyncio.run(_asgi_request(app, f"/stream/{filename}"))
+
+        header_ms = float(response.headers["Server-Timing"].removeprefix("app;dur="))
+        messages = "\n".join(captured.output)
+        start_match = re.search(r"response_start_ms=(\d+(?:\.\d+)?)", messages)
+        total_match = re.search(r"duration_ms=(\d+(?:\.\d+)?)", messages)
+        self.assertEqual(response.body, b"firstsecond")
+        self.assertIsNotNone(start_match)
+        self.assertIsNotNone(total_match)
+        self.assertAlmostEqual(header_ms, float(start_match.group(1)), places=3)
+        self.assertGreater(float(total_match.group(1)), header_ms + 10.0)
+        self.assertIn("route=/stream/{filename}", messages)
+        self.assertNotIn(filename, messages)
+
+    def test_observability_wraps_cors_preflight_and_exposes_headers(self) -> None:
+        from server import main
+
+        origin_headers = {
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        }
+        preflight = asyncio.run(
+            _asgi_request(
+                main.app,
+                "/api/health",
+                method="OPTIONS",
+                headers=origin_headers,
+            )
+        )
+        actual = asyncio.run(
+            _asgi_request(
+                main.app,
+                "/api/health",
+                headers={"Origin": "http://localhost:5173"},
+            )
+        )
+
+        self.assertEqual(preflight.status_code, 200)
+        self.assertIn("X-Request-ID", preflight.headers)
+        self.assertIn("Server-Timing", preflight.headers)
+        self.assertEqual(
+            actual.headers["Access-Control-Expose-Headers"],
+            "X-Request-ID, Server-Timing",
+        )
+
+    def test_real_application_health_has_headers_without_using_dependencies(self) -> None:
+        from server import main
+
+        with (
+            patch.object(main.ffmpeg, "resolve") as resolve_ffmpeg,
+            patch.object(main.workspace, "load") as load_workspace,
+        ):
+            response = asyncio.run(_asgi_request(main.app, "/api/health"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["ok"], True)
+        self.assertIn("X-Request-ID", response.headers)
+        self.assertIn("Server-Timing", response.headers)
+        resolve_ffmpeg.assert_not_called()
+        load_workspace.assert_not_called()
 
 
 if __name__ == "__main__":
