@@ -192,6 +192,22 @@ python -m venv .venv
 
 No Linux, use `./scripts/verify.sh` depois de criar o venv da API.
 
+### Benchmark da biblioteca
+
+Com a versao desta branch ja construida e implantada no host que possui o
+acervo de referencia, execute o benchmark somente-leitura da listagem:
+
+```powershell
+python scripts/benchmark-library.py --base-url http://127.0.0.1:8000 --object-id boom --samples 20
+```
+
+O script faz um `GET` de aquecimento e depois mede 20 `GETs` sequenciais, com
+timeout finito. Ele informa apenas quantidade de amostras, p50, p95, minimo e
+maximo; nao imprime nomes de videos, IDs de objeto nem credenciais. O alvo de
+aceite de referencia e p95 aquecido `<= 500 ms` para 416 videos. Esse valor deve
+ser medido no host implantado depois do build desta branch; testes unitarios nao
+demonstram nem substituem essa medicao operacional.
+
 Antes de qualquer deploy, revogue tokens HF/GCS/worker que ja tenham aparecido
 em `.env`, logs ou historico e gere novos. Apagar o valor local nao revoga a
 credencial no provedor.
