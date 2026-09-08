@@ -25,6 +25,7 @@ class _RequestObservation:
     started: float
     slow_request_ms: float
     response_start_ms: float | None = None
+    status_code: int = 500
     logged: bool = False
 
 
@@ -39,6 +40,11 @@ def _elapsed_ms(observation: _RequestObservation) -> float:
     return max(0.0, (time.perf_counter() - observation.started) * 1000.0)
 
 
+def _route_path(scope: Scope) -> str:
+    route = scope.get("route")
+    return getattr(route, "path", None) or "unmatched"
+
+
 def _warn_if_slow(
     scope: Scope,
     observation: _RequestObservation,
@@ -47,8 +53,6 @@ def _warn_if_slow(
 ) -> None:
     if observation.logged or duration_ms <= observation.slow_request_ms:
         return
-    route = scope.get("route")
-    route_path = getattr(route, "path", None) or "unmatched"
     response_start_ms = observation.response_start_ms
     if response_start_ms is None:
         response_start_ms = duration_ms
@@ -57,10 +61,36 @@ def _warn_if_slow(
         "response_start_ms=%.3f duration_ms=%.3f",
         observation.request_id,
         scope["method"],
-        route_path,
+        _route_path(scope),
         status_code,
         response_start_ms,
         duration_ms,
+    )
+    observation.logged = True
+
+
+def _warn_stream_error(
+    scope: Scope,
+    observation: _RequestObservation,
+    exception: Exception,
+) -> None:
+    if observation.logged:
+        return
+    duration_ms = _elapsed_ms(observation)
+    response_start_ms = observation.response_start_ms
+    if response_start_ms is None:
+        response_start_ms = duration_ms
+    log.warning(
+        "request_id=%s method=%s route=%s status=%d "
+        "response_start_ms=%.3f duration_ms=%.3f "
+        "stream_error=true exception=%s",
+        observation.request_id,
+        scope["method"],
+        _route_path(scope),
+        observation.status_code,
+        response_start_ms,
+        duration_ms,
+        type(exception).__name__,
     )
     observation.logged = True
 
@@ -83,12 +113,10 @@ class _RequestObservabilityMiddleware:
         state = scope.setdefault("state", {})
         state["request_id"] = observation.request_id
         state[_OBSERVATION_STATE_KEY] = observation
-        status_code = 500
 
         async def send_observed(message: Message) -> None:
-            nonlocal status_code
             if message["type"] == "http.response.start":
-                status_code = message["status"]
+                observation.status_code = message["status"]
                 observation.response_start_ms = _elapsed_ms(observation)
                 headers = MutableHeaders(scope=message)
                 headers["X-Request-ID"] = observation.request_id
@@ -105,11 +133,42 @@ class _RequestObservabilityMiddleware:
                 _warn_if_slow(
                     scope,
                     observation,
-                    status_code,
+                    observation.status_code,
                     _elapsed_ms(observation),
                 )
 
         await self.app(scope, receive, send_observed)
+
+
+class _ObservedServerErrorResponse(PlainTextResponse):
+    def __init__(self, scope: Scope, observation: _RequestObservation) -> None:
+        super().__init__("Internal Server Error", status_code=500)
+        self._scope = scope
+        self._observation = observation
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        observation = self._observation
+        observation.status_code = self.status_code
+        observation.response_start_ms = _elapsed_ms(observation)
+        self.headers["X-Request-ID"] = observation.request_id
+        self.headers["Server-Timing"] = (
+            f"app;dur={observation.response_start_ms:.3f}"
+        )
+
+        async def send_observed(message: Message) -> None:
+            await send(message)
+            if (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                _warn_if_slow(
+                    self._scope,
+                    observation,
+                    self.status_code,
+                    _elapsed_ms(observation),
+                )
+
+        await super().__call__(scope, receive, send_observed)
 
 
 def install_request_observability(
@@ -129,23 +188,16 @@ def install_request_observability(
     )
 
     async def unexpected_error(request: Request, exc: Exception) -> PlainTextResponse:
-        observation = request.scope["state"].get(_OBSERVATION_STATE_KEY)
+        observation = request.scope.get("state", {}).get(_OBSERVATION_STATE_KEY)
         if observation is None:
             observation = _RequestObservation(
                 request_id=_request_id(request.headers),
                 started=time.perf_counter(),
                 slow_request_ms=slow_request_ms,
             )
-        duration_ms = _elapsed_ms(observation)
-        observation.response_start_ms = duration_ms
-        _warn_if_slow(request.scope, observation, 500, duration_ms)
-        return PlainTextResponse(
-            "Internal Server Error",
-            status_code=500,
-            headers={
-                "X-Request-ID": observation.request_id,
-                "Server-Timing": f"app;dur={duration_ms:.3f}",
-            },
-        )
+        if observation.response_start_ms is not None:
+            _warn_stream_error(request.scope, observation, exc)
+            return PlainTextResponse("Internal Server Error", status_code=500)
+        return _ObservedServerErrorResponse(request.scope, observation)
 
     app.add_exception_handler(Exception, unexpected_error)

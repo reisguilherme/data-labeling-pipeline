@@ -36,6 +36,7 @@ async def _asgi_request(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     raise_server_exceptions: bool = True,
+    response_body_send_delay_ms: float = 0,
 ) -> _Response:
     request_messages = [
         {"type": "http.request", "body": b"", "more_body": False},
@@ -49,6 +50,8 @@ async def _asgi_request(
         raise AssertionError("unreachable")
 
     async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body" and response_body_send_delay_ms:
+            await asyncio.sleep(response_body_send_delay_ms / 1000.0)
         response_messages.append(message)
 
     raw_headers = [
@@ -122,6 +125,15 @@ class RequestObservabilityTests(unittest.TestCase):
                 yield b"first"
                 await asyncio.sleep(0.02)
                 yield b"second"
+
+            return StreamingResponse(body())
+
+        @app.get("/broken-stream/{filename}")
+        async def broken_stream(filename: str) -> StreamingResponse:
+            async def body():
+                yield b"first"
+                await asyncio.sleep(0.01)
+                raise RuntimeError("expected streaming failure")
 
             return StreamingResponse(body())
 
@@ -246,6 +258,60 @@ class RequestObservabilityTests(unittest.TestCase):
         self.assertGreater(float(total_match.group(1)), header_ms + 10.0)
         self.assertIn("route=/stream/{filename}", messages)
         self.assertNotIn(filename, messages)
+
+    def test_streaming_error_preserves_started_status_and_timing_once(self) -> None:
+        filename = "private-recording-2026.mp4"
+        app = self._app(slow_request_ms=1000)
+
+        with self.assertLogs("server.observability", level="WARNING") as captured:
+            response = asyncio.run(
+                _asgi_request(
+                    app,
+                    f"/broken-stream/{filename}",
+                    raise_server_exceptions=False,
+                )
+            )
+
+        header_ms = float(response.headers["Server-Timing"].removeprefix("app;dur="))
+        message = "\n".join(captured.output)
+        start_match = re.search(r"response_start_ms=(\d+(?:\.\d+)?)", message)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"first")
+        self.assertIsInstance(response.exception, RuntimeError)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("status=200", message)
+        self.assertIn("stream_error=true", message)
+        self.assertIn("exception=RuntimeError", message)
+        self.assertNotIn("status=500", message)
+        self.assertIsNotNone(start_match)
+        self.assertAlmostEqual(header_ms, float(start_match.group(1)), places=3)
+        self.assertIn("route=/broken-stream/{filename}", message)
+        self.assertNotIn(filename, message)
+
+    def test_server_error_warning_includes_sending_its_body_once(self) -> None:
+        app = self._app(slow_request_ms=15)
+
+        with self.assertLogs("server.observability", level="WARNING") as captured:
+            response = asyncio.run(
+                _asgi_request(
+                    app,
+                    "/runtime-error/private-object-8675309",
+                    raise_server_exceptions=False,
+                    response_body_send_delay_ms=20,
+                )
+            )
+
+        header_ms = float(response.headers["Server-Timing"].removeprefix("app;dur="))
+        message = "\n".join(captured.output)
+        total_match = re.search(r"duration_ms=(\d+(?:\.\d+)?)", message)
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.body, b"Internal Server Error")
+        self.assertIsInstance(response.exception, RuntimeError)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIsNotNone(total_match)
+        self.assertGreater(float(total_match.group(1)), header_ms + 15.0)
+        self.assertIn("status=500", message)
+        self.assertNotIn("stream_error=true", message)
 
     def test_observability_wraps_cors_preflight_and_exposes_headers(self) -> None:
         from server import main
