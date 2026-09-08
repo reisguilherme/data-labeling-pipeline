@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import unittest
+import hashlib
 import json
 import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,6 +56,8 @@ class MulticlassDatasetTests(unittest.TestCase):
             (segment / "prompt.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": 1,
+                        "frame_count": 1,
                         "image_width": 4,
                         "image_height": 4,
                         "objects": [{"obj_id": 1, "label": label, "normalized": [0, 0, 1, 1]}],
@@ -64,9 +67,27 @@ class MulticlassDatasetTests(unittest.TestCase):
             )
             mask = Image.new("1", (4, 4), 0)
             mask.putpixel((1, 1), 1)
-            (masks / "000000.png").write_bytes(encode_binary_png(mask))
+            mask_payload = encode_binary_png(mask)
+            (masks / "000000.png").write_bytes(mask_payload)
             (out / "run.json").write_text(
-                json.dumps({"status": "done", "frame_count": 1, "frames_written": 1}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "done",
+                        "frame_count": 1,
+                        "frames_written": 1,
+                        "objects": [{"obj_id": 1}],
+                        "artifacts": {
+                            "format": "png-1bit-v1",
+                            "files": 1,
+                            "checksums": {
+                                "masks/1/000000.png": hashlib.sha256(
+                                    mask_payload
+                                ).hexdigest()
+                            },
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             (out / "mask_review.json").write_text(

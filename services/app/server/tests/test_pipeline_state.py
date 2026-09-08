@@ -7,6 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
+from pipeline_core.masks import encode_binary_png
+
 
 class PipelineStateTests(unittest.TestCase):
     def test_only_fully_reviewed_valid_sam3_video_is_completed(self) -> None:
@@ -91,7 +95,10 @@ class PipelineStateTests(unittest.TestCase):
             "export": {"root": str(root / "video"), "segments": ["seg_00"]},
         }
 
-        with patch.object(
+        with patch(
+            "server.pipeline_state._ExpectedMask",
+            side_effect=AssertionError("mask plan on fast path"),
+        ), patch.object(
             Path, "read_bytes", side_effect=AssertionError("PNG read on fast path")
         ):
             snapshot = inspect_pipeline_entry(
@@ -209,6 +216,197 @@ class PipelineStateTests(unittest.TestCase):
         self.assertEqual((snapshot.stage, snapshot.status), ("review", "audit_required"))
         self.assertEqual(snapshot.validation_status, "audit_required")
         self.assertFalse(snapshot.artifacts_valid)
+
+    def test_missing_legacy_manifest_fields_require_audit_and_preserve_counts(self) -> None:
+        from server.pipeline_state import inspect_pipeline_entry
+
+        prompt = {
+            "schema_version": 1,
+            "frame_count": 2,
+            "image_width": 8,
+            "image_height": 6,
+            "objects": [{"obj_id": 1, "label": "boom"}],
+        }
+        run = {
+            "schema_version": 1,
+            "status": "done",
+            "frame_count": 2,
+            "frames_written": 2,
+            "objects": [{"obj_id": 1}],
+            "artifacts": {
+                "format": "png-1bit-v1",
+                "files": 2,
+                "checksums": {
+                    "masks/1/000000.png": "a" * 64,
+                    "masks/1/000001.png": "b" * 64,
+                },
+            },
+        }
+        omissions = {
+            "run schema": lambda p, r: r.pop("schema_version"),
+            "prompt schema": lambda p, r: p.pop("schema_version"),
+            "frames written": lambda p, r: r.pop("frames_written"),
+            "prompt frame count": lambda p, r: p.pop("frame_count"),
+            "artifact format": lambda p, r: r["artifacts"].pop("format"),
+            "artifact file count": lambda p, r: r["artifacts"].pop("files"),
+            "artifact checksums": lambda p, r: r["artifacts"].pop("checksums"),
+        }
+
+        for name, omit in omissions.items():
+            with self.subTest(name=name):
+                case_prompt = copy.deepcopy(prompt)
+                case_run = copy.deepcopy(run)
+                omit(case_prompt, case_run)
+                root = Path(tempfile.mkdtemp())
+                segment = root / "video" / "seg_00"
+                out = segment / "_sam3"
+                out.mkdir(parents=True)
+                (segment / "prompt.json").write_text(
+                    json.dumps(case_prompt), encoding="utf-8"
+                )
+                (out / "run.json").write_text(
+                    json.dumps(case_run), encoding="utf-8"
+                )
+                entry = {
+                    "status": "done",
+                    "export": {
+                        "root": str(root / "video"),
+                        "segments": ["seg_00"],
+                    },
+                }
+
+                snapshot = inspect_pipeline_entry(
+                    entry, sam3={"state": "done"}, output_root=root
+                )
+
+                self.assertEqual(
+                    (snapshot.stage, snapshot.status), ("review", "audit_required")
+                )
+                self.assertEqual(snapshot.validation_status, "audit_required")
+                self.assertEqual(snapshot.expected_frames, 2)
+                self.assertEqual(snapshot.inconsistencies, ())
+
+    def test_prompt_override_objects_are_the_effective_manifest_identity(self) -> None:
+        from server.pipeline_state import inspect_pipeline_entry
+
+        root = Path(tempfile.mkdtemp())
+        segment = root / "video" / "seg_00"
+        out = segment / "_sam3"
+        out.mkdir(parents=True)
+        (segment / "prompt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frame_count": 1,
+                    "image_width": 8,
+                    "image_height": 6,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "prompt_override.json").write_text(
+            json.dumps(
+                {
+                    "objects": [
+                        {
+                            "obj_id": 1,
+                            "label": "boom",
+                            "box_normalized": [0, 0, 0.5, 0.5],
+                        },
+                        {
+                            "obj_id": 2,
+                            "label": "person",
+                            "box_normalized": [0.5, 0.5, 1, 1],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "done",
+                    "frame_count": 1,
+                    "frames_written": 1,
+                    "objects": [{"obj_id": 1}, {"obj_id": 2}],
+                    "artifacts": {
+                        "format": "png-1bit-v1",
+                        "files": 2,
+                        "checksums": {
+                            "masks/1/000000.png": "a" * 64,
+                            "masks/2/000000.png": "b" * 64,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "mask_review.json").write_text(
+            json.dumps({"schema_version": 1, "frames": {"0": {"status": "ok"}}}),
+            encoding="utf-8",
+        )
+        entry = {
+            "status": "done",
+            "export": {"root": str(root / "video"), "segments": ["seg_00"]},
+        }
+
+        snapshot = inspect_pipeline_entry(entry, {"state": "done"}, root)
+
+        self.assertEqual((snapshot.stage, snapshot.status), ("completed", "validated"))
+        self.assertEqual(snapshot.validation_status, "manifest")
+
+    def test_deep_audit_accepts_missing_checksums_when_mask_bytes_are_valid(self) -> None:
+        from server.pipeline_state import audit_pipeline_entry
+
+        root = Path(tempfile.mkdtemp())
+        segment = root / "video" / "seg_00"
+        out = segment / "_sam3"
+        mask_path = out / "masks" / "1" / "000000.png"
+        mask_path.parent.mkdir(parents=True)
+        payload = encode_binary_png(Image.new("1", (8, 6), 0))
+        mask_path.write_bytes(payload)
+        (segment / "prompt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frame_count": 1,
+                    "image_width": 8,
+                    "image_height": 6,
+                    "objects": [{"obj_id": 1, "label": "boom"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "done",
+                    "frame_count": 1,
+                    "frames_written": 1,
+                    "objects": [{"obj_id": 1}],
+                    "artifacts": {"format": "png-1bit-v1", "files": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "mask_review.json").write_text(
+            json.dumps({"schema_version": 1, "frames": {"0": {"status": "ok"}}}),
+            encoding="utf-8",
+        )
+        entry = {
+            "status": "done",
+            "export": {"root": str(root / "video"), "segments": ["seg_00"]},
+        }
+
+        snapshot = audit_pipeline_entry(entry, {"state": "done"}, root)
+
+        self.assertEqual((snapshot.stage, snapshot.status), ("completed", "validated"))
+        self.assertEqual(snapshot.validation_status, "manifest")
+        self.assertEqual(snapshot.expected_frames, 1)
+        self.assertTrue(snapshot.artifacts_valid)
 
     def test_manifest_metadata_rejects_structural_contradictions(self) -> None:
         from server.pipeline_state import inspect_pipeline_entry

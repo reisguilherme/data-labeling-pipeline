@@ -179,6 +179,7 @@ def _inspect_pipeline_entry(
     edited_frames = 0
     has_unprocessed_segments = False
     audit_required = False
+    can_audit = True
     inconsistencies: list[str] = []
     expected_masks: list[_ExpectedMask] = []
 
@@ -186,8 +187,9 @@ def _inspect_pipeline_entry(
         segment = root / str(segment_name)
         out = segment / "_sam3"
         run_path = out / "run.json"
+        prompt_path = segment / "prompt.json"
         run = _read_json(run_path)
-        prompt = _read_json(segment / "prompt.json")
+        prompt = _read_json(prompt_path)
         if run is None:
             # Antes da primeira propagacao ainda nao existe run.json. Isso e um
             # trabalho pronto para SAM3, nao um artefato corrompido. Um arquivo
@@ -197,41 +199,107 @@ def _inspect_pipeline_entry(
                 inconsistencies.append(f"{segment_name}: run.json invalido")
             else:
                 has_unprocessed_segments = True
+                can_audit = False
             continue
-        if run.get("status") != "done":
+        if "status" not in run:
+            audit_required = True
+        elif run.get("status") != "done":
             inconsistencies.append(f"{segment_name}: run SAM3 nao concluido")
             continue
 
-        if _schema_int(run.get("schema_version")) != _SCHEMA_VERSION:
+        if "schema_version" not in run:
+            audit_required = True
+        elif _schema_int(run.get("schema_version")) != _SCHEMA_VERSION:
             inconsistencies.append(f"{segment_name}: schema de run.json desconhecido")
-            continue
-        frame_count = _schema_int(run.get("frame_count"))
-        frames_written = _schema_int(run.get("frames_written"))
-        if frame_count is None or frame_count <= 0 or frames_written != frame_count:
-            inconsistencies.append(f"{segment_name}: contagem de frames invalida")
             continue
 
         if prompt is None:
-            inconsistencies.append(f"{segment_name}: prompt.json ausente ou invalido")
+            if prompt_path.exists():
+                inconsistencies.append(f"{segment_name}: prompt.json invalido")
+            else:
+                audit_required = True
+                can_audit = False
             continue
-        if _schema_int(prompt.get("schema_version")) != _SCHEMA_VERSION:
+        if "schema_version" not in prompt:
+            audit_required = True
+        elif _schema_int(prompt.get("schema_version")) != _SCHEMA_VERSION:
             inconsistencies.append(f"{segment_name}: schema de prompt.json desconhecido")
             continue
+
+        run_frame_count = _schema_int(run.get("frame_count"))
         prompt_frame_count = _schema_int(prompt.get("frame_count"))
+        if "frame_count" in run and (
+            run_frame_count is None or run_frame_count <= 0
+        ):
+            inconsistencies.append(f"{segment_name}: contagem de frames invalida")
+            continue
+        if "frame_count" in prompt and (
+            prompt_frame_count is None or prompt_frame_count <= 0
+        ):
+            inconsistencies.append(f"{segment_name}: contagem de frames invalida")
+            continue
+        if (
+            run_frame_count is not None
+            and prompt_frame_count is not None
+            and run_frame_count != prompt_frame_count
+        ):
+            inconsistencies.append(f"{segment_name}: contagem de frames divergente")
+            continue
+        frame_count = run_frame_count or prompt_frame_count
+        if frame_count is None:
+            audit_required = True
+            can_audit = False
+            continue
+        if run_frame_count is None or prompt_frame_count is None:
+            audit_required = True
+
+        expected_frames += frame_count
+        review = _read_json(out / "mask_review.json") or {}
+        frames = review.get("frames") or {}
+        if isinstance(frames, dict):
+            for frame in range(frame_count):
+                reviewed = frames.get(str(frame)) or {}
+                if reviewed.get("status") in {"ok", "edited"}:
+                    reviewed_frames += 1
+                    if reviewed.get("status") == "edited":
+                        edited_frames += 1
+
+        frames_written = _schema_int(run.get("frames_written"))
+        if "frames_written" not in run:
+            audit_required = True
+        elif frames_written != frame_count:
+            inconsistencies.append(f"{segment_name}: contagem de frames invalida")
+            continue
+
         width = _schema_int(prompt.get("image_width"))
         height = _schema_int(prompt.get("image_height"))
-        prompt_object_ids = _object_ids(prompt.get("objects"))
-        if (
-            prompt_frame_count is None
-            or prompt_frame_count <= 0
-            or prompt_frame_count != frame_count
-            or width is None
-            or width <= 0
-            or height is None
-            or height <= 0
-            or prompt_object_ids is None
-        ):
-            inconsistencies.append(f"{segment_name}: prompt incompleto")
+        if "image_width" not in prompt or "image_height" not in prompt:
+            audit_required = True
+            can_audit = False
+            continue
+        if width is None or width <= 0 or height is None or height <= 0:
+            inconsistencies.append(f"{segment_name}: dimensoes invalidas no prompt")
+            continue
+
+        effective_objects = prompt.get("objects")
+        override_supplies_objects = False
+        override_path = out / "prompt_override.json"
+        if override_path.exists():
+            override = _read_json(override_path)
+            if override is None:
+                inconsistencies.append(f"{segment_name}: prompt_override.json invalido")
+                continue
+            if override.get("objects"):
+                effective_objects = override.get("objects")
+                override_supplies_objects = True
+
+        if "objects" not in prompt and not override_supplies_objects:
+            audit_required = True
+            can_audit = False
+            continue
+        prompt_object_ids = _object_ids(effective_objects)
+        if prompt_object_ids is None:
+            inconsistencies.append(f"{segment_name}: objetos invalidos no prompt")
             continue
         if len(set(prompt_object_ids)) != len(prompt_object_ids):
             inconsistencies.append(f"{segment_name}: obj_id repetido no prompt")
@@ -249,7 +317,6 @@ def _inspect_pipeline_entry(
                 )
                 continue
 
-        expected_frames += frame_count
         expected_keys = {
             f"masks/{obj_id}/{frame:06d}.png"
             for obj_id in prompt_object_ids
@@ -263,45 +330,48 @@ def _inspect_pipeline_entry(
             if not isinstance(artifacts, dict):
                 inconsistencies.append(f"{segment_name}: manifesto de artefatos invalido")
             else:
-                raw_checksums = artifacts.get("checksums")
-                artifact_files = _schema_int(artifacts.get("files"))
-                if (
-                    artifacts.get("format") != _ARTIFACT_FORMAT
-                    or artifact_files != len(expected_keys)
-                    or not isinstance(raw_checksums, dict)
-                    or len(raw_checksums) != len(expected_keys)
-                    or set(raw_checksums) != expected_keys
-                    or any(
-                        not isinstance(checksum, str)
-                        or _SHA256.fullmatch(checksum) is None
-                        for checksum in raw_checksums.values()
-                    )
-                ):
+                if "format" not in artifacts:
+                    audit_required = True
+                elif artifacts.get("format") != _ARTIFACT_FORMAT:
                     inconsistencies.append(
-                        f"{segment_name}: manifesto de artefatos invalido"
+                        f"{segment_name}: formato de artefato desconhecido"
                     )
+                if "files" not in artifacts:
+                    audit_required = True
+                elif _schema_int(artifacts.get("files")) != len(expected_keys):
+                    inconsistencies.append(
+                        f"{segment_name}: cardinalidade de artefatos invalida"
+                    )
+                if "checksums" not in artifacts:
+                    audit_required = True
                 else:
-                    checksums = raw_checksums
+                    raw_checksums = artifacts.get("checksums")
+                    if (
+                        not isinstance(raw_checksums, dict)
+                        or len(raw_checksums) != len(expected_keys)
+                        or set(raw_checksums) != expected_keys
+                        or any(
+                            not isinstance(checksum, str)
+                            or _SHA256.fullmatch(checksum) is None
+                            for checksum in raw_checksums.values()
+                        )
+                    ):
+                        inconsistencies.append(
+                            f"{segment_name}: checksums de artefatos invalidos"
+                        )
+                    else:
+                        checksums = raw_checksums
 
-        for relative in sorted(expected_keys):
-            expected_masks.append(
-                _ExpectedMask(
-                    str(segment_name),
-                    out / Path(relative),
-                    (width, height),
-                    checksums.get(relative) if checksums is not None else None,
+        if audit_masks:
+            for relative in sorted(expected_keys):
+                expected_masks.append(
+                    _ExpectedMask(
+                        str(segment_name),
+                        out / Path(relative),
+                        (width, height),
+                        checksums.get(relative) if checksums is not None else None,
+                    )
                 )
-            )
-
-        review = _read_json(out / "mask_review.json") or {}
-        frames = review.get("frames") or {}
-        if isinstance(frames, dict):
-            for frame in range(frame_count):
-                reviewed = frames.get(str(frame)) or {}
-                if reviewed.get("status") in {"ok", "edited"}:
-                    reviewed_frames += 1
-                    if reviewed.get("status") == "edited":
-                        edited_frames += 1
 
     validation_status = "not_applicable"
     if inconsistencies:
@@ -313,7 +383,11 @@ def _inspect_pipeline_entry(
     elif expected_frames > 0:
         validation_status = "manifest"
 
-    if audit_masks and validation_status in {"manifest", "audit_required"}:
+    if (
+        audit_masks
+        and can_audit
+        and validation_status in {"manifest", "audit_required"}
+    ):
         for expected in expected_masks:
             try:
                 info = inspect_binary_png(
