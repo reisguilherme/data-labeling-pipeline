@@ -1,0 +1,16 @@
+[project]
+name = "boom-pipeline"
+version = "0.2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.115.12",
+  "google-cloud-storage==3.1.0",
+  "uvicorn[standard]==0.34.2",
+  "Pillow==12.3.0",
+  "PyYAML==6.0.3",
+  "psycopg[binary]==3.2.9",
+  "minio==7.2.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "services/app/server/tests"]

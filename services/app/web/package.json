@@ -1,0 +1,27 @@
+{
+  "name": "movies-screening-tool-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && npm run smoke",
+    "smoke": "node scripts/smoke.mjs global-export && node scripts/smoke.mjs object-management && node scripts/smoke.mjs archive-button && node scripts/smoke.mjs overview && node scripts/smoke.mjs operations && node scripts/smoke.mjs completed-gate && node scripts/smoke.mjs library && node scripts/smoke.mjs triage-submit-next && node scripts/smoke.mjs triage-submit-last && node scripts/smoke.mjs triage-no-object-next && node scripts/smoke.mjs login && node scripts/smoke.mjs objects && node scripts/smoke.mjs workspace && node scripts/smoke.mjs sam3 && node scripts/smoke.mjs sam3-prompt && node scripts/smoke.mjs sam3-propagation-refresh && node scripts/smoke.mjs mask-review",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "jsdom": "^30.0.0",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9"
+  }
+}

@@ -1,0 +1,213 @@
+name: boom-pipeline
+
+x-app-base: &app-base
+  image: boom/pipeline-app:0.2.0
+  build:
+    context: .
+    dockerfile: services/app/Dockerfile
+    args:
+      UID: "${UID:-1000}"
+      GID: "${GID:-1000}"
+  user: "${UID:-1000}:${GID:-1000}"
+  environment: &app-environment
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: pipeline
+    POSTGRES_USER: pipeline
+    POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    MINIO_ENDPOINT: minio:9000
+    MINIO_SECURE: "false"
+    MINIO_ROOT_USER_FILE: /run/secrets/minio_user
+    MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_password
+    MST_WORKER_TOKEN_FILE: /run/secrets/worker_token
+    MST_WORKSPACE: /workspace
+    GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcs_credentials
+    MST_CACHE_LIMIT_GB: "${MST_CACHE_LIMIT_GB:-40}"
+  secrets:
+    - postgres_password
+    - minio_user
+    - minio_password
+    - worker_token
+    - gcs_credentials
+  volumes:
+    - "${WORKSPACE_DIR:?defina WORKSPACE_DIR no .env}:/workspace"
+    - app-config:/config
+    - ./config:/registry:ro
+    - ./backups:/backups
+  read_only: true
+  tmpfs:
+    - /tmp:size=2g,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+
+services:
+  app:
+    <<: *app-base
+    command: [app]
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    <<: *app-base
+    command: [worker]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  sam3-worker:
+    image: boom/sam3-worker:0.2.0
+    build:
+      context: .
+      dockerfile: services/sam3-worker/Dockerfile
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+        NGC_TAG: "${NGC_TAG:-25.10-py3}"
+        SAM3_REF: "${SAM3_REF:-8f0b7f4d4e7eda2ed606ebde6702c93359ad01da}"
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      MST_API: http://app:8000
+      MST_WORKER_TOKEN_FILE: /run/secrets/worker_token
+      HF_TOKEN_FILE: /run/secrets/hf_token
+      HF_HOME: /model-cache/huggingface
+      MST_WORKSPACE: /workspace
+      SAM3_MODELS_CONFIG: /config/models.local.yaml
+      SAM3_MODEL_CACHE: /model-cache
+      SAM3_WORKER_ID: "${SAM3_WORKER_ID:-sam3-worker-1}"
+      SAM3_POLL_WAIT: "25"
+      SAM3_LEASE_SECONDS: "180"
+      SAM3_MAX_SIDE: "${SAM3_MAX_SIDE:-0}"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SECURE: "false"
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_password
+    secrets:
+      - worker_token
+      - hf_token
+      - minio_user
+      - minio_password
+    volumes:
+      - "${WORKSPACE_DIR}:/workspace"
+      - ./config:/config:ro
+      - ./models:/models:ro
+      - model-cache:/model-cache
+    depends_on:
+      app:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ipc: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=8g,mode=1777
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16.9-bookworm
+    user: postgres
+    environment:
+      POSTGRES_DB: pipeline
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:size=16m,mode=1777
+      - /tmp:size=256m,mode=1777
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U pipeline -d pipeline"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    user: "0:0"
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        if [ "$$(stat -c '%u:%g' /data)" != "1000:1000" ]; then
+          chown -R 1000:1000 /data;
+        fi
+    volumes:
+      - minio-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    user: "1000:1000"
+    command: [server, /data]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_password
+    secrets:
+      - minio_user
+      - minio_password
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - minio-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    healthcheck:
+      test: [CMD, curl, -f, http://127.0.0.1:9000/minio/health/live]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  minio_user:
+    file: ./secrets/minio_user.txt
+  minio_password:
+    file: ./secrets/minio_password.txt
+  worker_token:
+    file: ./secrets/worker_token.txt
+  hf_token:
+    file: ./secrets/hf_token.txt
+  gcs_credentials:
+    file: ./secrets/gcs_credentials.json
+
+volumes:
+  app-config:
+  model-cache:
+  postgres-data:
+  minio-data:

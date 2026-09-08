@@ -1,0 +1,7 @@
+fastapi==0.115.12
+google-cloud-storage==3.1.0
+minio==7.2.15
+pillow==12.3.0
+psycopg[binary]==3.2.9
+PyYAML==6.0.3
+uvicorn[standard]==0.34.2

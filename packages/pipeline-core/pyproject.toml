@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boom-pipeline-core"
+version = "0.2.0"
+requires-python = ">=3.12"
+dependencies = ["Pillow==12.3.0", "PyYAML==6.0.3", "minio==7.2.15"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

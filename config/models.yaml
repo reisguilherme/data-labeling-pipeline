@@ -1,0 +1,18 @@
+# Registro do checkpoint finetunado no formato nativo SAM3 (.pt).
+# Copie para config/models.local.yaml e use scripts/stage-model.ps1 para criar
+# releases locais imutáveis sob models/releases/.
+schema_version: 1
+default_model: sam3-finetuned-v1
+models:
+  - model_id: sam3-finetuned-v1
+    source:
+      type: local
+      path: /models/releases/sam3-finetuned/v1/model.pt
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    sam3_commit: 8f0b7f4d4e7eda2ed606ebde6702c93359ad01da
+assignments:
+  objects:
+    # Todos os objetos/classes treinados podem apontar para o mesmo checkpoint.
+    boom: sam3-finetuned-v1
+    # pessoa: sam3-finetuned-v1
+    # veiculo: sam3-finetuned-v1
