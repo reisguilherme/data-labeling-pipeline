@@ -12,9 +12,11 @@ from ..deps import get_object
 from ..locks import locks
 from ..pipeline_state import inspect_pipeline_entry
 from ..sam3 import queue as sam3_queue
+from ..singleflight import AsyncSingleFlight
 from ..workspace import ObjectContext
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["library"])
+_listing_singleflight = AsyncSingleFlight()
 
 
 def video_payload(
@@ -52,12 +54,11 @@ def video_payload(
     }
 
 
-@router.get("/videos")
-async def list_videos(
+def _build_video_listing(
+    ctx: ObjectContext,
     search: str | None = None,
     status: str | None = None,
     sort: str = "name",
-    ctx: ObjectContext = Depends(get_object),
 ) -> dict:
     held = locks.map_for(ctx.object_id)
     sam3_state = sam3_queue.map_for(ctx.object_id)
@@ -107,6 +108,20 @@ async def list_videos(
         "pipeline_status_counts": pipeline_status_counts,
         "videos": items,
     }
+
+
+@router.get("/videos")
+async def list_videos(
+    search: str | None = None,
+    status: str | None = None,
+    sort: str = "name",
+    ctx: ObjectContext = Depends(get_object),
+) -> dict:
+    key = (ctx.object_id, ctx.index.scanned_at, search, status, sort)
+    return await _listing_singleflight.run(
+        key,
+        lambda: asyncio.to_thread(_build_video_listing, ctx, search, status, sort),
+    )
 
 
 @router.post("/videos/rescan")
