@@ -17,12 +17,23 @@ from ..workspace import ObjectContext
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["library"])
 _listing_singleflight = AsyncSingleFlight()
+_STORE_ENTRY_UNSET = object()
 
 
 def video_payload(
-    ctx: ObjectContext, video, media_info: dict | None, lock=None, sam3=None
+    ctx: ObjectContext,
+    video,
+    media_info: dict | None,
+    lock=None,
+    sam3=None,
+    *,
+    store_entry=_STORE_ENTRY_UNSET,
 ) -> dict:
-    entry = ctx.store.entry(video.relpath)
+    entry = (
+        ctx.store.entry(video.relpath)
+        if store_entry is _STORE_ENTRY_UNSET
+        else store_entry
+    )
     status = entry.get("status", "pending") if entry else "pending"
     intervals = entry.get("intervals", []) if entry else []
     pipeline = inspect_pipeline_entry(entry, sam3, ctx.output_root)
@@ -62,6 +73,8 @@ def _build_video_listing(
 ) -> dict:
     held = locks.map_for(ctx.object_id)
     sam3_state = sam3_queue.map_for(ctx.object_id)
+    videos = ctx.index.all()
+    store_entries, counts = ctx.store.listing_snapshot(len(videos))
     items = [
         video_payload(
             ctx,
@@ -69,10 +82,10 @@ def _build_video_listing(
             ctx.index.cached_probe(video.video_id),
             held.get(video.video_id),
             sam3_state.get(video.relpath),
+            store_entry=store_entries.get(video.relpath),
         )
-        for video in ctx.index.all()
+        for video in videos
     ]
-    counts = ctx.store.counts(len(items))
     pipeline_counts: dict[str, int] = {}
     pipeline_status_counts: dict[str, int] = {}
     for item in items:

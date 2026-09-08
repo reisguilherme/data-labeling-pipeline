@@ -7,9 +7,11 @@ o disco é o espelho durável, reescrito atomicamente a cada save.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shutil
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,7 @@ class AnnotationStore:
         self._total_provider = total_provider
         self._doc: dict = _empty_doc()
         self._lock = asyncio.Lock()
+        self._state_lock = threading.RLock()
         self._saves = 0
         self.loaded = False
 
@@ -74,29 +77,33 @@ class AnnotationStore:
     def load(self) -> dict:
         path = self.annotations_path
         if not path.exists():
-            self._doc = _empty_doc()
+            loaded_doc = _empty_doc()
         else:
             try:
-                self._doc = json.loads(path.read_text(encoding="utf-8"))
+                loaded_doc = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 backup = path.with_suffix(".corrupt.json")
                 shutil.copy2(path, backup)
                 raise RuntimeError(
                     f"annotations.json ilegível ({exc}); cópia preservada em {backup}"
                 ) from exc
-            self._doc.setdefault("videos", {})
-            self._doc.setdefault("counts", {})
-        self.loaded = True
-        return self._doc
+            loaded_doc.setdefault("videos", {})
+            loaded_doc.setdefault("counts", {})
+        with self._state_lock:
+            self._doc = loaded_doc
+            self.loaded = True
+            return copy.deepcopy(self._doc)
 
     @property
     def doc(self) -> dict:
-        return self._doc
+        with self._state_lock:
+            return copy.deepcopy(self._doc)
 
     # -- leitura -----------------------------------------------------------
 
     def entry(self, relpath: str) -> dict | None:
-        return self._doc["videos"].get(relpath)
+        with self._state_lock:
+            return copy.deepcopy(self._doc["videos"].get(relpath))
 
     def status_of(self, relpath: str) -> str:
         entry = self.entry(relpath)
@@ -105,8 +112,22 @@ class AnnotationStore:
     def counts(self, total: int | None = None) -> dict[str, int]:
         """Contagem por status. `total` vem do índice em disco; sem ele, usa só
         os vídeos que têm entrada."""
+        with self._state_lock:
+            return self._counts_for(self._doc["videos"], total)
+
+    def listing_snapshot(
+        self, total: int | None = None
+    ) -> tuple[dict[str, dict], dict[str, int]]:
+        """Return entries and counts from one coherent in-memory revision."""
+        with self._state_lock:
+            entries = copy.deepcopy(self._doc["videos"])
+            counts = self._counts_for(self._doc["videos"], total)
+        return entries, counts
+
+    @staticmethod
+    def _counts_for(entries: dict[str, dict], total: int | None) -> dict[str, int]:
         counts = {status: 0 for status in STATUSES}
-        for entry in self._doc["videos"].values():
+        for entry in entries.values():
             status = entry.get("status", "pending")
             if status in counts:
                 counts[status] += 1
@@ -124,41 +145,44 @@ class AnnotationStore:
 
     async def put_entry(self, relpath: str, entry: dict) -> dict:
         async with self._lock:
-            self._doc["videos"][relpath] = entry
+            with self._state_lock:
+                self._doc["videos"][relpath] = copy.deepcopy(entry)
             await asyncio.to_thread(self._flush)
         return entry
 
     async def mutate(self, fn) -> Any:
         """Aplica `fn(doc)` sob o lock e persiste. Retorna o que `fn` devolver."""
         async with self._lock:
-            result = fn(self._doc)
+            with self._state_lock:
+                result = fn(self._doc)
             await asyncio.to_thread(self._flush)
         return result
 
     def _flush(self) -> None:
         path = self.annotations_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        self._doc["schema_version"] = SCHEMA_VERSION
-        self._doc["generated_by"] = f"{APP_NAME} {APP_VERSION}"
-        self._doc["flag_groups_version"] = FLAG_GROUPS_VERSION
-        self._doc["object_id"] = self.object_id
-        self._doc["label"] = self.label
-        # Caminhos com "/" para que o JSON seja legível/portável do lado da Spark.
-        self._doc["videos_root"] = self.videos_root.as_posix()
-        self._doc["output_root"] = self.output_root.as_posix()
-        self._doc["updated_at"] = iso()
-        self._doc["videos"] = dict(sorted(self._doc["videos"].items()))
-
-        # Recalcula a partir do índice em disco quando disponível, para que
-        # `pending` inclua vídeos ainda sem entrada.
         try:
             total = self._total_provider() or None
         except Exception:  # noqa: BLE001
             total = None
-        self._doc["counts"] = self.counts(total)
 
-        payload = json.dumps(self._doc, ensure_ascii=False, indent=2)
+        with self._state_lock:
+            self._doc["schema_version"] = SCHEMA_VERSION
+            self._doc["generated_by"] = f"{APP_NAME} {APP_VERSION}"
+            self._doc["flag_groups_version"] = FLAG_GROUPS_VERSION
+            self._doc["object_id"] = self.object_id
+            self._doc["label"] = self.label
+            # Caminhos com "/" mantêm o JSON legível/portável para a Spark.
+            self._doc["videos_root"] = self.videos_root.as_posix()
+            self._doc["output_root"] = self.output_root.as_posix()
+            self._doc["updated_at"] = iso()
+            self._doc["videos"] = dict(sorted(self._doc["videos"].items()))
+            self._doc["counts"] = self._counts_for(self._doc["videos"], total)
+            payload = json.dumps(self._doc, ensure_ascii=False, indent=2)
+
+        # O asyncio.Lock do writer permanece adquirido até o fim deste método,
+        # preservando a ordem dos replaces. O lock de estado fica livre durante
+        # o I/O para que leitores obtenham snapshots em memória.
+        path.parent.mkdir(parents=True, exist_ok=True)
 
         if path.exists():
             try:
@@ -174,8 +198,10 @@ class AnnotationStore:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
 
-        self._saves += 1
-        if self._saves % _HISTORY_EVERY == 0:
+        with self._state_lock:
+            self._saves += 1
+            snapshot_due = self._saves % _HISTORY_EVERY == 0
+        if snapshot_due:
             self._snapshot(path)
 
     def _snapshot(self, path: Path) -> None:
