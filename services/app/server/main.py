@@ -14,6 +14,7 @@ from starlette.staticfiles import StaticFiles
 from . import ffmpeg
 from .config import APP_NAME, APP_VERSION, settings
 from .locks import locks
+from .observability import install_request_observability
 from .routers import annotations, dataset, ingest
 from .routers import jobs as jobs_router
 from .routers import library, objects, review
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+install_request_observability(app)
 
 # Só existe para o `npm run dev` (porta 5173) falar com o backend em dev.
 # Em produção o SPA é servido por este mesmo processo, ou seja, mesma origem —
