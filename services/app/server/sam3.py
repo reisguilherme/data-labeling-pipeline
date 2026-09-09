@@ -153,6 +153,7 @@ class Sam3Queue:
                 state=raw.get("state", "queued"),
                 attempts=int(raw.get("attempts") or 0),
                 force=bool(raw.get("force")),
+                cancel_requested=bool(raw.get("cancel_requested")),
                 enqueued_at=raw.get("enqueued_at", ""),
                 enqueued_by=raw.get("enqueued_by"),
                 progress=raw.get("progress") or {},
@@ -160,12 +161,19 @@ class Sam3Queue:
                 error=raw.get("error"),
                 history=list(raw.get("history") or []),
             )
-            # Um lease não sobrevive a um restart: o runner que o detinha morreu
-            # junto com a conexão. Devolver para a fila é sempre a resposta certa
-            # — o marcador por segmento faz o retrabalho ser barato.
+            # Um lease não sobrevive a um restart: trabalho pendente volta para
+            # a fila, mas um cancelamento já aceito continua terminal.
             if item.state in ("leased", "running"):
-                item.state = "queued"
-                item.note("queued", reason="servidor reiniciou durante o processamento")
+                if item.cancel_requested:
+                    item.state = "cancelled"
+                    item.finished_at = item.finished_at or iso()
+                    item.note(
+                        "cancelled",
+                        reason="cancelamento preservado apos reinicio do servidor",
+                    )
+                else:
+                    item.state = "queued"
+                    item.note("queued", reason="servidor reiniciou durante o processamento")
             items[relpath] = item
         return items
 
@@ -210,7 +218,12 @@ class Sam3Queue:
             item.lease_id = None
             item.lease_expires_at_epoch = None
             item.worker = None
-            if item.attempts >= MAX_ATTEMPTS:
+            if item.cancel_requested:
+                item.state = "cancelled"
+                item.result = None
+                item.finished_at = iso()
+                item.note("cancelled", reason="lease expirou apos cancelamento")
+            elif item.attempts >= MAX_ATTEMPTS:
                 item.state = "error"
                 item.error = (
                     f"o lease expirou {item.attempts}x — o runner provavelmente "
@@ -343,7 +356,11 @@ class Sam3Queue:
         with self._lock:
             for object_id in list(self._by_object):
                 self._expire(object_id)
-                pending = [i for i in self._by_object[object_id].values() if i.state == "queued"]
+                pending = [
+                    item
+                    for item in self._by_object[object_id].values()
+                    if item.state == "queued" and not item.cancel_requested
+                ]
                 if not pending:
                     continue
                 pending.sort(key=lambda i: i.enqueued_at)
@@ -354,7 +371,6 @@ class Sam3Queue:
                 item.worker = worker
                 item.attempts += 1
                 item.started_at = iso()
-                item.cancel_requested = False
                 item.note("leased", worker=worker, attempt=item.attempts)
                 self._flush(object_id)
                 return object_id, item
@@ -450,13 +466,16 @@ class Sam3Queue:
             # cancellation explicitly instead.
             if terminal == "done" and item.cancel_requested:
                 return None
+            if terminal == "cancelled" or item.cancel_requested:
+                terminal = "cancelled"
+                result = None
             item.state = terminal
             item.result = result
             item.error = error
             item.finished_at = iso()
             item.lease_id = None
             item.lease_expires_at_epoch = None
-            item.cancel_requested = False
+            item.cancel_requested = terminal == "cancelled"
             item.completion_reserved = False
             self._state_changed.notify_all()
             if item.state == "done":

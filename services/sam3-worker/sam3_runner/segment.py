@@ -22,6 +22,10 @@ from .prompt import Prompt
 log = logging.getLogger("sam3_runner.segment")
 
 
+class PropagationCancelled(RuntimeError):
+    """Cooperative stop requested at a completed frame boundary."""
+
+
 def _write_labels(prompt: Prompt, rows: dict[int, list[str]]) -> int:
     """Um .txt por frame do segmento — inclusive os vazios.
 
@@ -45,7 +49,7 @@ def run_segment(
     cfg: RunnerConfig,
     classes: ClassMap,
     *,
-    on_frame: Callable[[int], None] | None = None,
+    on_frame: Callable[[int], bool | None] | None = None,
 ) -> RunReport:
     """Roda o SAM3 num segmento e grava `_sam3/labels/*.txt` + `_sam3/run.json`."""
     import torch
@@ -158,7 +162,10 @@ def run_segment(
                 # deixa a interface mostrar avanço sem reter imagens ou tensores
                 # 4K na RAM.
                 if on_frame is not None:
-                    on_frame(frame_idx)
+                    if on_frame(frame_idx) is False:
+                        raise PropagationCancelled(
+                            "cancelamento solicitado durante a propagacao"
+                        )
 
         # Alguns builds omitem obj_ids nos frames sem sinal. Ausencia de arquivo
         # nao pode ser confundida com mascara vazia, entao materializa o vazio.
@@ -186,6 +193,11 @@ def run_segment(
         )
         report.status = "done"
 
+    except PropagationCancelled:
+        # Nao publique run.json para um segmento interrompido. As mascaras ja
+        # persistidas permanecem parciais e, sem o marcador, nunca sao tratadas
+        # como uma execucao concluida nem usadas por should_skip().
+        raise
     except Exception as exc:  # noqa: BLE001
         # Capturar tudo aqui é o que garante que um segmento ruim não derrube o
         # worker: em 4K um vídeo longo pode simplesmente não caber, e a resposta

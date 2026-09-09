@@ -262,6 +262,57 @@ class Sam3RevisionQueueTests(unittest.TestCase):
                     )
                 )
 
+    def test_file_queue_cancel_wins_worker_error_without_retrying(self) -> None:
+        queue = Sam3Queue()
+        queue.bind("boom", Path(tempfile.mkdtemp()))
+        self._enqueue_file(queue, 4)
+        _, item = queue.take("worker", 180)
+        lease_id = item.lease_id
+        queue.cancel("boom", "clip.mp4")
+
+        found = queue.finish(
+            lease_id,
+            state="error",
+            result={"partial": True},
+            error="worker failed",
+        )
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found[1].state, "cancelled")
+        self.assertIsNone(found[1].result)
+        self.assertEqual(found[1].error, "worker failed")
+        self.assertTrue(found[1].cancel_requested)
+        self.assertIsNone(queue.take("another-worker", 180))
+
+    def test_file_queue_cancel_survives_worker_death_and_server_restart(self) -> None:
+        output_root = Path(tempfile.mkdtemp())
+        queue = Sam3Queue()
+        queue.bind("boom", output_root)
+        self._enqueue_file(queue, 4)
+        _, item = queue.take("worker", 180)
+        queue.cancel("boom", "clip.mp4")
+
+        restarted = Sam3Queue()
+        restarted.bind("boom", output_root)
+
+        restored = restarted.get("boom", "clip.mp4")
+        self.assertEqual(restored.state, "cancelled")
+        self.assertTrue(restored.cancel_requested)
+        self.assertIsNone(restarted.take("another-worker", 180))
+
+    def test_file_queue_cancelled_expired_lease_is_never_reclaimed(self) -> None:
+        queue = Sam3Queue()
+        queue.bind("boom", Path(tempfile.mkdtemp()))
+        self._enqueue_file(queue, 4)
+        _, item = queue.take("worker", 180)
+        queue.cancel("boom", "clip.mp4")
+        item.lease_expires_at_epoch = time.time() - 1
+
+        self.assertIsNone(queue.take("another-worker", 180))
+        cancelled = queue.get("boom", "clip.mp4")
+        self.assertEqual(cancelled.state, "cancelled")
+        self.assertTrue(cancelled.cancel_requested)
+
     def test_reading_live_file_lease_renews_completion_window(self) -> None:
         queue = Sam3Queue()
         queue.bind("boom", Path(tempfile.mkdtemp()))

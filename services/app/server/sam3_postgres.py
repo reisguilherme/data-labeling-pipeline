@@ -289,10 +289,18 @@ class PostgresSam3Queue:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                UPDATE jobs SET state='error', error='lease expirou no limite de tentativas',
+                UPDATE jobs SET
+                    state = CASE WHEN cancel_requested
+                                 THEN 'cancelled'::job_state
+                                 ELSE 'error'::job_state END,
+                    result = CASE WHEN cancel_requested THEN NULL ELSE result END,
+                    error = CASE WHEN cancel_requested THEN error
+                                 ELSE 'lease expirou no limite de tentativas' END,
+                    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
                     finished_at=now(), updated_at=now()
                  WHERE kind='sam3_propagation' AND state IN ('leased','running')
-                   AND lease_expires_at <= now() AND attempts >= max_attempts
+                   AND lease_expires_at <= now()
+                   AND (cancel_requested OR attempts >= max_attempts)
                 """
             )
             cursor.execute(
@@ -489,41 +497,58 @@ class PostgresSam3Queue:
         terminal = state if state in ("done", "error", "cancelled") else "error"
         live_guard = "" if fenced else """
                    AND lease_expires_at > now()
-                   AND (%s <> 'done' OR cancel_requested = FALSE)"""
-        params = [
-            terminal,
-            terminal,
-            json.dumps(result) if result is not None else None,
-            error,
-            terminal,
-            lease_id,
-        ]
-        if not fenced:
-            params.append(terminal)
+                   AND (completion.terminal <> 'done' OR jobs.cancel_requested = FALSE)"""
         cursor.execute(
             """
+            WITH completion AS (
+                SELECT %s::text AS terminal, %s::jsonb AS result, %s::text AS error
+            )
             UPDATE jobs SET
-                state = CASE WHEN %s = 'error' AND attempts < max_attempts
-                             THEN 'queued'::job_state ELSE %s::job_state END,
-                result = %s::jsonb, error = %s,
-                finished_at = CASE WHEN %s = 'error' AND attempts < max_attempts
-                                   THEN NULL ELSE now() END,
+                state = CASE
+                    WHEN jobs.cancel_requested OR completion.terminal = 'cancelled'
+                    THEN 'cancelled'::job_state
+                    WHEN completion.terminal = 'error' AND attempts < max_attempts
+                    THEN 'queued'::job_state
+                    ELSE completion.terminal::job_state
+                END,
+                result = CASE
+                    WHEN jobs.cancel_requested OR completion.terminal = 'cancelled'
+                    THEN NULL ELSE completion.result
+                END,
+                error = completion.error,
+                finished_at = CASE
+                    WHEN jobs.cancel_requested OR completion.terminal = 'cancelled'
+                    THEN now()
+                    WHEN completion.terminal = 'error' AND attempts < max_attempts
+                    THEN NULL ELSE now()
+                END,
                 worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
-                cancel_requested = FALSE, updated_at = now()
+                cancel_requested = CASE
+                    WHEN jobs.cancel_requested OR completion.terminal = 'cancelled'
+                    THEN TRUE ELSE FALSE
+                END,
+                updated_at = now()
+              FROM completion
              WHERE lease_token = %s::uuid
                AND kind = 'sam3_propagation'
                AND state IN ('leased','running')
             """
             + live_guard
             + """
-            RETURNING id, payload, state::text, attempts, created_at,
-                      lease_token, lease_expires_at, cancel_requested,
-                      progress, worker_id, started_at, finished_at, result, error
+            RETURNING jobs.id, jobs.payload, jobs.state::text, jobs.attempts,
+                      jobs.created_at, jobs.lease_token, jobs.lease_expires_at,
+                      jobs.cancel_requested, jobs.progress, jobs.worker_id,
+                      jobs.started_at, jobs.finished_at, jobs.result, jobs.error
             """,
-            tuple(params),
+            (
+                terminal,
+                json.dumps(result) if result is not None else None,
+                error,
+                lease_id,
+            ),
         )
         row = cursor.fetchone()
-        if row and terminal == "done" and result:
+        if row and row[2] == "done" and result:
             from .sam3_run_index import index_completed_runs
 
             job_payload = row[1] or {}

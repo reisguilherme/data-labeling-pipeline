@@ -210,7 +210,7 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
     from .model import autocast_context
     from .prompt import PromptError, load_prompt
     from .marker import read as read_marker
-    from .segment import run_segment, should_skip
+    from .segment import PropagationCancelled, run_segment, should_skip
 
     lease_id = job["lease_id"]
     segments = job.get("segments") or []
@@ -299,13 +299,33 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
 
             seen_frames: set[int] = set()
 
-            def note_frame(frame_idx: int) -> None:
+            def note_frame(frame_idx: int) -> bool:
                 seen_frames.add(frame_idx)
                 progress["frames_done"] = frames_done + len(seen_frames)
+                return not heartbeat.cancel_requested
 
             log.info("  %s (%d frames)", segment["segment"], prompt.frame_count)
-            with autocast_context():
-                report = run_segment(predictor, prompt, cfg, classes, on_frame=note_frame)
+            try:
+                with autocast_context():
+                    report = run_segment(
+                        predictor, prompt, cfg, classes, on_frame=note_frame
+                    )
+            except PropagationCancelled:
+                log.info(
+                    "cancelamento pedido durante %s (%d frames observados)",
+                    segment["segment"],
+                    len(seen_frames),
+                )
+                client.finish(
+                    lease_id,
+                    "cancelled",
+                    {
+                        "segments_done": done,
+                        "frames_done": progress["frames_done"],
+                    },
+                    None,
+                )
+                return
             remember(segment, report.to_json())
 
             if report.status == "done":
