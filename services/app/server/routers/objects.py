@@ -17,7 +17,7 @@ from ..jobs import jobs
 from ..locks import locks
 from ..object_lifecycle import (
     active_durable_jobs,
-    partition_managed_paths,
+    partition_owned_object_paths,
     validate_purge_confirmation,
     validate_unique_label,
 )
@@ -297,8 +297,16 @@ async def purge_object(
         raise HTTPException(409, "o objeto ainda possui jobs duráveis ativos")
     if workspace.root is None:
         raise HTTPException(409, "workspace não configurado")
-    managed, skipped = partition_managed_paths(
-        workspace.root, [cfg.videos_root, cfg.output_root]
+    registered_roots = [
+        (registered.object_id, path)
+        for registered in workspace.list(include_archived=True)
+        for path in (registered.videos_root, registered.output_root)
+    ]
+    managed, skipped = partition_owned_object_paths(
+        workspace.root,
+        object_id,
+        [cfg.videos_root, cfg.output_root],
+        registered_roots=registered_roots,
     )
     if not durable_jobs.enabled():
         raise HTTPException(503, "PostgreSQL é obrigatório para exclusão auditada")

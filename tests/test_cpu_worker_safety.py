@@ -72,6 +72,24 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "recusa remover"):
                 _remove_tree(sibling, root)
 
+    def test_remove_tree_rejects_symlink_to_a_sibling_inside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            sibling = root / "another-video"
+            sibling.mkdir(parents=True)
+            sentinel = sibling / "keep.jpg"
+            sentinel.write_bytes(b"keep")
+            link = root / "staging"
+            try:
+                link.symlink_to(sibling, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlink indisponivel neste host: {exc}")
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                _remove_tree(link, root)
+
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+
     def test_cleanup_root_is_one_child_with_plain_basename(self) -> None:
         from services.app import worker as worker_module
 
@@ -1335,6 +1353,72 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             self.assertEqual(purge_errors, [])
             saved = json.loads(registry.read_text(encoding="utf-8"))
             self.assertEqual(saved["objects"], [])
+
+    def test_purge_rejects_legacy_job_that_targets_another_objects_root(self) -> None:
+        from server.config import settings
+        from server.workspace import ObjectConfig, Workspace
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            boom_raw = root / "boom" / "raw"
+            boom_dataset = root / "boom" / "dataset"
+            evil_dataset = root / "evil" / "dataset"
+            for path in (boom_raw, boom_dataset, evil_dataset):
+                path.mkdir(parents=True)
+            sentinel = boom_raw / "keep.mp4"
+            sentinel.write_bytes(b"keep")
+            configs = [
+                ObjectConfig(
+                    object_id="boom",
+                    display_name="Boom",
+                    label="boom",
+                    videos_root=boom_raw,
+                    output_root=boom_dataset,
+                ),
+                ObjectConfig(
+                    object_id="evil",
+                    display_name="Evil",
+                    label="evil",
+                    videos_root=boom_raw,
+                    output_root=evil_dataset,
+                    archived=True,
+                ),
+            ]
+            (root / "objects.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "objects": [config.to_json(root) for config in configs],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            test_workspace = Workspace()
+            job = {
+                "id": "purge-evil",
+                "payload": {
+                    "object_id": "evil",
+                    "actor": "guilherme",
+                    "managed_paths": [str(boom_raw), str(evil_dataset)],
+                },
+            }
+
+            with patch.object(settings, "workspace_root", root), patch.object(
+                settings, "legacy", None
+            ), patch.dict(
+                os.environ,
+                {"MST_WORKSPACE": str(root), "DATABASE_URL": "postgresql://unused"},
+            ), patch(
+                "server.workspace.workspace", test_workspace
+            ), patch(
+                "server.object_lifecycle.write_purge_inventory"
+            ) as inventory:
+                with self.assertRaisesRegex(ValueError, "mudaram"):
+                    worker_module.run_object_purge(job, MagicMock(), "lease")
+
+            inventory.assert_not_called()
+            self.assertEqual(sentinel.read_bytes(), b"keep")
 
 
 if __name__ == "__main__":

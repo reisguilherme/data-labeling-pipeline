@@ -103,13 +103,32 @@ def _context(job: dict):
     return ctx
 
 
-def _remove_tree(path: Path, root: Path) -> None:
-    resolved = path.resolve()
-    expected_root = root.resolve()
+def _validated_tree_child(path: Path, root: Path) -> Path:
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    lexical_root = Path(os.path.abspath(os.fspath(root)))
+    try:
+        relative = candidate.relative_to(lexical_root)
+    except ValueError as exc:
+        raise ValueError(f"recusa remover caminho fora do cache/export: {candidate}") from exc
+    if not relative.parts or lexical_root.is_symlink():
+        raise ValueError(f"recusa remover caminho fora do cache/export: {candidate}")
+    current = lexical_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"recusa remover symlink de cache/export: {current}")
+    resolved = candidate.resolve()
+    expected_root = lexical_root.resolve()
     if resolved == expected_root or not resolved.is_relative_to(expected_root):
         raise ValueError(f"recusa remover caminho fora do cache/export: {resolved}")
-    if resolved.exists():
-        shutil.rmtree(resolved)
+    return candidate
+
+
+def _remove_tree(path: Path, root: Path) -> None:
+    candidate = _validated_tree_child(path, root)
+    if candidate.exists():
+        candidate = _validated_tree_child(candidate, root)
+        shutil.rmtree(candidate)
 
 
 def _export_root_from_basename(ctx, basename: str) -> Path:
@@ -226,7 +245,7 @@ def run_proxy_full(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     payload = job["payload"]
     video_id = payload["video_id"]
     out = proxy.proxy_dir(ctx, video_id)
-    staging = proxy.new_staging_generation(out)
+    staging = proxy.new_staging_generation(out, ctx.cache_dir)
     for tier in proxy.TIERS:
         (staging / tier).mkdir(parents=True, exist_ok=True)
     source = ctx.index.resolve_path(video_id)
@@ -283,7 +302,7 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     video_id = payload["video_id"]
     start, end = int(payload["start"]), int(payload["end"])
     final = proxy.window_dir(ctx, video_id, start, end)
-    staging = proxy.new_staging_generation(final)
+    staging = proxy.new_staging_generation(final, ctx.cache_dir)
     for tier in proxy.TIERS:
         (staging / tier).mkdir(parents=True, exist_ok=True)
     source = ctx.index.resolve_path(video_id)
@@ -826,7 +845,7 @@ def run_object_purge(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     from server.config import settings
     from server.object_lifecycle import (
         delete_project_records,
-        partition_managed_paths,
+        partition_owned_object_paths,
         preserve_exported_datasets,
         remove_minio_object_prefix,
         write_purge_inventory,
@@ -840,7 +859,17 @@ def run_object_purge(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     cfg = workspace.get(object_id)
     if not cfg.archived:
         raise ValueError("objeto deixou de estar arquivado; purge cancelado")
-    managed, skipped = partition_managed_paths(root, [cfg.videos_root, cfg.output_root])
+    registered_roots = [
+        (registered.object_id, path)
+        for registered in workspace.list(include_archived=True)
+        for path in (registered.videos_root, registered.output_root)
+    ]
+    managed, skipped = partition_owned_object_paths(
+        root,
+        object_id,
+        [cfg.videos_root, cfg.output_root],
+        registered_roots=registered_roots,
+    )
     if [str(path) for path in managed] != list(job["payload"].get("managed_paths") or []):
         raise ValueError("raízes do objeto mudaram desde a solicitação; purge cancelado")
 
@@ -883,14 +912,19 @@ def run_object_purge(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     )
     removed_paths: list[str] = []
     for path in managed:
-        resolved = path.resolve()
+        still_managed, _ = partition_owned_object_paths(
+            root,
+            object_id,
+            [path],
+            registered_roots=registered_roots,
+        )
         # Revalida imediatamente antes do passo destrutivo; nenhuma string do
         # payload é usada como alvo.
-        if resolved == root or not resolved.is_relative_to(root):
-            raise ValueError(f"alvo saiu do workspace durante o purge: {resolved}")
-        if resolved.exists():
-            shutil.rmtree(resolved)
-            removed_paths.append(resolved.as_posix())
+        if still_managed != [path]:
+            raise ValueError(f"alvo perdeu ownership durante o purge: {path}")
+        if path.exists():
+            shutil.rmtree(path)
+            removed_paths.append(path.as_posix())
     workspace.remove_registration(object_id)
     queue.update_progress(
         str(job["id"]), token,

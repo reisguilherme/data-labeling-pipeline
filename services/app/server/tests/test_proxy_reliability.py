@@ -91,6 +91,20 @@ class ProxyReliabilityTests(unittest.TestCase):
         self.assertIsNone(proxy.locate_frame(self.ctx, "video-1", 0, proxy.SMALL))
         self.assertIn(".part", staging.name)
 
+    def test_staging_rejects_a_symlinked_cache_ancestor(self) -> None:
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        self.cache.mkdir()
+        try:
+            (self.cache / "proxy").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink indisponivel: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            proxy.new_staging_generation(self.root, self.cache)
+
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_current_is_the_only_publication_write_and_staging_is_hidden(self) -> None:
         staging = self._staging(frames=3)
         other_staging = proxy.new_staging_generation(self.root)

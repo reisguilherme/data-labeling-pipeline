@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .config import CACHE_LIMIT_GB, settings
 from .manifest import DownloadManifest, ExclusionList
+from .object_lifecycle import validate_new_object_roots
 from .store import AnnotationStore
 from .videos import VideoIndex, iso
 
@@ -463,8 +464,22 @@ class Workspace:
 
     def create(self, cfg: ObjectConfig) -> ObjectConfig:
         validate_object_id(cfg.object_id)
+        if self.root is None:
+            raise RuntimeError("workspace_root nao configurado")
         if cfg.object_id in self._objects:
             raise ValueError(f"já existe um objeto com o id '{cfg.object_id}'")
+        registered_roots = [
+            (current.object_id, path)
+            for current in self._objects.values()
+            for path in (current.videos_root, current.output_root)
+        ]
+        cfg.videos_root, cfg.output_root = validate_new_object_roots(
+            self.root,
+            cfg.object_id,
+            cfg.videos_root,
+            cfg.output_root,
+            registered_roots=registered_roots,
+        )
         cfg.created_at = cfg.created_at or iso()
         self._objects[cfg.object_id] = cfg
         self.save()

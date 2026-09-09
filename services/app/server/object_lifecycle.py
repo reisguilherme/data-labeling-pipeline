@@ -53,6 +53,107 @@ def partition_managed_paths(
     return managed, skipped
 
 
+def _lexical(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.fspath(_lexical(left))) == os.path.normcase(
+        os.fspath(_lexical(right))
+    )
+
+
+def _overlaps(left: Path, right: Path) -> bool:
+    left = left.resolve()
+    right = right.resolve()
+    return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _contains_symlink(workspace_root: Path, candidate: Path) -> bool:
+    root = _lexical(workspace_root)
+    path = _lexical(candidate)
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _exclusive_default_root(
+    workspace_root: Path,
+    object_id: str,
+    candidate: Path,
+    kind: str,
+    registered_roots: Iterable[tuple[str, Path]],
+) -> bool:
+    root = workspace_root.resolve()
+    expected = root / object_id / kind
+    if not _same_path(candidate, expected):
+        return False
+    if _contains_symlink(root, candidate):
+        return False
+    resolved = candidate.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        return False
+    for registered_object, registered in registered_roots:
+        if registered_object != object_id and _overlaps(resolved, registered):
+            return False
+    return True
+
+
+def validate_new_object_roots(
+    workspace_root: Path,
+    object_id: str,
+    videos_root: Path,
+    output_root: Path,
+    *,
+    registered_roots: Iterable[tuple[str, Path]] = (),
+) -> tuple[Path, Path]:
+    """Novos objetos sempre possuem roots exclusivos no layout portatil."""
+    root = workspace_root.resolve()
+    registered = tuple(registered_roots)
+    if not _exclusive_default_root(
+        root, object_id, videos_root, "raw", registered
+    ) or not _exclusive_default_root(
+        root, object_id, output_root, "dataset", registered
+    ):
+        raise ValueError(
+            "raizes do objeto devem usar o layout exclusivo "
+            f"{object_id}/raw e {object_id}/dataset dentro do workspace"
+        )
+    return root / object_id / "raw", root / object_id / "dataset"
+
+
+def partition_owned_object_paths(
+    workspace_root: Path,
+    object_id: str,
+    paths: Iterable[Path],
+    *,
+    registered_roots: Iterable[tuple[str, Path]] = (),
+) -> tuple[list[Path], list[Path]]:
+    """Seleciona apenas os dois roots exclusivos que um purge pode remover."""
+    root = workspace_root.resolve()
+    registered = tuple(registered_roots)
+    managed: list[Path] = []
+    skipped: list[Path] = []
+    for path in paths:
+        kind = "raw" if _same_path(path, root / object_id / "raw") else (
+            "dataset" if _same_path(path, root / object_id / "dataset") else None
+        )
+        if kind is not None and _exclusive_default_root(
+            root, object_id, path, kind, registered
+        ):
+            managed.append(path)
+        else:
+            skipped.append(path)
+    return managed, skipped
+
+
 def active_durable_jobs(database_url: str | None, object_id: str) -> int:
     if not database_url:
         return 0

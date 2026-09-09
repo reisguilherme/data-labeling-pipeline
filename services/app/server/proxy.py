@@ -115,12 +115,47 @@ def frame_file(directory: Path, local_index: int) -> Path:
     return directory / f"{local_index:06d}.jpg"
 
 
-def new_staging_generation(root: Path) -> Path:
+def _staging_cache_root(root: Path, cache_root: Path | None) -> tuple[Path, Path]:
+    candidate = Path(os.path.abspath(os.fspath(root)))
+    if cache_root is None:
+        for ancestor in candidate.parents:
+            relative = candidate.relative_to(ancestor)
+            if relative.parts and relative.parts[0] in {"proxy", "windows"}:
+                cache_root = ancestor
+                break
+    if cache_root is None:
+        raise ValueError("raiz de staging nao pertence a um cache conhecido")
+    cache = Path(os.path.abspath(os.fspath(cache_root)))
+    try:
+        relative = candidate.relative_to(cache)
+    except ValueError as exc:
+        raise ValueError("raiz de staging fora do cache") from exc
+    if len(relative.parts) < 2 or relative.parts[0] not in {"proxy", "windows"}:
+        raise ValueError("layout de staging invalido")
+    if cache.is_symlink():
+        raise ValueError("cache nao pode ser symlink")
+    current = cache
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("ancestral do staging nao pode ser symlink")
+        if current.exists() and not current.is_dir():
+            raise ValueError("ancestral do staging precisa ser diretorio")
+    resolved_cache = cache.resolve()
+    resolved = candidate.resolve()
+    if resolved == resolved_cache or not resolved.is_relative_to(resolved_cache):
+        raise ValueError("raiz de staging fora do cache")
+    return candidate, cache
+
+
+def new_staging_generation(root: Path, cache_root: Path | None = None) -> Path:
     """Reserva um staging único sob a mesma trava usada por publish/eviction."""
+    root, cache_root = _staging_cache_root(root, cache_root)
     if root.is_symlink():
         raise ValueError("raiz do proxy não pode ser symlink")
     staging = root / GENERATIONS_DIR / f".{uuid.uuid4().hex}.part"
     with _exclusive_file_lock(root / ".publish.lock"):
+        _staging_cache_root(root, cache_root)
         staging.mkdir(parents=True)
     return staging
 
@@ -1340,7 +1375,7 @@ async def start_full(
         return existing[0]
 
     # Cada tentativa recebe um staging próprio e invisível para as rotas.
-    staging = new_staging_generation(out)
+    staging = new_staging_generation(out, ctx.cache_dir)
     for tier in TIERS:
         (staging / tier).mkdir(parents=True, exist_ok=True)
 
@@ -1416,7 +1451,7 @@ async def start_window(
             return job, start, end
 
     final = window_dir(ctx, video_id, start, end)
-    staging = new_staging_generation(final)
+    staging = new_staging_generation(final, ctx.cache_dir)
     for tier in TIERS:
         (staging / tier).mkdir(parents=True, exist_ok=True)
 
