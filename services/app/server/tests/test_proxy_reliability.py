@@ -4,12 +4,14 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from server import proxy
+from starlette.responses import FileResponse
 
 
 class ProxyReliabilityTests(unittest.TestCase):
@@ -276,6 +278,23 @@ class ProxyReliabilityTests(unittest.TestCase):
                     proxy.current_generation(self.root, expected_kind="full")
                 )
 
+        marker_path.write_text(
+            '{"schema_version":2,"frames":' + ("9" * 5000) + "}",
+            encoding="utf-8",
+        )
+        self.assertIsNone(proxy.current_generation(self.root, expected_kind="full"))
+
+    def test_malformed_window_index_integer_is_an_empty_cache_not_an_error(self) -> None:
+        base = self.cache / "windows" / "video-1"
+        base.mkdir(parents=True)
+        (base / proxy.WINDOWS_INDEX).write_text(
+            '{"schema_version":1,"windows":[{"start":' + ("9" * 5000) + "}]}",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [])
+        self.assertIsNone(proxy.locate_frame(self.ctx, "video-1", 0, proxy.SMALL))
+
     def test_window_reads_use_atomic_index_without_directory_enumeration(self) -> None:
         roots = [
             proxy.window_dir(self.ctx, "video-1", 0, 1),
@@ -312,6 +331,63 @@ class ProxyReliabilityTests(unittest.TestCase):
         ):
             self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [[0, 1], [4, 5]])
             self.assertIsNotNone(proxy.locate_frame(self.ctx, "video-1", 5, proxy.FULL))
+
+    def test_frame_lookup_reads_only_constant_candidate_markers_with_many_windows(self) -> None:
+        for start in range(0, 120, 2):
+            root = proxy.window_dir(self.ctx, "video-1", start, start)
+            staging = proxy.new_staging_generation(root)
+            for tier in proxy.TIERS:
+                (staging / tier).mkdir(parents=True, exist_ok=True)
+                (staging / tier / "000000.jpg").write_bytes(b"jpeg")
+            proxy.publish_generation(
+                staging,
+                root,
+                self.cache,
+                kind="window",
+                job_id=f"window-{start}",
+                start=start,
+                end=start,
+            )
+
+        marker_reads = 0
+        real_bounded_text = proxy._bounded_text
+
+        def count_marker_reads(path: Path, limit: int):
+            nonlocal marker_reads
+            if path.name == proxy.COMPLETE_MARKER:
+                marker_reads += 1
+            return real_bounded_text(path, limit)
+
+        with patch("server.proxy._bounded_text", side_effect=count_marker_reads):
+            located = proxy.locate_frame(self.ctx, "video-1", 118, proxy.FULL)
+
+        self.assertIsNotNone(located)
+        self.assertLessEqual(marker_reads, 2)
+
+    def test_newest_overlapping_window_wins_only_inside_its_coverage(self) -> None:
+        for start, end, payload in ((0, 4, b"old"), (2, 2, b"new")):
+            root = proxy.window_dir(self.ctx, "video-1", start, end)
+            staging = proxy.new_staging_generation(root)
+            for tier in proxy.TIERS:
+                (staging / tier).mkdir()
+                for local in range(end - start + 1):
+                    (staging / tier / f"{local:06d}.jpg").write_bytes(payload)
+            proxy.publish_generation(
+                staging,
+                root,
+                self.cache,
+                kind="window",
+                job_id=f"window-{start}-{end}",
+                start=start,
+                end=end,
+            )
+
+        left = proxy.locate_frame(self.ctx, "video-1", 1, proxy.FULL)
+        overlap = proxy.locate_frame(self.ctx, "video-1", 2, proxy.FULL)
+        right = proxy.locate_frame(self.ctx, "video-1", 3, proxy.FULL)
+        self.assertEqual(left.read_bytes(), b"old")
+        self.assertEqual(overlap.read_bytes(), b"new")
+        self.assertEqual(right.read_bytes(), b"old")
 
     def test_failed_window_index_swap_preserves_previous_manifest(self) -> None:
         first_root = proxy.window_dir(self.ctx, "video-1", 0, 0)
@@ -369,10 +445,28 @@ class ProxyReliabilityTests(unittest.TestCase):
             job_id="new",
         )
 
-        self.assertFalse(old.path.exists())
+        self.assertTrue(old.path.exists(), "geração resolvida precisa de grace period")
         self.assertTrue(new.path.exists())
         self.assertTrue(concurrent_staging.exists())
         self.assertEqual(proxy.current_generation(self.root).token, new.token)
+
+        newest = proxy.publish_generation(
+            self._staging(frames=3),
+            self.root,
+            self.cache,
+            kind="full",
+            job_id="newest",
+        )
+        proxy.collect_stale_generations(
+            self.root,
+            self.cache,
+            max_delete=8,
+            retire_grace_seconds=0,
+        )
+        self.assertFalse(old.path.exists())
+        self.assertTrue(new.path.exists(), "a geração anterior imediata é preservada")
+        self.assertTrue(newest.path.exists())
+        self.assertTrue(concurrent_staging.exists())
 
     def test_gc_is_bounded_and_refuses_roots_outside_cache(self) -> None:
         current = self._publish(frames=1)
@@ -385,7 +479,7 @@ class ProxyReliabilityTests(unittest.TestCase):
             stale_paths.append(final)
 
         removed = proxy.collect_stale_generations(
-            self.root, self.cache, max_delete=1
+            self.root, self.cache, max_delete=1, retire_grace_seconds=0
         )
         self.assertEqual(removed, 1)
         self.assertEqual(sum(path.exists() for path in stale_paths), 2)
@@ -395,6 +489,155 @@ class ProxyReliabilityTests(unittest.TestCase):
         outside.mkdir()
         with self.assertRaisesRegex(ValueError, "fora do cache"):
             proxy.collect_stale_generations(outside, self.cache)
+
+    def test_file_response_path_survives_publication_and_immediate_gc(self) -> None:
+        old = self._publish(frames=1)
+        resolved = proxy.locate_frame(self.ctx, "video-1", 0, proxy.FULL)
+        self.assertIsNotNone(resolved)
+        response = FileResponse(resolved, media_type="image/jpeg")
+
+        proxy.publish_generation(
+            self._staging(frames=2),
+            self.root,
+            self.cache,
+            kind="full",
+            job_id="replacement",
+        )
+        proxy.collect_stale_generations(self.root, self.cache)
+
+        self.assertEqual(Path(response.path), resolved)
+        self.assertTrue(resolved.exists())
+        self.assertTrue(old.path.exists())
+
+    def test_lru_keeps_current_when_a_staging_generation_exists(self) -> None:
+        window_root = proxy.window_dir(self.ctx, "video-1", 0, 0)
+        staging = proxy.new_staging_generation(window_root)
+        self.assertTrue(staging.is_dir(), "staging precisa ser reservado sob a trava")
+        for tier in proxy.TIERS:
+            (staging / tier).mkdir()
+            (staging / tier / "000000.jpg").write_bytes(b"jpeg")
+        published = proxy.publish_generation(
+            staging,
+            window_root,
+            self.cache,
+            kind="window",
+            job_id="published",
+            start=0,
+            end=0,
+        )
+        active_staging = proxy.new_staging_generation(window_root)
+
+        with patch("server.proxy.CACHE_LIMIT_GB", 0):
+            proxy._evict_if_needed(self.ctx)
+
+        self.assertTrue(active_staging.exists())
+        self.assertTrue(published.path.exists())
+        self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [[0, 0]])
+
+    def test_lru_unpublishes_window_index_but_preserves_resolved_frame(self) -> None:
+        window_root = proxy.window_dir(self.ctx, "video-1", 4, 4)
+        staging = proxy.new_staging_generation(window_root)
+        for tier in proxy.TIERS:
+            (staging / tier).mkdir()
+            (staging / tier / "000000.jpg").write_bytes(b"jpeg")
+        proxy.publish_generation(
+            staging,
+            window_root,
+            self.cache,
+            kind="window",
+            job_id="published",
+            start=4,
+            end=4,
+        )
+        resolved = proxy.locate_frame(self.ctx, "video-1", 4, proxy.FULL)
+
+        with patch("server.proxy.CACHE_LIMIT_GB", 0):
+            proxy._evict_if_needed(self.ctx)
+
+        self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [])
+        self.assertTrue(resolved.exists(), "request já resolvido não pode perder o arquivo")
+
+    def test_lru_marker_failure_keeps_published_window_discoverable(self) -> None:
+        window_root = proxy.window_dir(self.ctx, "video-1", 7, 7)
+        staging = proxy.new_staging_generation(window_root)
+        for tier in proxy.TIERS:
+            (staging / tier).mkdir()
+            (staging / tier / "000000.jpg").write_bytes(b"jpeg")
+        published = proxy.publish_generation(
+            staging,
+            window_root,
+            self.cache,
+            kind="window",
+            job_id="marker-failure",
+            start=7,
+            end=7,
+        )
+        real_fsync = proxy._fsync_file
+
+        def fail_retirement_marker(path: Path, data: str) -> None:
+            if path.name == proxy.RETIRE_MARKER:
+                raise OSError("retirement marker failed")
+            real_fsync(path, data)
+
+        with patch("server.proxy._fsync_file", side_effect=fail_retirement_marker):
+            with self.assertRaisesRegex(OSError, "retirement marker failed"):
+                proxy._retire_proxy_root(window_root, self.cache)
+
+        self.assertEqual(proxy.current_generation(window_root).token, published.token)
+        self.assertIsNotNone(proxy.locate_frame(self.ctx, "video-1", 7, proxy.FULL))
+
+    def test_expired_staging_does_not_pin_lru_and_is_eventually_collected(self) -> None:
+        window_root = proxy.window_dir(self.ctx, "video-1", 9, 9)
+        staging = proxy.new_staging_generation(window_root)
+        for tier in proxy.TIERS:
+            (staging / tier).mkdir()
+            (staging / tier / "000000.jpg").write_bytes(b"jpeg")
+        proxy.publish_generation(
+            staging,
+            window_root,
+            self.cache,
+            kind="window",
+            job_id="published-before-crash",
+            start=9,
+            end=9,
+        )
+        abandoned = proxy.new_staging_generation(window_root)
+        (abandoned / "partial").mkdir()
+        (abandoned / "partial" / "000000.jpg").write_bytes(b"partial")
+        old = time.time() - proxy.STAGING_ORPHAN_GRACE_SECONDS - 10
+        for entry in sorted(abandoned.rglob("*"), reverse=True):
+            os.utime(entry, (old, old))
+        os.utime(abandoned, (old, old))
+
+        with patch("server.proxy._schedule_stale_generation_gc"):
+            self.assertTrue(proxy._retire_proxy_root(window_root, self.cache))
+
+        proxy.collect_stale_generations(
+            window_root,
+            self.cache,
+            max_delete=8,
+            retire_grace_seconds=0,
+            staging_grace_seconds=0,
+        )
+        self.assertFalse(abandoned.exists())
+        self.assertIsNone(proxy.current_generation(window_root))
+
+    def test_lru_skips_busy_publication_lock_without_waiting(self) -> None:
+        published = self._publish(frames=1)
+        result: list[bool] = []
+
+        def retire() -> None:
+            result.append(proxy._retire_proxy_root(self.root, self.cache))
+
+        with proxy._exclusive_file_lock(self.root / ".publish.lock"):
+            contender = threading.Thread(target=retire)
+            contender.start()
+            contender.join(timeout=0.2)
+            self.assertFalse(contender.is_alive(), "LRU bloqueou esperando publisher")
+
+        self.assertEqual(result, [False])
+        self.assertTrue(published.path.exists())
+        self.assertEqual(proxy.current_generation(self.root).token, published.token)
 
     def test_gc_cannot_delete_generation_while_another_publisher_is_committing(self) -> None:
         self._publish(frames=1)
@@ -453,6 +696,8 @@ class ProxyReliabilityTests(unittest.TestCase):
         stale_staging = self._staging(frames=1)
         stale = stale_staging.parent / stale_staging.name[1:-5]
         stale_staging.replace(stale)
+        newer_staging = self._staging(frames=1)
+        newer_staging.replace(newer_staging.parent / newer_staging.name[1:-5])
         deletion_started = threading.Event()
         allow_deletion = threading.Event()
         errors: list[BaseException] = []
@@ -467,7 +712,9 @@ class ProxyReliabilityTests(unittest.TestCase):
 
         def collect() -> None:
             try:
-                proxy.collect_stale_generations(self.root, self.cache)
+                proxy.collect_stale_generations(
+                    self.root, self.cache, retire_grace_seconds=0
+                )
             except BaseException as exc:  # pragma: no cover - surfaced below
                 errors.append(exc)
 
@@ -510,7 +757,7 @@ class ProxyReliabilityTests(unittest.TestCase):
         old = self._publish(frames=1)
         with self.assertLogs("movies-screening-tool.proxy", level="WARNING") as logs:
             with patch(
-                "server.proxy.collect_stale_generations",
+                "server.proxy._schedule_stale_generation_gc",
                 side_effect=RuntimeError("gc crashed"),
             ):
                 generation = proxy.publish_generation(
@@ -523,7 +770,7 @@ class ProxyReliabilityTests(unittest.TestCase):
 
         self.assertNotEqual(generation.token, old.token)
         self.assertEqual(proxy.current_generation(self.root).token, generation.token)
-        self.assertIn("falha ao coletar gerações antigas", logs.output[0])
+        self.assertIn("não foi possível agendar GC", logs.output[0])
 
 
 if __name__ == "__main__":

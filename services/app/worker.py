@@ -205,7 +205,12 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             publish_guard=publish_guard,
         )
         proxy._touch(final)
-        proxy._evict_if_needed(ctx)
+        try:
+            proxy._evict_if_needed(ctx)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "falha na manutenção LRU após publicar janela", exc_info=True
+            )
         return {
             "start": start,
             "end": end,
@@ -545,6 +550,18 @@ def run_object_purge(job: dict, queue: PostgresJobQueue, token: str) -> dict:
 log = logging.getLogger("pipeline.cpu-worker")
 
 
+def _settle_job_best_effort(job_id: str, action) -> None:
+    """Perder a lease abandona o resultado; nunca encerra o consumidor CPU."""
+    try:
+        action()
+    except Exception:  # noqa: BLE001 - qualquer falha será recuperada pela lease/reaper
+        log.warning(
+            "não foi possível finalizar job %s; lease será reavaliada",
+            job_id,
+            exc_info=True,
+        )
+
+
 def main() -> int:
     import psycopg
 
@@ -594,16 +611,29 @@ def main() -> int:
                 raise lease_errors[0]
             stop_heartbeat.set()
             heartbeat.join(timeout=5)
-            queue.finish(str(job["id"]), token, state="done", result=result)
+            _settle_job_best_effort(
+                str(job["id"]),
+                lambda: queue.finish(
+                    str(job["id"]), token, state="done", result=result
+                ),
+            )
         except Cancelled as exc:
             stop_heartbeat.set()
             heartbeat.join(timeout=5)
-            queue.finish(str(job["id"]), token, state="cancelled", error=str(exc))
+            _settle_job_best_effort(
+                str(job["id"]),
+                lambda: queue.finish(
+                    str(job["id"]), token, state="cancelled", error=str(exc)
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             stop_heartbeat.set()
             heartbeat.join(timeout=5)
             log.exception("job %s falhou", job["id"])
-            queue.retry_or_fail(str(job["id"]), token, str(exc))
+            _settle_job_best_effort(
+                str(job["id"]),
+                lambda: queue.retry_or_fail(str(job["id"]), token, str(exc)),
+            )
 
 
 if __name__ == "__main__":

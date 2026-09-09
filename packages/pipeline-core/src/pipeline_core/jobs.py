@@ -26,7 +26,36 @@ def priority_for(kind: str) -> int:
 
 
 CLAIM_SQL = """
-WITH candidate AS (
+WITH expired_terminal_candidates AS (
+    SELECT id
+      FROM jobs
+     WHERE state IN ('leased', 'running')
+       AND lease_expires_at <= now()
+       AND (cancel_requested OR attempts >= max_attempts)
+     ORDER BY updated_at ASC
+     FOR UPDATE SKIP LOCKED
+     LIMIT 100
+),
+expired_terminal AS (
+    UPDATE jobs AS expired
+       SET state = CASE
+               WHEN expired.cancel_requested THEN 'cancelled'::job_state
+               ELSE 'error'::job_state
+           END,
+           error = CASE
+               WHEN expired.cancel_requested THEN COALESCE(expired.error, 'cancelamento solicitado')
+               ELSE COALESCE(expired.error, 'lease expirada após esgotar tentativas')
+           END,
+           worker_id = NULL,
+           lease_token = NULL,
+           lease_expires_at = NULL,
+           finished_at = now(),
+           updated_at = now()
+      FROM expired_terminal_candidates AS candidate
+     WHERE expired.id = candidate.id
+    RETURNING expired.id
+),
+candidate AS (
     SELECT id
       FROM jobs
      WHERE cancel_requested = FALSE
@@ -114,6 +143,7 @@ class PostgresJobQueue:
                      WHERE id = %(job_id)s
                        AND lease_token = %(lease_token)s::uuid
                        AND state IN ('leased', 'running')
+                       AND lease_expires_at > now()
                     RETURNING cancel_requested
                     """,
                     {
@@ -152,6 +182,7 @@ class PostgresJobQueue:
                         lease_expires_at=now() + %(lease_duration)s, updated_at=now()
                      WHERE id=%(job_id)s AND lease_token=%(lease_token)s::uuid
                        AND state IN ('leased','running')
+                       AND lease_expires_at > now()
                     RETURNING cancel_requested
                     """,
                     {
@@ -185,6 +216,8 @@ class PostgresJobQueue:
                         finished_at=CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
                         updated_at=now()
                      WHERE id=%(job_id)s AND lease_token=%(lease_token)s::uuid
+                       AND state IN ('leased','running')
+                       AND lease_expires_at > now()
                     RETURNING state::text
                     """,
                     {"job_id": job_id, "lease_token": lease_token, "error": error},
@@ -228,6 +261,7 @@ class PostgresJobQueue:
                      WHERE id = %(job_id)s
                        AND lease_token = %(lease_token)s::uuid
                        AND state IN ('leased', 'running')
+                       AND lease_expires_at > now()
                     """,
                     {
                         "job_id": job_id,
