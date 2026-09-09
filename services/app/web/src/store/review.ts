@@ -22,6 +22,7 @@ interface ReviewState {
   segments: string[];
   name: string;
   label: string;
+  exportVersion: string;
   frameCount: number;
   frames: ReviewFrame[];
   current: number;
@@ -57,6 +58,7 @@ const ZOOM_MAX = 8;
 /** Pendências de escrita, fora da store: são efeito, não estado renderizável. */
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 const pending = new Map<number, ReviewFrame>();
+let openGeneration = 0;
 
 export const useReview = create<ReviewState>((set, get) => {
   async function flushNow(): Promise<void> {
@@ -64,8 +66,8 @@ export const useReview = create<ReviewState>((set, get) => {
       clearTimeout(saveTimer);
       saveTimer = null;
     }
-    const { videoId, segment } = get();
-    if (!videoId || !segment || pending.size === 0) return;
+    const { videoId, segment, exportVersion } = get();
+    if (!videoId || !segment || !exportVersion || pending.size === 0) return;
 
     const batch = [...pending.entries()];
     pending.clear();
@@ -73,6 +75,7 @@ export const useReview = create<ReviewState>((set, get) => {
     try {
       for (const [frame, entry] of batch) {
         await api.reviewFrame(videoId, segment, frame, {
+          export_version: exportVersion,
           status: entry.status === "edited" ? "edited" : "ok",
           boxes: entry.boxes,
         });
@@ -116,6 +119,7 @@ export const useReview = create<ReviewState>((set, get) => {
     segments: [],
     name: "",
     label: "",
+    exportVersion: "",
     frameCount: 0,
     frames: [],
     current: 0,
@@ -130,10 +134,17 @@ export const useReview = create<ReviewState>((set, get) => {
     panY: 0,
 
     open: async (videoId, segment) => {
+      const generation = ++openGeneration;
       await flushNow();
+      if (generation !== openGeneration) return;
       set({ loading: true, error: null, videoId, segment, frames: [], current: 0 });
       try {
         const data: ReviewSegment = await api.segmentReview(videoId, segment);
+        if (
+          generation !== openGeneration
+          || get().videoId !== videoId
+          || get().segment !== segment
+        ) return;
         // Primeiro frame ainda não revisado: retomar onde parou é o que torna
         // um segmento de 799 frames possível em mais de uma sessão.
         const resume = data.frames.findIndex((f) => !f.status);
@@ -141,6 +152,7 @@ export const useReview = create<ReviewState>((set, get) => {
           segments: data.segments,
           name: data.name,
           label: data.label,
+          exportVersion: data.export_version,
           frameCount: data.frame_count,
           frames: data.frames,
           current: resume === -1 ? 0 : resume,
@@ -153,13 +165,16 @@ export const useReview = create<ReviewState>((set, get) => {
           panY: 0,
         });
       } catch (error) {
-        set({ loading: false, error: (error as Error).message });
+        if (generation === openGeneration) {
+          set({ loading: false, error: (error as Error).message });
+        }
       }
     },
 
     close: () => {
+      openGeneration += 1;
       void flushNow();
-      set({ videoId: null, segment: null, frames: [], current: 0 });
+      set({ videoId: null, segment: null, exportVersion: "", frames: [], current: 0 });
     },
 
     goto: (frame) => {
@@ -191,13 +206,17 @@ export const useReview = create<ReviewState>((set, get) => {
     },
 
     resetFrame: async () => {
-      const { videoId, segment, current, frames } = get();
-      if (!videoId || !segment) return;
+      const { videoId, segment, current, frames, exportVersion } = get();
+      if (!videoId || !segment || !exportVersion) return;
       await flushNow();
       try {
-        await api.reviewReset(videoId, segment, current);
+        await api.reviewReset(videoId, segment, current, exportVersion);
         const data: ReviewSegment = await api.segmentReview(videoId, segment);
-        set({ frames: data.frames, selectedBox: -1 });
+        set({
+          frames: data.frames,
+          exportVersion: data.export_version,
+          selectedBox: -1,
+        });
       } catch (error) {
         set({ error: (error as Error).message });
         set({ frames });
@@ -205,13 +224,23 @@ export const useReview = create<ReviewState>((set, get) => {
     },
 
     confirmRest: async () => {
-      const { videoId, segment, current, frameCount } = get();
-      if (!videoId || !segment) return;
+      const { videoId, segment, current, frameCount, exportVersion } = get();
+      if (!videoId || !segment || !exportVersion) return;
       await flushNow();
       try {
-        await api.reviewConfirm(videoId, segment, current, frameCount - 1);
+        await api.reviewConfirm(
+          videoId,
+          segment,
+          current,
+          frameCount - 1,
+          exportVersion,
+        );
         const data: ReviewSegment = await api.segmentReview(videoId, segment);
-        set({ frames: data.frames, current: frameCount - 1 });
+        set({
+          frames: data.frames,
+          exportVersion: data.export_version,
+          current: frameCount - 1,
+        });
       } catch (error) {
         set({ error: (error as Error).message });
       }

@@ -68,6 +68,7 @@ export interface ReviewSegment {
   segments: string[];
   classes: string[];
   label: string;
+  export_version: string;
   prompt: {
     image_width?: number;
     image_height?: number;

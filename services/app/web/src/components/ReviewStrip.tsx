@@ -22,12 +22,14 @@ const OVERSCAN = 6;
 export function ReviewStrip({
   videoId,
   segment,
+  exportVersion,
   frames,
   current,
   onPick,
 }: {
   videoId: string;
   segment: string;
+  exportVersion: string;
   frames: ReviewFrame[];
   current: number;
   onPick: (frame: number) => void;
@@ -92,7 +94,7 @@ export function ReviewStrip({
                 )}
               >
                 <img
-                  src={api.segmentFrameUrl(videoId, segment, frame.frame)}
+                  src={api.segmentFrameUrl(videoId, segment, frame.frame, exportVersion)}
                   alt=""
                   loading="lazy"
                   decoding="async"

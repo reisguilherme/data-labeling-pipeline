@@ -33,7 +33,10 @@ class MaskApiContractTests(unittest.TestCase):
 
         self.assertEqual(payload["revision"], 0)
         self.assertEqual(payload["instances"][0]["bbox"], [0.4, 0.5, 0.5, 0.6])
-        self.assertEqual(payload["instances"][0]["mask_url"], "/masks/3.png?revision=0")
+        self.assertEqual(
+            payload["instances"][0]["mask_url"],
+            f"/masks/3.png?revision=0&sha256={payload['instances'][0]['sha256']}",
+        )
 
     def test_decodes_binary_png_from_base64_payload(self) -> None:
         png = encode_binary_png(Image.new("1", (4, 4), 0))

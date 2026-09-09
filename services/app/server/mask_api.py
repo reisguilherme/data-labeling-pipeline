@@ -70,7 +70,10 @@ def serialize_frame_state(
             {
                 "obj_id": instance.obj_id,
                 "label": instance.label,
-                "mask_url": f"{mask_url(instance.obj_id)}?revision={state.revision}",
+                "mask_url": (
+                    f"{mask_url(instance.obj_id)}?revision={state.revision}"
+                    f"&sha256={instance.info.sha256}"
+                ),
                 "bbox": list(instance.info.bbox_normalized)
                 if instance.info.bbox_normalized is not None
                 else None,

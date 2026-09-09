@@ -409,35 +409,48 @@ export const api = {
     request<ReviewSegment>(`${O()}/videos/${videoId}/segments/${segment}/review`),
 
   /** Frame do EXPORT — não do cache de proxy, que é evictável. */
-  segmentFrameUrl: (videoId: string, segment: string, frame: number) =>
-    `${O()}/videos/${videoId}/segments/${segment}/frames/${frame}.jpg`,
+  segmentFrameUrl: (videoId: string, segment: string, frame: number, version?: string) =>
+    `${O()}/videos/${videoId}/segments/${segment}/frames/${frame}.jpg${
+      version ? `?version=${encodeURIComponent(version)}` : ""
+    }`,
 
   reviewFrame: (
     videoId: string,
     segment: string,
     frame: number,
-    payload: { status: "ok" | "edited"; boxes: BBox[] },
+    payload: { export_version: string; status: "ok" | "edited"; boxes: BBox[] },
   ) =>
     request<{ frame: number; status: string }>(
       `${O()}/videos/${videoId}/segments/${segment}/review/${frame}`,
       { method: "PUT", body: JSON.stringify(payload) },
     ),
 
-  reviewConfirm: (videoId: string, segment: string, start: number, end: number) =>
+  reviewConfirm: (
+    videoId: string,
+    segment: string,
+    start: number,
+    end: number,
+    exportVersion: string,
+  ) =>
     request<{ confirmed: number; reviewed: number; complete: boolean }>(
       `${O()}/videos/${videoId}/segments/${segment}/review/confirm`,
-      { method: "POST", body: JSON.stringify({ start, end }) },
+      { method: "POST", body: JSON.stringify({ start, end, export_version: exportVersion }) },
     ),
 
-  reviewReset: (videoId: string, segment: string, frame: number) =>
+  reviewReset: (videoId: string, segment: string, frame: number, exportVersion: string) =>
     request<{ frame: number }>(
-      `${O()}/videos/${videoId}/segments/${segment}/review/${frame}`,
+      `${O()}/videos/${videoId}/segments/${segment}/review/${frame}?export_version=${encodeURIComponent(exportVersion)}`,
       { method: "DELETE" },
     ),
 
-  maskReviewFrame: (videoId: string, segment: string, frame: number) =>
+  maskReviewFrame: (
+    videoId: string,
+    segment: string,
+    frame: number,
+    exportVersion: string,
+  ) =>
     request<MaskReviewFrame>(
-      `${O()}/videos/${videoId}/segments/${segment}/mask-review/${frame}`,
+      `${O()}/videos/${videoId}/segments/${segment}/mask-review/${frame}?export_version=${encodeURIComponent(exportVersion)}`,
     ),
 
   saveMaskReviewFrame: (
@@ -446,6 +459,7 @@ export const api = {
     frame: number,
     payload: {
       expected_revision: number;
+      export_version: string;
       status: "ok" | "edited";
       instances: { obj_id: number; label: string; png_base64: string }[];
       retain_obj_ids?: number[];
@@ -460,10 +474,11 @@ export const api = {
     videoId: string,
     segment: string,
     frames: import("./types").MaskReviewBatchFrame[],
+    exportVersion: string,
   ) =>
     request<import("./types").MaskReviewBatchResult>(
       `${O()}/videos/${videoId}/segments/${segment}/mask-review`,
-      { method: "PUT", body: JSON.stringify({ frames }) },
+      { method: "PUT", body: JSON.stringify({ frames, export_version: exportVersion }) },
     ),
 
   // -- dataset --------------------------------------------------------------

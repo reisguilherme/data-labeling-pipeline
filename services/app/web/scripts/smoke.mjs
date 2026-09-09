@@ -185,6 +185,7 @@ const SEGMENT_REVIEW = {
   segments: ["seg_00"],
   classes: ["boom"],
   label: "boom",
+  export_version: "export-v1",
   prompt: {
     image_width: 3840,
     image_height: 2160,
@@ -884,7 +885,7 @@ const routes = [
   [/\/videos\/[^/]+\/review$/, { ...SEGMENT_REVIEW, complete: false, segments: [{ segment: "seg_00", complete: false }] }],
   [/\/segments\/[^/]+\/review$/, scenario.segmentReview ?? SEGMENT_REVIEW],
   [/\/segments\/[^/]+\/mask-review$/, { frames: [], reviewed: 2, frame_count: 2, complete: true }],
-  [/\/segments\/[^/]+\/mask-review\/\d+$/, (url) => ({
+  [/\/segments\/[^/]+\/mask-review\/\d+(?:\?.*)?$/, (url) => ({
     ...MASK_REVIEW,
     frame: Number(url.match(/mask-review\/(\d+)/)?.[1] ?? 0),
     revision: 0,
@@ -1042,7 +1043,7 @@ window.fetch = async (input, init = {}) => {
       }),
     };
   }
-  if (scenario.action === "review-walk-save" && /\/mask-review\/\d+$/.test(url)) {
+  if (scenario.action === "review-walk-save" && /\/mask-review\/\d+(?:\?.*)?$/.test(url)) {
     maskFrameRequests += 1;
     if (maskFrameRequests === 2) await new Promise((resolve) => setTimeout(resolve, 120));
   }

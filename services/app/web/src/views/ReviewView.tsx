@@ -25,6 +25,7 @@ export function ReviewView({
   const flush = useReview((s) => s.flush);
   const segment = useReview((s) => s.segment);
   const segments = useReview((s) => s.segments);
+  const exportVersion = useReview((s) => s.exportVersion);
   const frames = useReview((s) => s.frames);
   const current = useReview((s) => s.current);
   const frameCount = useReview((s) => s.frameCount);
@@ -92,13 +93,13 @@ export function ReviewView({
   }, [video.video_id, segment]);
 
   useEffect(() => {
-    if (!segment) return;
+    if (!segment || !exportVersion) return;
     let active = true;
     setMaskFrame(null);
     setMaskLoading(true);
     setMaskUnavailable(false);
     void api
-      .maskReviewFrame(video.video_id, segment, current)
+      .maskReviewFrame(video.video_id, segment, current, exportVersion)
       .then((data) => {
         if (!active) return;
         setMaskFrame(data);
@@ -115,7 +116,7 @@ export function ReviewView({
     return () => {
       active = false;
     };
-  }, [video.video_id, segment, current]);
+  }, [video.video_id, segment, current, exportVersion]);
 
   const hasPendingReview = Object.keys(drafts).length > 0 || [...visited].some(
     (frame) => !maskStates[frame]?.status,
@@ -136,7 +137,7 @@ export function ReviewView({
   }, [hasPendingReview]);
 
   const src = segment
-    ? api.segmentFrameUrl(video.video_id, segment, current)
+    ? api.segmentFrameUrl(video.video_id, segment, current, exportVersion)
     : "";
 
   useEffect(() => {
@@ -146,11 +147,11 @@ export function ReviewView({
       const target = current + offset;
       if (target < 0 || target >= frameCount || offset === 0) continue;
       const image = new Image();
-      image.src = api.segmentFrameUrl(video.video_id, segment, target);
+      image.src = api.segmentFrameUrl(video.video_id, segment, target, exportVersion);
       images.push(image);
     }
     return () => images.forEach((image) => (image.src = ""));
-  }, [video.video_id, segment, current, frameCount]);
+  }, [video.video_id, segment, current, frameCount, exportVersion]);
 
   /** Retângulo ocupado pela imagem dentro do <img> com object-contain. */
   const measure = useCallback(() => {
@@ -266,7 +267,12 @@ export function ReviewView({
     setCommitting(true);
     try {
       if (updates.length > 0) {
-        await api.saveMaskReviewBatch(video.video_id, segment ?? "", updates);
+        await api.saveMaskReviewBatch(
+          video.video_id,
+          segment ?? "",
+          updates,
+          exportVersion,
+        );
       }
       const progress = await api.videoReview(video.video_id);
       setVisited(new Set());
@@ -284,7 +290,7 @@ export function ReviewView({
     } finally {
       setCommitting(false);
     }
-  }, [drafts, frameCount, maskStates, maskUnavailable, onBack, open, refreshPipeline, segment, stagedReviewed, video.video_id, visited]);
+  }, [drafts, exportVersion, frameCount, maskStates, maskUnavailable, onBack, open, refreshPipeline, segment, stagedReviewed, video.video_id, visited]);
 
   const onWheel = useCallback((event: React.WheelEvent) => {
     const container = event.currentTarget.getBoundingClientRect();
@@ -494,6 +500,7 @@ export function ReviewView({
       <ReviewStrip
         videoId={video.video_id}
         segment={segment ?? ""}
+        exportVersion={exportVersion}
         frames={frames}
         current={current}
         onPick={(frame) => useReview.getState().goto(frame)}
