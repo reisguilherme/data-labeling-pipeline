@@ -65,20 +65,24 @@
 
 **Interfaces:**
 - `proxy.validate_generation(path) -> ProxyGeneration` validates marker-independent staged output with metadata only.
-- `proxy.publish_generation(staging, final, cache_root) -> None` swaps a validated directory while retaining/restoring the previous generation on failure.
-- Completion marker schema v2 contains `schema_version`, `frames`, per-tier counts, dimensions/configuration, and a generation token.
+- `proxy.publish_generation(staging, root, cache_root) -> ProxyGeneration` renames a validated immutable generation and atomically replaces only a small `CURRENT` pointer.
+- Layout is `proxy/<video>/CURRENT` plus `generations/<uuid>/`; window roots use the same layout. A `.part` generation is never addressable through `CURRENT`.
+- Completion marker schema v2 lives inside the immutable generation and contains `schema_version`, generation/job identity, kind/range, frames, per-tier counts, dimensions/configuration, and a generation token.
 - `is_complete()` performs bounded O(1) checks and invalidates legacy/contradictory markers.
 
 - [ ] Write RED tests proving a complete marker with a missing tier, unequal counts, zero-byte boundary JPEG, or old schema is not complete.
 - [ ] Write a RED worker test where FFmpeg fails after an already-complete proxy exists; assert the old generation and marker are byte-for-byte preserved and staging is removed.
-- [ ] Write a RED success test asserting no public path contains staged output during FFmpeg, both tiers are validated, publication happens once, and the marker is the final write.
+- [ ] Write a RED success test asserting no staged output is addressable during FFmpeg, both tiers are validated, and `CURRENT` is the final/only publication write.
 - [ ] Write a RED test proving `available_ranges()` never advertises an in-progress full generation and `locate_frame()` never returns a `.part` artifact.
+- [ ] Write RED crash tests around every publish boundary: before generation rename, after generation rename/before `CURRENT`, and while replacing `CURRENT`; the old pointer must remain valid and a new orphan must never become active.
 - [ ] Run focused tests and capture RED evidence.
 - [ ] Introduce versioned marker parsing/writing with bounded boundary-file checks; never enumerate all frames in request handlers.
-- [ ] Make durable and in-process `proxy_full` extraction use a sibling `.part` staging directory. Validate exact equal tier counts after FFmpeg, write the marker inside staging, then swap generations with rollback.
-- [ ] Apply the same rollback-safe publish helper to window replacement and validate equal counts before publish.
+- [ ] Make durable and in-process `proxy_full` extraction use a unique `generations/.<uuid>.part` directory. Validate exact equal tier counts and sequential non-empty regular JPEGs after FFmpeg; write the marker, rename to immutable `generations/<uuid>`, fsync a temporary pointer, then `os.replace()` it over `CURRENT`.
+- [ ] Resolve all reads (`is_complete`, `available_ranges`, `locate_frame`) through a validated `CURRENT` pointer. Request handlers may inspect marker plus O(1) boundary files but must never enumerate a generation.
+- [ ] Apply the same immutable-generation/pointer model to windows; never delete/replace a non-empty public directory.
+- [ ] Use a distinct staging UUID per attempt so a stale worker cannot clean another worker's staging. Leave post-publish orphan collection outside the critical path.
 - [ ] Remove the frontend-derived progress range contract from the API: job progress remains progress only; availability comes from published server state.
-- [ ] Ensure cancellation/failure removes only staging and never the prior public generation.
+- [ ] Fence publication on the current lease/cancellation state. Ensure cancellation/failure removes only its own staging and never the prior current generation.
 - [ ] Run proxy, worker-safety, video-router, and full server/root tests; verify GREEN.
 - [ ] Commit as `fix: publish proxy frames atomically`.
 
@@ -97,15 +101,20 @@
 - `_media_for_write(ctx, video_id)` may use the exact proxy marker or cached probe and may issue only a bounded non-packet-count probe as fallback.
 - `PUT /annotations/{video_id}` must not call `count_packets`, enumerate proxy frames, or clean filesystem trees.
 - `POST /annotations/{video_id}/no-object` persists first and returns a `cleanup_job_id` when old exported segments need removal.
-- New CPU job `video_export_cleanup` accepts object/video identity, resolves the authorized output root from the current workspace context, and deletes only the prior export tree after strict containment checks.
+- Every annotation entry has monotonic `annotation_revision` (legacy default `0`); export and cleanup jobs carry that revision and may not commit against a newer state.
+- New CPU job `video_export_cleanup` accepts object/video/revision plus a validated direct-child basename, reconstructs the root from the current workspace context, and deletes only direct `seg_*` children after strict containment checks.
 
 - [ ] Add RED tests that patch packet counting, `proxy.status`, and `clean_segments` to fail if called in either mutation endpoint.
 - [ ] Add a RED event-loop test with cleanup blocked by a thread event and prove the no-object endpoint still returns after persistence/enqueue.
 - [ ] Add RED tests for `video_export_cleanup` containment, idempotency, missing roots, cancellation boundary, and successful cleanup without touching sibling exports.
+- [ ] Add RED concurrency/fencing tests: two same-video mutations preserve history and increment revisions; a stale export cannot promote a later no-object entry; a stale cleanup cannot delete a later re-export.
+- [ ] Add a RED database test for two simultaneous identical idempotency keys; both callers must receive the same job without a unique-key failure.
 - [ ] Run focused tests and capture RED evidence.
-- [ ] Replace `_media_for` in mutation paths with exact-marker/cached metadata and `probe(count_packets=False)` fallback. Derive proxy mode without `available_ranges()`.
-- [ ] Persist no-object state before enqueueing cleanup. In PostgreSQL mode create an idempotent durable cleanup job; in fallback mode schedule the bounded cleanup through a FastAPI background task/thread.
-- [ ] Add the CPU worker handler and ensure every resolved deletion target remains inside the object's configured output root.
+- [ ] Build PUT and no-object entries with `ctx.store.mutate()` so previous state, history, and revision are read/updated under the writer lock. Replace `_media_for` with exact-marker/cached/previous metadata and `probe(count_packets=False)` fallback only for PUT; no-object never probes media. Derive proxy mode without `available_ranges()`.
+- [ ] Persist no-object before enqueueing cleanup. Validate the previous root as one direct child of `output_root`, then enqueue an idempotent job keyed by object/video/revision. If enqueue fails, return persisted state with a retryable cleanup marker instead of rolling back the user decision.
+- [ ] Add the CPU worker handler; reconstruct the root from its basename, reject root/sibling/symlink escapes, delete only direct `seg_*` children via `_remove_tree`, and preserve other files.
+- [ ] Fence every video export/cleanup with annotation revision; cancel older active exports after a new mutation. Use a per-object/video advisory lock around worker media mutation and re-check revision immediately before destructive work/commit.
+- [ ] Make durable-job idempotent creation atomic under concurrent absent-row callers (`INSERT ... ON CONFLICT` or equivalent transaction-safe approach).
 - [ ] Keep previous export metadata in the cleanup job payload/audit history while clearing it from the effective annotation immediately.
 - [ ] Run focused, server, and root tests; verify GREEN.
 - [ ] Commit as `perf: remove media cleanup from triage mutations`.
