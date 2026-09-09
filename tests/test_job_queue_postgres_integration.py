@@ -150,6 +150,30 @@ class PostgresLeaseExpiryIntegrationTests(unittest.TestCase):
         self.assertEqual(state, "cancelled")
         self.assertEqual(row, ("cancelled", None, True))
 
+    def test_cancel_requested_between_last_heartbeat_and_finish_wins(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET cancel_requested=true, "
+                "lease_expires_at=now() + interval '30 seconds' WHERE id=%s",
+                (self.job_id,),
+            )
+            connection.commit()
+
+        PostgresJobQueue(self._connect).finish(
+            str(self.job_id),
+            str(self.token),
+            state="done",
+            result={"published": True},
+        )
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state::text, result, finished_at IS NOT NULL "
+                "FROM jobs WHERE id=%s",
+                (self.job_id,),
+            ).fetchone()
+        self.assertEqual(row, ("cancelled", None, True))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -97,6 +97,24 @@ class DurableJobContractTests(unittest.TestCase):
 
         self.assertEqual(state, "cancelled")
 
+    def test_finish_cannot_overwrite_a_concurrent_cancellation_with_done(self) -> None:
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.rowcount = 1
+        queue = PostgresJobQueue(lambda: connection)
+
+        queue.finish(
+            "job",
+            "00000000-0000-0000-0000-000000000001",
+            state="done",
+            result={"published": True},
+        )
+
+        sql = " ".join(cursor.execute.call_args.args[0].upper().split())
+        self.assertIn("WHEN CANCEL_REQUESTED THEN 'CANCELLED'::JOB_STATE", sql)
+        self.assertIn("WHEN CANCEL_REQUESTED THEN NULL", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

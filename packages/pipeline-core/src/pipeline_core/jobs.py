@@ -259,8 +259,14 @@ class PostgresJobQueue:
                 cursor.execute(
                     """
                     UPDATE jobs
-                       SET state = %(state)s,
-                           result = %(result)s::jsonb,
+                       SET state = CASE
+                               WHEN cancel_requested THEN 'cancelled'::job_state
+                               ELSE %(state)s::job_state
+                           END,
+                           result = CASE
+                               WHEN cancel_requested THEN NULL
+                               ELSE %(result)s::jsonb
+                           END,
                            error = %(error)s,
                            finished_at = now(),
                            lease_expires_at = NULL,
