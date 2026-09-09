@@ -7,9 +7,11 @@ import copy
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from .. import export as export_module
 from .. import flags as flags_module
@@ -17,11 +19,15 @@ from .. import durable_jobs, proxy
 from ..deps import current_client, current_user
 from ..locks import locks
 from ..models import VideoEntryIn, build_interval, validate_intervals
-from ..sam3 import queue as sam3_queue
 from ..deps import get_object
 from ..users import User
 from ..videos import iso
+from ..video_export_completion import (
+    ExportCompletionConflict,
+    finalize_video_export,
+)
 from ..workspace import ObjectContext
+from .sam3 import require_worker
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["annotations"])
 
@@ -509,6 +515,109 @@ class FinishPayload(BaseModel):
     job_id: str
 
 
+_SegmentName = Annotated[
+    str, StringConstraints(min_length=5, max_length=128, pattern=r"^seg_[A-Za-z0-9_-]+$")
+]
+
+
+class WorkerExportOwner(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    object_id: str = Field(min_length=1, max_length=128)
+    video_id: str = Field(min_length=1, max_length=128)
+    relpath: str = Field(min_length=1, max_length=4096)
+    annotation_revision: int = Field(ge=0, strict=True)
+
+
+class WorkerExportResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    root: str = Field(min_length=1, max_length=4096)
+    segments: list[_SegmentName] = Field(min_length=1, max_length=10_000)
+    total_frames: int = Field(ge=0, strict=True)
+    jpeg_qscale: int = Field(ge=1, le=31, strict=True)
+    frame_naming: Literal["restart_per_segment"]
+    ffmpeg_version: str = Field(min_length=1, max_length=512)
+    annotation_revision: int = Field(ge=0, strict=True)
+    owner: WorkerExportOwner
+
+
+class WorkerExportCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: UUID
+    lease_token: UUID
+    result: WorkerExportResult
+
+
+@router.post("/videos/{video_id}/export/complete")
+async def complete_export_internal(
+    video_id: str,
+    payload: WorkerExportCompletion,
+    ctx: ObjectContext = Depends(get_object),
+    _: str = Depends(require_worker),
+) -> dict:
+    """Commit a frame export while the reporting CPU worker still owns its lease."""
+    job_id = str(payload.job_id)
+    lease_token = str(payload.lease_token)
+    video = _require(ctx, video_id)
+    result = payload.result.model_dump(mode="python")
+    async with durable_jobs.video_advisory_lock_async(ctx.object_id, video_id):
+        await asyncio.to_thread(ctx.store.load)
+        async with durable_jobs.owned_job_lease_async(
+            job_id, lease_token
+        ) as job:
+            if job is None:
+                raise HTTPException(409, "lease de export invalida ou expirada")
+            if (
+                job.get("job_id") != job_id
+                or job.get("kind") != "video_export"
+                or job.get("worker_kind") != "cpu"
+                or job.get("object_id") != ctx.object_id
+                or job.get("video_id") != video_id
+                or job.get("relpath") != video.relpath
+            ):
+                raise HTTPException(409, "job nao pertence a este export de video")
+
+            owner = job.get("owner")
+            revision = job.get("annotation_revision")
+            total = job.get("total")
+            basename = job.get("root_basename")
+            if (
+                type(revision) is not int
+                or revision < 0
+                or type(total) is not int
+                or total < 0
+                or not isinstance(basename, str)
+                or not basename
+                or not isinstance(job.get("user"), str)
+                or not job["user"]
+            ):
+                raise HTTPException(409, "payload autoritativo do job e invalido")
+
+            try:
+                finalized = await finalize_video_export(
+                    ctx,
+                    video_id,
+                    result,
+                    job["user"],
+                    job_id,
+                    expected_revision=revision,
+                    expected_root_basename=basename,
+                    expected_owner=owner,
+                    expected_total=total,
+                    _video_lock_held=True,
+                )
+            except ExportCompletionConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+    return {
+        "ok": True,
+        "digest": finalized.digest,
+        "replayed": finalized.replayed,
+    }
+
+
 @router.post("/videos/{video_id}/export/finish")
 async def finish_export(
     video_id: str,
@@ -516,7 +625,7 @@ async def finish_export(
     ctx: ObjectContext = Depends(get_object),
     user: User = Depends(current_user),
 ) -> dict:
-    """Grava o resultado do export na anotação, depois que o job termina."""
+    """Compatibility endpoint; correctness no longer depends on the browser."""
     from ..jobs import jobs
 
     video = _require(ctx, video_id)
@@ -556,80 +665,34 @@ async def finish_export(
         or result_revision != job_revision
     ):
         raise HTTPException(409, "resultado possui revisao invalida")
-    expected_owner = export_module.export_owner(ctx, video, job_revision)
-    if export_module.valid_export_owner(job_result.get("owner")) != expected_owner:
-        raise HTTPException(409, "resultado possui ownership invalido")
-    result_basename = _cleanup_basename(ctx.output_root, job_result)
     expected_basename = (
         export_module.export_root_for(ctx, video).name
         if local_job is not None
         else durable_job.get("root_basename")
     )
+    result_basename = _cleanup_basename(ctx.output_root, job_result)
     if not expected_basename or result_basename != expected_basename:
         raise HTTPException(409, "resultado possui raiz de export inesperada")
-    result_root = ctx.output_root / result_basename
-    if export_module.read_export_owner(result_root) != expected_owner:
-        raise HTTPException(409, "raiz de export nao pertence ao job")
-
-    def apply(doc: dict) -> dict:
-        entry = doc["videos"].get(video.relpath)
-        if entry is None:
-            raise HTTPException(404, "anotação não encontrada")
-        current_revision = int(entry.get("annotation_revision") or 0)
-        if (job_revision is None and current_revision != 0) or (
-            job_revision is not None and current_revision != int(job_revision)
-        ):
-            raise HTTPException(
-                409,
-                "resultado pertence a uma revisao antiga da anotacao",
-            )
-        expected_segments = [
-            interval.get("segment") for interval in entry.get("intervals") or []
-        ]
-        result_segments = job_result.get("segments")
-        if result_segments != expected_segments or any(
-            not isinstance(segment, str)
-            or not segment.startswith("seg_")
-            or Path(segment).name != segment
-            for segment in result_segments or []
-        ):
-            raise HTTPException(
-                409, "resultado possui segmentos diferentes da anotacao"
-            )
-        expected_total = sum(
-            int(interval.get("frame_count") or 0)
-            for interval in entry.get("intervals") or []
+    expected_owner = (
+        job_result.get("owner") if local_job is not None else durable_job.get("owner")
+    )
+    expected_total = (
+        job_result.get("total_frames")
+        if local_job is not None
+        else durable_job.get("total")
+    )
+    try:
+        finalized = await finalize_video_export(
+            ctx,
+            video_id,
+            job_result,
+            user.user_id,
+            payload.job_id,
+            expected_revision=job_revision,
+            expected_root_basename=expected_basename,
+            expected_owner=expected_owner,
+            expected_total=expected_total,
         )
-        if job_result.get("total_frames") != expected_total:
-            raise HTTPException(409, "resultado possui total de frames invalido")
-        if any(
-            (result_root / segment).is_symlink()
-            or not (result_root / segment).is_dir()
-            for segment in result_segments
-        ):
-            raise HTTPException(409, "resultado possui segmento ausente ou inseguro")
-        entry["export"] = job_result
-        entry["exported_at"] = iso()
-        entry["status"] = "done"
-        entry["updated_at"] = iso()
-        entry["exported_by"] = user.user_id
-        return entry
-
-    async with _video_mutation_lock(ctx, video_id):
-        entry = await ctx.store.mutate(apply)
-
-    # Enfileira para o SAM3 aqui, no servidor, e não no cliente: assim toda
-    # exportação entra na fila independentemente de quem exportou ou de qual
-    # aba, e o front só precisa saber MOSTRAR o estado, nunca criá-lo.
-    if ctx.config.auto_sam3 and job_result.get("segments"):
-        sam3_queue.enqueue(
-            ctx.object_id,
-            video_id=video_id,
-            relpath=video.relpath,
-            name=video.name,
-            export_root=job_result["root"],
-            segments=list(job_result["segments"]),
-            user=user.user_id,
-        )
-
-    return entry
+    except ExportCompletionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return finalized.entry

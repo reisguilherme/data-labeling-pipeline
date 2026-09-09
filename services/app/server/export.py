@@ -490,7 +490,6 @@ async def export_video(
                         "falha ao remover lixeira de export local", exc_info=True
                     )
 
-            job.state = "done"
             job.result = {
                 "root": root.as_posix(),
                 "segments": segments,
@@ -501,6 +500,23 @@ async def export_video(
                 "annotation_revision": expected_revision,
                 "owner": owner,
             }
+            # The local in-process fallback follows the same authoritative
+            # commit path as the durable CPU worker. A terminal job therefore
+            # always means annotations.json and the SAM3 queue were committed.
+            from .video_export_completion import finalize_video_export
+
+            await finalize_video_export(
+                ctx,
+                video_id,
+                job.result,
+                user,
+                job.job_id,
+                expected_revision=expected_revision,
+                expected_root_basename=root.name,
+                expected_owner=owner,
+                expected_total=total,
+            )
+            job.state = "done"
         except Exception as exc:  # noqa: BLE001
             if job._cancelled:
                 job.state = "cancelled"

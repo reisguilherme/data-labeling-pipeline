@@ -293,12 +293,6 @@ export const api = {
       method: "POST",
     }),
 
-  finishExport: (videoId: string, jobId: string) =>
-    request<VideoEntry>(`${O()}/videos/${videoId}/export/finish`, {
-      method: "POST",
-      body: JSON.stringify({ job_id: jobId }),
-    }),
-
   // -- entrada de vídeos ---------------------------------------------------
 
   exclusions: () => request<ExclusionsInfo>(`${O()}/exclusions`),

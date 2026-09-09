@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
@@ -55,7 +56,8 @@ async def enqueue(
             409, "exporte o vídeo antes: o SAM3 consome os frames e o prompt.json do export"
         )
 
-    item = queue.enqueue(
+    item = await asyncio.to_thread(
+        queue.enqueue,
         ctx.object_id,
         video_id=video_id,
         relpath=video.relpath,
@@ -63,6 +65,7 @@ async def enqueue(
         export_root=export["root"],
         segments=list(export["segments"]),
         user=user.user_id,
+        annotation_revision=int(entry.get("annotation_revision") or 0),
         force=bool(payload.force if payload else False),
     )
     return item.public()
@@ -122,7 +125,7 @@ def require_worker(x_mst_worker: str | None = Header(default=None)) -> str:
         raise HTTPException(
             503, "MST_WORKER_TOKEN não configurado no servidor — a fila do SAM3 está desligada"
         )
-    if not x_mst_worker or x_mst_worker != expected:
+    if not x_mst_worker or not secrets.compare_digest(x_mst_worker, expected):
         raise HTTPException(401, "token de worker inválido")
     return x_mst_worker
 
@@ -210,6 +213,7 @@ async def next_job(
             "label": label,
             "force": item.force,
             "attempt": item.attempts,
+            "annotation_revision": item.annotation_revision,
             "export_root": export_root,
             "segments": [
                 {"segment": segment, "dir": str(Path(export_root) / segment)}
@@ -252,51 +256,133 @@ class ResultIn(BaseModel):
     error: str | None = None
 
 
+def _matches_annotation_revision(entry: dict | None, annotation_revision: int) -> bool:
+    if entry is None or entry.get("status") == "no_boom":
+        return False
+    try:
+        current = int(entry.get("annotation_revision") or 0)
+    except (TypeError, ValueError):
+        return False
+    return current == annotation_revision
+
+
+def _write_sam3_result(entry: dict, result_payload: dict | None) -> None:
+    result_payload = result_payload or {}
+    entry["sam3"] = {
+        "at": iso(),
+        "runner_version": result_payload.get("runner_version"),
+        **{
+            key: value
+            for key, value in result_payload.items()
+            if key != "runner_version"
+        },
+    }
+
+
+async def _finish_done_result(
+    *,
+    lease_id: str,
+    payload: ResultIn,
+    object_id: str,
+    leased_item,
+    ctx,
+    durable: bool,
+) -> dict:
+    from contextlib import asynccontextmanager
+
+    from .. import durable_jobs
+
+    @asynccontextmanager
+    async def video_fence():
+        if not durable:
+            yield
+            return
+        async with durable_jobs.video_advisory_lock_async(
+            object_id, leased_item.video_id
+        ):
+            await asyncio.to_thread(ctx.store.load)
+            yield
+
+    async with video_fence():
+        async with queue.owned_lease_async(lease_id) as owned:
+            if owned is None:
+                raise HTTPException(409, "lease inválido ou expirado")
+            item = owned.item
+            if (
+                owned.object_id != object_id
+                or item.video_id != leased_item.video_id
+                or item.relpath != leased_item.relpath
+                or item.annotation_revision != leased_item.annotation_revision
+            ):
+                raise HTTPException(409, "lease mudou durante a conclusao")
+
+            entry = ctx.store.entry(item.relpath)
+            stale = item.cancel_requested or not _matches_annotation_revision(
+                entry, item.annotation_revision
+            )
+            if stale:
+                found = await owned.finish(
+                    state="cancelled",
+                    result=None,
+                    error="anotacao mudou durante o processamento",
+                )
+                if found is None:
+                    raise HTTPException(409, "lease inválido ou expirado")
+                return {"ok": True, "state": found[1].state, "stale": True}
+
+            def apply(doc: dict) -> None:
+                current = doc["videos"].get(item.relpath)
+                if not _matches_annotation_revision(
+                    current, item.annotation_revision
+                ):
+                    raise HTTPException(
+                        409, "anotacao mudou durante o processamento"
+                    )
+                _write_sam3_result(current, payload.result)
+
+            await ctx.store.mutate(apply)
+            found = await owned.finish(
+                state="done", result=payload.result, error=payload.error
+            )
+            if found is None:
+                raise HTTPException(409, "lease inválido ou expirado")
+            return {"ok": True, "state": found[1].state, "stale": False}
+
+
 @worker_router.post("/lease/{lease_id}/result")
 async def result(
     lease_id: str, payload: ResultIn, _: str = Depends(require_worker)
 ) -> dict:
-    found = queue.finish(
-        lease_id, state=payload.state, result=payload.result, error=payload.error
-    )
-    if found is None:
+    # Error/cancellation acknowledgements do not publish annotation metadata.
+    if payload.state != "done":
+        found = await asyncio.to_thread(
+            queue.finish,
+            lease_id,
+            state=payload.state,
+            result=payload.result,
+            error=payload.error,
+        )
+        if found is None:
+            raise HTTPException(409, "lease inválido ou expirado")
+        return {"ok": True, "state": found[1].state}
+
+    leased = await asyncio.to_thread(queue.get_lease, lease_id)
+    if leased is None:
         raise HTTPException(409, "lease inválido ou expirado")
-    object_id, item = found
+    object_id, leased_item = leased
 
-    # O resultado durável vai para o annotations.json, junto de tudo mais que
-    # descreve o vídeo — a fila é estado de sessão, o dataset é o artefato.
-    if item.state == "done":
-        try:
-            from .. import durable_jobs
+    from .. import durable_jobs
 
-            ctx = workspace.context(object_id)
-            ctx.ensure_loaded()
-
-            def apply(doc: dict) -> None:
-                entry = doc["videos"].get(item.relpath)
-                if entry is not None:
-                    entry["sam3"] = {
-                        "at": iso(),
-                        "runner_version": (payload.result or {}).get("runner_version"),
-                        **{
-                            key: value
-                            for key, value in (payload.result or {}).items()
-                            if key != "runner_version"
-                        },
-                    }
-
-            if durable_jobs.enabled():
-                async with durable_jobs.video_advisory_lock_async(
-                    object_id, item.video_id
-                ):
-                    await asyncio.to_thread(ctx.store.load)
-                    await ctx.store.mutate(apply)
-            else:
-                await ctx.store.mutate(apply)
-        except Exception:  # noqa: BLE001 — a fila já registrou; não derruba o worker
-            pass
-
-    return {"ok": True, "state": item.state}
+    ctx = workspace.context(object_id)
+    await asyncio.to_thread(ctx.ensure_loaded)
+    return await _finish_done_result(
+        lease_id=lease_id,
+        payload=payload,
+        object_id=object_id,
+        leased_item=leased_item,
+        ctx=ctx,
+        durable=durable_jobs.enabled(),
+    )
 
 
 @worker_router.get("/health")

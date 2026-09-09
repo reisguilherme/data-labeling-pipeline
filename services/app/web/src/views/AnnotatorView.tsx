@@ -86,14 +86,11 @@ export function AnnotatorView({
     const queued = await state.queueExport();
     if (!queued) return;
 
-    // O observador sobrevive à desmontagem desta tela. Quando o worker termina,
-    // confirma o resultado no backend (que enfileira o SAM3) e atualiza os cards.
+    // O observador sobrevive à desmontagem só para atualizar os cards. O worker
+    // confirma o resultado no backend antes de concluir o próprio job.
     watchJob(queued.job_id, (job) => {
       if (job.state === "done") {
-        void api
-          .finishExport(video.video_id, queued.job_id)
-          .then(() => refresh())
-          .catch((exception) => console.error("falha ao finalizar export da triagem", exception));
+        void refresh();
       }
     });
     if (next) onNavigate(next);

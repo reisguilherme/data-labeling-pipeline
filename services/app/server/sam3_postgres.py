@@ -4,8 +4,61 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+
+
+class _OwnedPostgresLease:
+    def __init__(self, queue, connection, cursor, row) -> None:
+        self._queue = queue
+        self._connection = connection
+        self._cursor = cursor
+        self.object_id = str((row[1] or {}).get("object_id") or "")
+        self.item = queue._item(row)
+
+    def finish(
+        self, *, state: str, result: dict | None, error: str | None
+    ):
+        found = self._queue._finish_cursor(
+            self._connection,
+            self._cursor,
+            self.item.lease_id or "",
+            state=state,
+            result=result,
+            error=error,
+            fenced=True,
+        )
+        if found is not None:
+            self.object_id, self.item = found
+        return found
+
+
+class _AsyncOwnedPostgresLease:
+    def __init__(self, lease, executor: ThreadPoolExecutor) -> None:
+        self._lease = lease
+        self._executor = executor
+        self.object_id = lease.object_id
+        self.item = lease.item
+
+    async def finish(
+        self, *, state: str, result: dict | None, error: str | None
+    ):
+        loop = asyncio.get_running_loop()
+        found = await loop.run_in_executor(
+            self._executor,
+            partial(
+                self._lease.finish,
+                state=state,
+                result=result,
+                error=error,
+            ),
+        )
+        self.object_id = self._lease.object_id
+        self.item = self._lease.item
+        return found
 
 
 class PostgresSam3Queue:
@@ -30,6 +83,7 @@ class PostgresSam3Queue:
             name=payload.get("name", ""),
             export_root=payload.get("export_root", ""),
             segments=list(payload.get("segments") or []),
+            annotation_revision=int(payload.get("annotation_revision") or 0),
             state=row[2],
             attempts=int(row[3]),
             force=bool(payload.get("force")),
@@ -68,9 +122,12 @@ class PostgresSam3Queue:
         export_root: str,
         segments: list[str],
         user: str | None,
+        annotation_revision: int = 0,
         force: bool = False,
     ):
-        key = f"sam3:{object_id}:{relpath}"
+        if type(annotation_revision) is not int or annotation_revision < 0:
+            raise ValueError("annotation_revision invalida")
+        key = f"sam3:{object_id}:{video_id}:r{annotation_revision}"
         payload = {
             "object_id": object_id,
             "video_id": video_id,
@@ -78,14 +135,77 @@ class PostgresSam3Queue:
             "name": name,
             "export_root": export_root,
             "segments": segments,
+            "annotation_revision": annotation_revision,
             "user": user,
             "force": force,
         }
         with self._connect() as connection, connection.cursor() as cursor:
+            # Serialize every revision decision for this logical video inside
+            # PostgreSQL. Without this transaction-scoped fence, concurrent
+            # r4/r5 inserts can both observe an empty queue and both commit.
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"sam3:{object_id}:{relpath}",),
+            )
+            # Select by the logical video first, not only by the requested
+            # idempotency key. This makes enqueue monotonic when an older
+            # export callback is delayed until after a newer revision.
+            cursor.execute(
+                self._select()
+                + """ WHERE kind = 'sam3_propagation'
+                         AND payload->>'object_id' = %s
+                         AND payload->>'relpath' = %s
+                       ORDER BY
+                         CASE
+                           WHEN COALESCE(payload->>'annotation_revision', '') ~ '^[0-9]+$'
+                           THEN (payload->>'annotation_revision')::bigint
+                           ELSE 0
+                         END DESC,
+                         created_at DESC
+                       LIMIT 1""",
+                (object_id, relpath),
+            )
+            latest_row = cursor.fetchone()
+            latest = self._item(latest_row) if latest_row else None
+            if latest is not None and latest.annotation_revision > annotation_revision:
+                return latest
+            if (
+                latest is not None
+                and latest.annotation_revision == annotation_revision
+                and (latest.active or (latest.state == "done" and not force))
+            ):
+                return latest
+
             cursor.execute(self._select() + " WHERE idempotency_key = %s", (key,))
             existing = cursor.fetchone()
+            if existing is None and annotation_revision == 0 and latest_row is not None:
+                # Jobs created before revision fencing omitted the revision;
+                # _item maps those to zero, so they remain safely reusable.
+                existing = latest_row
             if existing and (existing[2] in ("queued", "leased", "running") or (existing[2] == "done" and not force)):
                 return self._item(existing)
+            # A newer annotation must never silently share an active job with
+            # an older export. Queued work can be cancelled immediately;
+            # leased work receives the normal cooperative cancellation flag.
+            cursor.execute(
+                """
+                UPDATE jobs SET
+                    state = CASE WHEN state = 'queued' THEN 'cancelled'::job_state ELSE state END,
+                    finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,
+                    cancel_requested = CASE WHEN state IN ('leased','running') THEN TRUE ELSE cancel_requested END,
+                    updated_at = now()
+                 WHERE kind = 'sam3_propagation'
+                   AND payload->>'object_id' = %s
+                   AND payload->>'relpath' = %s
+                   AND CASE
+                         WHEN COALESCE(payload->>'annotation_revision', '') ~ '^[0-9]+$'
+                         THEN (payload->>'annotation_revision')::bigint
+                         ELSE 0
+                       END < %s
+                   AND state IN ('queued','leased','running')
+                """,
+                (object_id, relpath, annotation_revision),
+            )
             cursor.execute(
                 """
                 INSERT INTO jobs(kind, worker_kind, state, priority, payload,
@@ -110,7 +230,6 @@ class PostgresSam3Queue:
         return item
 
     def cancel(self, object_id: str, relpath: str):
-        key = f"sam3:{object_id}:{relpath}"
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -119,12 +238,20 @@ class PostgresSam3Queue:
                     finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,
                     cancel_requested = CASE WHEN state IN ('leased','running') THEN TRUE ELSE cancel_requested END,
                     updated_at = now()
-                WHERE idempotency_key = %s
-                RETURNING id, payload, state::text, attempts, created_at,
-                          lease_token, lease_expires_at, cancel_requested,
-                          progress, worker_id, started_at, finished_at, result, error
+                WHERE kind = 'sam3_propagation'
+                  AND payload->>'object_id' = %s
+                  AND payload->>'relpath' = %s
+                  AND state IN ('queued','leased','running')
                 """,
-                (key,),
+                (object_id, relpath),
+            )
+            cursor.execute(
+                self._select()
+                + """ WHERE kind = 'sam3_propagation'
+                         AND payload->>'object_id' = %s
+                         AND payload->>'relpath' = %s
+                       ORDER BY created_at DESC LIMIT 1""",
+                (object_id, relpath),
             )
             row = cursor.fetchone()
         return self._item(row) if row else None
@@ -141,8 +268,12 @@ class PostgresSam3Queue:
     def get(self, object_id: str, relpath: str):
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
-                self._select() + " WHERE idempotency_key = %s",
-                (f"sam3:{object_id}:{relpath}",),
+                self._select()
+                + """ WHERE kind = 'sam3_propagation'
+                         AND payload->>'object_id' = %s
+                         AND payload->>'relpath' = %s
+                       ORDER BY created_at DESC LIMIT 1""",
+                (object_id, relpath),
             )
             row = cursor.fetchone()
         return self._item(row) if row else None
@@ -201,7 +332,9 @@ class PostgresSam3Queue:
                 """
                 UPDATE jobs SET state = 'running', progress = COALESCE(%s::jsonb, progress),
                     lease_expires_at = now() + make_interval(secs => %s), updated_at = now()
-                 WHERE lease_token = %s::uuid AND state IN ('leased','running')
+                 WHERE lease_token = %s::uuid
+                   AND kind = 'sam3_propagation'
+                   AND state IN ('leased','running')
                    AND lease_expires_at > now()
                 RETURNING id, payload, state::text, attempts, created_at,
                           lease_token, lease_expires_at, cancel_requested,
@@ -215,48 +348,207 @@ class PostgresSam3Queue:
         item = self._item(row)
         return item, item.cancel_requested
 
-    def finish(self, lease_id: str, *, state: str, result: dict | None, error: str | None):
-        terminal = state if state in ("done", "error", "cancelled") else "error"
+    def get_lease(self, lease_id: str):
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                UPDATE jobs SET
-                    state = CASE WHEN %s = 'error' AND attempts < max_attempts
-                                 THEN 'queued'::job_state ELSE %s::job_state END,
-                    result = %s::jsonb, error = %s,
-                    finished_at = CASE WHEN %s = 'error' AND attempts < max_attempts
-                                       THEN NULL ELSE now() END,
-                    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
-                    cancel_requested = FALSE, updated_at = now()
-                 WHERE lease_token = %s::uuid AND state IN ('leased','running')
+                UPDATE jobs
+                   SET lease_expires_at = now() + make_interval(secs => %s),
+                       updated_at = now()
+                 WHERE lease_token = %s::uuid
+                   AND kind = 'sam3_propagation'
+                   AND state IN ('leased','running')
+                   AND lease_expires_at > now()
                 RETURNING id, payload, state::text, attempts, created_at,
                           lease_token, lease_expires_at, cancel_requested,
                           progress, worker_id, started_at, finished_at, result, error
                 """,
-                (
-                    terminal,
-                    terminal,
-                    json.dumps(result) if result is not None else None,
-                    error,
-                    terminal,
-                    lease_id,
-                ),
+                (180, lease_id),
             )
             row = cursor.fetchone()
-            if row and terminal == "done" and result:
-                from .sam3_run_index import index_completed_runs
-
-                job_payload = row[1] or {}
-                index_completed_runs(
-                    connection,
-                    object_id=str(job_payload.get("object_id") or ""),
-                    relpath=str(job_payload.get("relpath") or ""),
-                    result=result,
-                )
         if not row:
             return None
         payload = row[1] or {}
         return str(payload.get("object_id") or ""), self._item(row)
+
+    @contextmanager
+    def owned_lease(self, lease_id: str, *, lease_seconds: int = 180):
+        """Hold the live SAM3 job row until annotation metadata and ACK agree."""
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise ValueError("lease_seconds invalido")
+        connection = self._connect()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE jobs
+                   SET lease_expires_at = now() + make_interval(secs => %s),
+                       updated_at = now()
+                 WHERE lease_token = %s::uuid
+                   AND kind = 'sam3_propagation'
+                   AND state IN ('leased','running')
+                   AND lease_expires_at > now()
+                RETURNING id, payload, state::text, attempts, created_at,
+                          lease_token, lease_expires_at, cancel_requested,
+                          progress, worker_id, started_at, finished_at, result, error
+                """,
+                (lease_seconds, lease_id),
+            )
+            row = cursor.fetchone()
+            yield (
+                _OwnedPostgresLease(self, connection, cursor, row)
+                if row is not None
+                else None
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    @asynccontextmanager
+    async def owned_lease_async(self, lease_id: str, *, lease_seconds: int = 180):
+        manager = self.owned_lease(lease_id, lease_seconds=lease_seconds)
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sam3-lease")
+        enter_future = loop.run_in_executor(executor, manager.__enter__)
+        entered = False
+        try:
+            try:
+                lease = await asyncio.shield(enter_future)
+                entered = True
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(enter_future)
+                except Exception:
+                    pass
+                else:
+                    await asyncio.shield(
+                        loop.run_in_executor(
+                            executor, manager.__exit__, None, None, None
+                        )
+                    )
+                raise
+
+            proxy = (
+                _AsyncOwnedPostgresLease(lease, executor)
+                if lease is not None
+                else None
+            )
+            try:
+                yield proxy
+            except BaseException as exc:
+                exit_future = loop.run_in_executor(
+                    executor,
+                    manager.__exit__,
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                )
+                entered = False
+                try:
+                    await asyncio.shield(exit_future)
+                except asyncio.CancelledError:
+                    await asyncio.shield(exit_future)
+                raise
+            else:
+                exit_future = loop.run_in_executor(
+                    executor, manager.__exit__, None, None, None
+                )
+                entered = False
+                try:
+                    await asyncio.shield(exit_future)
+                except asyncio.CancelledError:
+                    await asyncio.shield(exit_future)
+                    raise
+        finally:
+            if entered:
+                try:
+                    await asyncio.shield(
+                        loop.run_in_executor(
+                            executor, manager.__exit__, None, None, None
+                        )
+                    )
+                except BaseException:
+                    pass
+            executor.shutdown(wait=False)
+
+    def _finish_cursor(
+        self,
+        connection,
+        cursor,
+        lease_id: str,
+        *,
+        state: str,
+        result: dict | None,
+        error: str | None,
+        fenced: bool,
+    ):
+        terminal = state if state in ("done", "error", "cancelled") else "error"
+        live_guard = "" if fenced else """
+                   AND lease_expires_at > now()
+                   AND (%s <> 'done' OR cancel_requested = FALSE)"""
+        params = [
+            terminal,
+            terminal,
+            json.dumps(result) if result is not None else None,
+            error,
+            terminal,
+            lease_id,
+        ]
+        if not fenced:
+            params.append(terminal)
+        cursor.execute(
+            """
+            UPDATE jobs SET
+                state = CASE WHEN %s = 'error' AND attempts < max_attempts
+                             THEN 'queued'::job_state ELSE %s::job_state END,
+                result = %s::jsonb, error = %s,
+                finished_at = CASE WHEN %s = 'error' AND attempts < max_attempts
+                                   THEN NULL ELSE now() END,
+                worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+                cancel_requested = FALSE, updated_at = now()
+             WHERE lease_token = %s::uuid
+               AND kind = 'sam3_propagation'
+               AND state IN ('leased','running')
+            """
+            + live_guard
+            + """
+            RETURNING id, payload, state::text, attempts, created_at,
+                      lease_token, lease_expires_at, cancel_requested,
+                      progress, worker_id, started_at, finished_at, result, error
+            """,
+            tuple(params),
+        )
+        row = cursor.fetchone()
+        if row and terminal == "done" and result:
+            from .sam3_run_index import index_completed_runs
+
+            job_payload = row[1] or {}
+            index_completed_runs(
+                connection,
+                object_id=str(job_payload.get("object_id") or ""),
+                relpath=str(job_payload.get("relpath") or ""),
+                result=result,
+            )
+        if not row:
+            return None
+        payload = row[1] or {}
+        return str(payload.get("object_id") or ""), self._item(row)
+
+    def finish(self, lease_id: str, *, state: str, result: dict | None, error: str | None):
+        with self._connect() as connection, connection.cursor() as cursor:
+            return self._finish_cursor(
+                connection,
+                cursor,
+                lease_id,
+                state=state,
+                result=result,
+                error=error,
+                fenced=False,
+            )
 
     def arrivals(self) -> asyncio.Event:
         if self._arrivals is None:

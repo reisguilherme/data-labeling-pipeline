@@ -79,5 +79,14 @@ class ComposeSecurityTests(unittest.TestCase):
             "./secrets/gcs_credentials.json",
         )
 
+    def test_cpu_worker_has_internal_api_without_losing_shared_environment(self) -> None:
+        environment = self.services["worker"]["environment"]
+        self.assertEqual(environment["MST_API"], "http://app:8000")
+        self.assertEqual(environment["POSTGRES_HOST"], "postgres")
+        self.assertEqual(environment["MST_WORKSPACE"], "/workspace")
+        self.assertEqual(
+            environment["MST_WORKER_TOKEN_FILE"], "/run/secrets/worker_token"
+        )
+
 if __name__ == "__main__":
     unittest.main()

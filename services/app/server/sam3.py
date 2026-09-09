@@ -25,6 +25,7 @@ import os
 import secrets
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -51,10 +52,14 @@ class QueueItem:
     name: str
     export_root: str
     segments: list[str] = field(default_factory=list)
+    annotation_revision: int = 0
     state: str = "queued"
     attempts: int = 0
     force: bool = False
     cancel_requested: bool = False
+    # In-process fence used only while the API commits result metadata. It is
+    # deliberately reset on load, because reservations never survive restart.
+    completion_reserved: bool = False
     enqueued_at: str = ""
     enqueued_by: str | None = None
     lease_id: str | None = None
@@ -85,6 +90,7 @@ class QueueItem:
             "attempts": self.attempts,
             "error": self.error,
             "segments": len(self.segments),
+            "annotation_revision": self.annotation_revision,
             "finished_at": self.finished_at,
         }
 
@@ -92,11 +98,26 @@ class QueueItem:
         return asdict(self)
 
 
+class _OwnedFileLease:
+    def __init__(self, queue: "Sam3Queue", object_id: str, item: QueueItem) -> None:
+        self._queue = queue
+        self.object_id = object_id
+        self.item = item
+
+    async def finish(
+        self, *, state: str, result: dict | None, error: str | None
+    ) -> tuple[str, QueueItem] | None:
+        return self._queue.finish(
+            self.item.lease_id or "", state=state, result=result, error=error
+        )
+
+
 class Sam3Queue:
     def __init__(self) -> None:
         self._by_object: dict[str, dict[str, QueueItem]] = {}
         self._paths: dict[str, Path] = {}
         self._lock = threading.Lock()
+        self._state_changed = threading.Condition(self._lock)
         # Acordar o long-poll do worker assim que algo entra na fila, em vez de
         # deixá-lo esperando os 25 s inteiros.
         self._arrivals: asyncio.Event | None = None
@@ -128,6 +149,7 @@ class Sam3Queue:
                 name=raw.get("name", relpath),
                 export_root=raw.get("export_root", ""),
                 segments=list(raw.get("segments") or []),
+                annotation_revision=int(raw.get("annotation_revision") or 0),
                 state=raw.get("state", "queued"),
                 attempts=int(raw.get("attempts") or 0),
                 force=bool(raw.get("force")),
@@ -179,6 +201,8 @@ class Sam3Queue:
         now = time.time()
         changed = False
         for item in self._by_object.get(object_id, {}).values():
+            if item.completion_reserved:
+                continue
             if item.state not in ("leased", "running"):
                 continue
             if (item.lease_expires_at_epoch or 0) > now:
@@ -212,15 +236,42 @@ class Sam3Queue:
         export_root: str,
         segments: list[str],
         user: str | None,
+        annotation_revision: int = 0,
         force: bool = False,
     ) -> QueueItem:
-        with self._lock:
+        if type(annotation_revision) is not int or annotation_revision < 0:
+            raise ValueError("annotation_revision invalida")
+        with self._state_changed:
             self._expire(object_id)
             items = self._by_object.setdefault(object_id, {})
             existing = items.get(relpath)
-            if existing is not None and existing.active:
+            while (
+                existing is not None
+                and existing.completion_reserved
+                and existing.annotation_revision < annotation_revision
+            ):
+                self._state_changed.wait()
+                existing = items.get(relpath)
+            # A conclusao de um export antigo pode chegar depois que uma
+            # revisao mais nova ja foi enfileirada. Nunca deixe esse callback
+            # atrasado substituir o trabalho novo no indice por relpath.
+            if (
+                existing is not None
+                and existing.annotation_revision > annotation_revision
+            ):
                 return existing
-            if existing is not None and existing.state == "done" and not force:
+            if (
+                existing is not None
+                and existing.annotation_revision == annotation_revision
+                and existing.active
+            ):
+                return existing
+            if (
+                existing is not None
+                and existing.annotation_revision == annotation_revision
+                and existing.state == "done"
+                and not force
+            ):
                 return existing
 
             item = QueueItem(
@@ -229,6 +280,7 @@ class Sam3Queue:
                 name=name,
                 export_root=export_root,
                 segments=segments,
+                annotation_revision=annotation_revision,
                 state="queued",
                 force=force,
                 enqueued_at=iso(),
@@ -246,6 +298,10 @@ class Sam3Queue:
             self._expire(object_id)
             item = self._by_object.get(object_id, {}).get(relpath)
             if item is None or not item.active:
+                return item
+            # Result completion linearized first. A later operator cancel must
+            # wait for that short commit rather than invalidate it halfway.
+            if item.completion_reserved:
                 return item
             if item.state == "queued":
                 item.state = "cancelled"
@@ -311,6 +367,50 @@ class Sam3Queue:
                     return object_id, item
         return None
 
+    def get_lease(self, lease_id: str) -> tuple[str, QueueItem] | None:
+        """Return only a live lease, without changing queue state."""
+        with self._lock:
+            found = self._find_lease(lease_id)
+            if found is None:
+                return None
+            _object_id, item = found
+            if (
+                not item.completion_reserved
+                and (item.lease_expires_at_epoch or 0) <= time.time()
+            ):
+                return None
+            item.lease_expires_at_epoch = time.time() + DEFAULT_LEASE_SECONDS
+            self._flush(found[0])
+            return found
+
+    @asynccontextmanager
+    async def owned_lease_async(
+        self, lease_id: str, lease_seconds: int = DEFAULT_LEASE_SECONDS
+    ):
+        """Reserve one live file-backed lease across metadata persistence."""
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise ValueError("lease_seconds invalido")
+        reservation: _OwnedFileLease | None = None
+        with self._lock:
+            found = self._find_lease(lease_id)
+            if found is not None:
+                object_id, item = found
+                if (item.lease_expires_at_epoch or 0) > time.time():
+                    item.completion_reserved = True
+                    item.lease_expires_at_epoch = time.time() + lease_seconds
+                    reservation = _OwnedFileLease(self, object_id, item)
+        try:
+            yield reservation
+        finally:
+            if reservation is not None:
+                object_id, item = reservation.object_id, reservation.item
+                with self._lock:
+                    current = self._find_lease(lease_id)
+                    if current is not None and current[1] is item:
+                        item.completion_reserved = False
+                        self._flush(object_id)
+                        self._state_changed.notify_all()
+
     def heartbeat(
         self, lease_id: str, progress: dict | None, lease_seconds: int = DEFAULT_LEASE_SECONDS
     ) -> tuple[QueueItem, bool] | None:
@@ -319,7 +419,10 @@ class Sam3Queue:
             if found is None:
                 return None
             object_id, item = found
-            if (item.lease_expires_at_epoch or 0) <= time.time():
+            if (
+                not item.completion_reserved
+                and (item.lease_expires_at_epoch or 0) <= time.time()
+            ):
                 return None
             item.state = "running"
             item.lease_expires_at_epoch = time.time() + lease_seconds
@@ -336,13 +439,26 @@ class Sam3Queue:
             if found is None:
                 return None
             object_id, item = found
-            item.state = state if state in ("done", "error", "cancelled") else "error"
+            if (
+                not item.completion_reserved
+                and (item.lease_expires_at_epoch or 0) <= time.time()
+            ):
+                return None
+            terminal = state if state in ("done", "error", "cancelled") else "error"
+            # Once cancellation was observed by the server, a late successful
+            # result may not promote the job. The worker can acknowledge the
+            # cancellation explicitly instead.
+            if terminal == "done" and item.cancel_requested:
+                return None
+            item.state = terminal
             item.result = result
             item.error = error
             item.finished_at = iso()
             item.lease_id = None
             item.lease_expires_at_epoch = None
             item.cancel_requested = False
+            item.completion_reserved = False
+            self._state_changed.notify_all()
             if item.state == "done":
                 item.progress = {
                     **item.progress,

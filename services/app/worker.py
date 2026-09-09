@@ -9,6 +9,9 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -19,6 +22,68 @@ from pipeline_core.storage import MinioBlobStore
 
 class Cancelled(RuntimeError):
     pass
+
+
+_COMPLETION_RESPONSE_LIMIT = 64 * 1024
+
+
+def _report_video_export_completion(
+    job: dict,
+    lease_token: str,
+    result: dict,
+) -> dict:
+    """Ask the API to commit a published export before acknowledging its job."""
+    base_url = os.environ.get("MST_API", "").strip().rstrip("/")
+    worker_token = os.environ.get("MST_WORKER_TOKEN", "")
+    if not base_url or not worker_token:
+        raise RuntimeError("MST_API e MST_WORKER_TOKEN sao obrigatorios no worker")
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username:
+        raise RuntimeError("MST_API invalida")
+    payload = job.get("payload") or {}
+    object_id = payload.get("object_id")
+    video_id = payload.get("video_id")
+    if not isinstance(object_id, str) or not object_id:
+        raise RuntimeError("job de export sem object_id")
+    if not isinstance(video_id, str) or not video_id:
+        raise RuntimeError("job de export sem video_id")
+    path = (
+        f"/api/objects/{urllib.parse.quote(object_id, safe='')}"
+        f"/videos/{urllib.parse.quote(video_id, safe='')}/export/complete"
+    )
+    body = json.dumps(
+        {
+            "job_id": str(job["id"]),
+            "lease_token": lease_token,
+            "result": result,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + path,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-MST-Worker": worker_token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            encoded = response.read(_COMPLETION_RESPONSE_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"API rejeitou conclusao do export (HTTP {exc.code})") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError("API de conclusao do export indisponivel") from exc
+    if len(encoded) > _COMPLETION_RESPONSE_LIMIT:
+        raise RuntimeError("resposta da conclusao do export excedeu o limite")
+    try:
+        decoded = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("resposta invalida da conclusao do export") from exc
+    if not isinstance(decoded, dict) or decoded.get("ok") is not True:
+        raise RuntimeError("API nao confirmou a conclusao do export")
+    return decoded
 
 
 def _context(job: dict):
@@ -1021,6 +1086,10 @@ def main() -> int:
                 raise ValueError(f"job CPU sem handler registrado: {job['kind']}")
             if lease_errors:
                 raise lease_errors[0]
+            if job["kind"] == "video_export" and not result.get("stale"):
+                _report_video_export_completion(job, token, result)
+                if lease_errors:
+                    raise lease_errors[0]
             stop_heartbeat.set()
             heartbeat.join(timeout=5)
             _settle_job_best_effort(

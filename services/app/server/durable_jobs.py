@@ -8,6 +8,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -257,6 +258,180 @@ def get(job_id: str) -> dict[str, Any] | None:
         "relpath": payload.get("relpath"),
         "owner": payload.get("owner"),
     }
+
+
+def renew_owned_lease(
+    job_id: str, lease_token: str, *, lease_seconds: int = 180
+) -> dict[str, Any] | None:
+    """Fence an internal callback and return only server-owned job fields."""
+    try:
+        UUID(job_id)
+        UUID(lease_token)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if type(lease_seconds) is not int or lease_seconds <= 0:
+        raise ValueError("lease_seconds invalido")
+
+    with _connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE jobs
+               SET lease_expires_at = now() + %(lease_duration)s,
+                   updated_at = now()
+             WHERE id = %(job_id)s::uuid
+               AND lease_token = %(lease_token)s::uuid
+               AND state IN ('leased', 'running')
+               AND lease_expires_at > now()
+               AND cancel_requested = FALSE
+            RETURNING id::text, kind, worker_kind, payload
+            """,
+            {
+                "job_id": job_id,
+                "lease_token": lease_token,
+                "lease_duration": timedelta(seconds=lease_seconds),
+            },
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    payload = row[3] or {}
+    return {
+        "job_id": row[0],
+        "kind": row[1],
+        "worker_kind": row[2],
+        "object_id": payload.get("object_id"),
+        "video_id": payload.get("video_id"),
+        "relpath": payload.get("relpath"),
+        "annotation_revision": payload.get("annotation_revision"),
+        "root_basename": payload.get("root_basename"),
+        "owner": payload.get("owner"),
+        "total": payload.get("total"),
+        "user": payload.get("user"),
+    }
+
+
+@contextmanager
+def owned_job_lease(
+    job_id: str, lease_token: str, *, lease_seconds: int = 180
+):
+    """Keep the active job row locked for an external authoritative commit."""
+    try:
+        UUID(job_id)
+        UUID(lease_token)
+    except (TypeError, ValueError, AttributeError):
+        yield None
+        return
+    if type(lease_seconds) is not int or lease_seconds <= 0:
+        raise ValueError("lease_seconds invalido")
+
+    connection = _connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE jobs
+                   SET lease_expires_at = now() + %(lease_duration)s,
+                       updated_at = now()
+                 WHERE id = %(job_id)s::uuid
+                   AND lease_token = %(lease_token)s::uuid
+                   AND state IN ('leased', 'running')
+                   AND lease_expires_at > now()
+                   AND cancel_requested = FALSE
+                RETURNING id::text, kind, worker_kind, payload
+                """,
+                {
+                    "job_id": job_id,
+                    "lease_token": lease_token,
+                    "lease_duration": timedelta(seconds=lease_seconds),
+                },
+            )
+            row = cursor.fetchone()
+        if row is None:
+            yield None
+        else:
+            payload = row[3] or {}
+            yield {
+                "job_id": row[0],
+                "kind": row[1],
+                "worker_kind": row[2],
+                "object_id": payload.get("object_id"),
+                "video_id": payload.get("video_id"),
+                "relpath": payload.get("relpath"),
+                "annotation_revision": payload.get("annotation_revision"),
+                "root_basename": payload.get("root_basename"),
+                "owner": payload.get("owner"),
+                "total": payload.get("total"),
+                "user": payload.get("user"),
+            }
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+@asynccontextmanager
+async def owned_job_lease_async(
+    job_id: str, lease_token: str, *, lease_seconds: int = 180
+):
+    """Async adapter that retains the row lock until the caller exits."""
+    manager = owned_job_lease(job_id, lease_token, lease_seconds=lease_seconds)
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="job-lease")
+    enter_future = loop.run_in_executor(executor, manager.__enter__)
+    entered = False
+    try:
+        try:
+            job = await asyncio.shield(enter_future)
+            entered = True
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(enter_future)
+            except Exception:
+                pass
+            else:
+                await asyncio.shield(
+                    loop.run_in_executor(executor, manager.__exit__, None, None, None)
+                )
+            raise
+
+        try:
+            yield job
+        except BaseException as exc:
+            exit_future = loop.run_in_executor(
+                executor,
+                manager.__exit__,
+                type(exc),
+                exc,
+                exc.__traceback__,
+            )
+            entered = False
+            try:
+                await asyncio.shield(exit_future)
+            except asyncio.CancelledError:
+                await asyncio.shield(exit_future)
+            raise
+        else:
+            exit_future = loop.run_in_executor(
+                executor, manager.__exit__, None, None, None
+            )
+            entered = False
+            try:
+                await asyncio.shield(exit_future)
+            except asyncio.CancelledError:
+                await asyncio.shield(exit_future)
+                raise
+    finally:
+        if entered:
+            # Defensive cleanup for unusual BaseExceptions raised by the loop.
+            try:
+                await asyncio.shield(
+                    loop.run_in_executor(executor, manager.__exit__, None, None, None)
+                )
+            except BaseException:
+                pass
+        executor.shutdown(wait=False)
 
 
 def cancel(job_id: str) -> bool:

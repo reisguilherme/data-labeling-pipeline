@@ -459,10 +459,14 @@ const SCENARIOS = {
     config: CONFIG,
     videos: TRIAGE_VIDEOS,
     action: "submit-triage",
+    terminalJobs: { "export-job-1": "done" },
     expectPath: "/objects/boom/videos/eee/triage",
     expect: [["Salvar, enviar ao SAM3 e próximo", "ação descreve o fluxo real"]],
     expectedRequests: [
       [/\/api\/objects\/boom\/videos\/aaa\/export$/, "exportação foi enfileirada"],
+    ],
+    forbiddenRequests: [
+      [/\/api\/objects\/boom\/videos\/aaa\/export\/finish$/, "browser não finaliza export depois de desmontar"],
     ],
   },
   "triage-window-bootstrap": {
@@ -1427,6 +1431,9 @@ if (scenario.disabledButton) {
 }
 for (const [pattern, label] of scenario.expectedRequests ?? []) {
   check(requests.some((url) => pattern.test(url)), label);
+}
+for (const [pattern, label] of scenario.forbiddenRequests ?? []) {
+  check(!requests.some((url) => pattern.test(url)), label);
 }
 if (scenario.expectPath) {
   check(window.location.pathname === scenario.expectPath, "abriu o próximo vídeo", window.location.pathname);
