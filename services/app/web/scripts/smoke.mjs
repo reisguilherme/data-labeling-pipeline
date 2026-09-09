@@ -561,6 +561,35 @@ const SCENARIOS = {
     action: "triage-frame-recovery-failure",
     expectedFailure: "cancelado",
   },
+  "triage-repair-once-manual": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: (() => {
+      let calls = 0;
+      return () => ({
+        ...PROXY_STATUS,
+        generation: ++calls === 1 ? "generation-before-repair" : "generation-after-repair",
+      });
+    })(),
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: (() => {
+      let calls = 0;
+      return () => ({
+        mode: "full",
+        job_id: `repair-sequence-${++calls}`,
+        total_frames: 96,
+        already_complete: false,
+      });
+    })(),
+    terminalJobs: {
+      "repair-sequence-1": "done",
+      "repair-sequence-2": "error",
+      "repair-sequence-3": "error",
+    },
+    action: "triage-repair-once-manual",
+  },
   "triage-sse-poll-failure": {
     url: "/objects/boom/videos/aaa/triage",
     config: CONFIG,
@@ -634,6 +663,58 @@ const SCENARIOS = {
     action: "triage-stale-open",
     expectPath: "/objects/boom/videos/eee/triage",
     reject: [["10 → 19", "resposta atrasada do vídeo anterior não sobrescreve o novo"]],
+  },
+  "triage-stale-save-mutation": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayAnnotationMutation: true,
+    annotation: (url) => url.includes("/eee")
+      ? { ...TRIAGE_ANNOTATION, video_id: "eee", relpath: "proximo.mp4", name: "proximo", intervals: [] }
+      : TRIAGE_ANNOTATION,
+    action: "triage-stale-mutation",
+    mutation: "save",
+    expectPath: "/objects/boom/videos/eee/triage",
+  },
+  "triage-stale-export-mutation": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayExportMutation: true,
+    annotation: (url) => url.includes("/eee")
+      ? { ...TRIAGE_ANNOTATION, video_id: "eee", relpath: "proximo.mp4", name: "proximo", intervals: [] }
+      : TRIAGE_ANNOTATION,
+    action: "triage-stale-mutation",
+    mutation: "export",
+    expectPath: "/objects/boom/videos/eee/triage",
+  },
+  "triage-stale-no-object-mutation": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayAnnotationMutation: true,
+    annotation: (url) => url.includes("/eee")
+      ? { ...TRIAGE_ANNOTATION, video_id: "eee", relpath: "proximo.mp4", name: "proximo", intervals: [] }
+      : TRIAGE_ANNOTATION,
+    action: "triage-stale-mutation",
+    mutation: "no-object",
+    expectPath: "/objects/boom/videos/eee/triage",
+  },
+  "triage-dirty-navigation-guard": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    confirmResult: false,
+    action: "triage-dirty-navigation-guard",
+    expectPath: "/objects/boom/videos/aaa/triage",
+  },
+  "triage-saving-navigation-guard": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayAnnotationMutation: true,
+    action: "triage-saving-navigation-guard",
+    expectPath: "/objects/boom/videos/aaa/triage",
   },
   "triage-submit-next-slow-refresh": {
     url: "/objects/boom/videos/aaa/triage",
@@ -837,11 +918,19 @@ let recoveryOverlayDuringFallback = false;
 let recoveryOverlayAfterLoad = false;
 let pollsWhenClosed = 0;
 let repairsWhileFirstPending = 0;
+let repairsBeforeManualRetry = 0;
+let staleMutationPreserved = false;
+let staleMutationDebug = "";
+let beforeUnloadBlocked = false;
+let confirmCalls = 0;
 let releaseFirstRepairStart = () => undefined;
 const firstRepairStartGate = new Promise((resolve) => {
   releaseFirstRepairStart = resolve;
 });
-window.confirm = () => true;
+window.confirm = () => {
+  confirmCalls += 1;
+  return scenario.confirmResult ?? true;
+};
 const originalPushState = window.history.pushState.bind(window.history);
 window.history.pushState = (...args) => {
   eventLog.push(`navigate:${String(args[2] ?? "")}`);
@@ -883,6 +972,13 @@ window.fetch = async (input, init = {}) => {
   ) {
     await new Promise((resolve) => setTimeout(resolve, 120));
     mutationAcked = true;
+  }
+  if (
+    scenario.delayExportMutation &&
+    init.method === "POST" &&
+    /\/api\/objects\/[^/]+\/videos\/[^/]+\/export$/.test(url)
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 160));
   }
   if (/\/api\/objects\/[^/]+\/videos(\?|$)/.test(url)) {
     videosRequests += 1;
@@ -1181,6 +1277,7 @@ if (scenario.action === "triage-full-frame-fallback") {
 if (
   scenario.action === "triage-frame-recovery-success" ||
   scenario.action === "triage-frame-recovery-failure" ||
+  scenario.action === "triage-repair-once-manual" ||
   scenario.action === "triage-sse-close" ||
   scenario.action === "triage-close-reopen-flight"
 ) {
@@ -1206,6 +1303,20 @@ if (
     recoveryOverlayAfterLoad = (window.document.body.textContent ?? "").includes("extraindo os frames");
   } else if (scenario.action === "triage-frame-recovery-failure") {
     await new Promise((resolve) => setTimeout(resolve, scenario.fastPoll ? 120 : 100));
+  } else if (scenario.action === "triage-repair-once-manual") {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await failBothTiers();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    repairsBeforeManualRetry = requestLog.filter(
+      (request) => request.method === "POST" &&
+        /\/videos\/aaa\/proxy$/.test(request.url) &&
+        JSON.parse(request.body ?? "{}").force === true,
+    ).length;
+    const retry = [...window.document.querySelectorAll("button")].find(
+      (button) => button.textContent?.includes("tentar novamente"),
+    );
+    retry?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 60));
   } else if (scenario.action === "triage-sse-close") {
     await new Promise((resolve) => setTimeout(resolve, 80));
     const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
@@ -1248,6 +1359,68 @@ if (scenario.action === "triage-stale-open") {
   const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
   next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   await new Promise((resolve) => setTimeout(resolve, 900));
+}
+if (scenario.action === "triage-stale-mutation") {
+  requests.length = 0;
+  requestLog.length = 0;
+  const mutationButton = [...window.document.querySelectorAll("button")].find((button) => {
+    const label = button.textContent?.trim() ?? "";
+    if (scenario.mutation === "save") return label.startsWith("salvar");
+    if (scenario.mutation === "export") return label.includes("Salvar, enviar ao SAM3");
+    return label.startsWith("Sem objeto");
+  });
+  mutationButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+
+  if (scenario.mutation === "export") {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (requestLog.some((request) => /\/videos\/aaa\/export$/.test(request.url))) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  } else {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  window.history.pushState({}, "", "/objects/boom/videos/eee/triage");
+  window.dispatchEvent(new window.PopStateEvent("popstate"));
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const addInterval = [...window.document.querySelectorAll("button")].find(
+    (button) => button.textContent?.includes("novo intervalo aqui"),
+  );
+  addInterval?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  const saveButton = [...window.document.querySelectorAll("button")].find(
+    (button) => button.textContent?.trim().startsWith("salvar"),
+  );
+  const hasUnsavedMarker = [...window.document.querySelectorAll("[title]")].some(
+    (element) => element.getAttribute("title")?.toLowerCase().includes("salvo"),
+  );
+  staleMutationPreserved = Boolean(
+    hasUnsavedMarker && !saveButton?.disabled,
+  );
+  staleMutationDebug = `marker=${hasUnsavedMarker} disabled=${String(saveButton?.disabled)} events=${eventLog.join(" | ")}`;
+}
+if (scenario.action === "triage-dirty-navigation-guard") {
+  const addInterval = [...window.document.querySelectorAll("button")].find(
+    (button) => button.textContent?.includes("novo intervalo aqui"),
+  );
+  addInterval?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const unload = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(unload);
+  beforeUnloadBlocked = unload.defaultPrevented;
+  const next = window.document.querySelector('button[title$="(PageDown)"]');
+  next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+if (scenario.action === "triage-saving-navigation-guard") {
+  const save = [...window.document.querySelectorAll("button")].find(
+    (button) => button.textContent?.trim().startsWith("salvar"),
+  );
+  save?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const next = window.document.querySelector('button[title$="(PageDown)"]');
+  next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 180));
 }
 if (scenario.action === "review-walk-save") {
   requests.length = 0;
@@ -1348,6 +1521,23 @@ if (scenario.action === "triage-frame-recovery-failure") {
     "falha oferece tentativa manual",
   );
 }
+if (scenario.action === "triage-repair-once-manual") {
+  const repairRequests = requestLog.filter(
+    (request) => request.method === "POST" &&
+      /\/videos\/aaa\/proxy$/.test(request.url) &&
+      JSON.parse(request.body ?? "{}").force === true,
+  );
+  check(
+    repairsBeforeManualRetry === 1,
+    "mudanca de disponibilidade nao repete o reparo automatico",
+    `${repairsBeforeManualRetry} reparos antes do clique`,
+  );
+  check(
+    repairRequests.length === 2,
+    "tentativa manual inicia um novo reparo separado",
+    `${repairRequests.length} reparos no total`,
+  );
+}
 if (scenario.action === "triage-sse-close") {
   const finalPolls = jobPolls.get("repair-poll-running") ?? 0;
   check(pollsWhenClosed > 0, "fallback por polling iniciou");
@@ -1381,6 +1571,20 @@ if (scenario.action === "triage-active-video-order") {
     "desativação e release antigos terminam antes da nova ativação",
     lifecycle.join(" | "),
   );
+}
+if (scenario.action === "triage-stale-mutation") {
+  check(
+    staleMutationPreserved,
+    `resposta tardia de ${scenario.mutation} nao altera o video recem-aberto`,
+    staleMutationDebug,
+  );
+}
+if (scenario.action === "triage-dirty-navigation-guard") {
+  check(confirmCalls === 1, "navegacao com alteracoes pede confirmacao");
+  check(beforeUnloadBlocked, "fechar a pagina com alteracoes ativa a protecao do navegador");
+}
+if (scenario.action === "triage-saving-navigation-guard") {
+  check(confirmCalls === 0, "navegacao durante salvamento e bloqueada sem descartar estado");
 }
 if (scenario.action === "submit-triage-slow-refresh") {
   const saveAt = requestLog.findIndex(

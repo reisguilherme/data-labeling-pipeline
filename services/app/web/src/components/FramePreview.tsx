@@ -47,8 +47,9 @@ export function FramePreview({ videoId }: { videoId: string }) {
   const [rect, setRect] = useState<Rect | null>(null);
   const [panning, setPanning] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
-  const recoveryAttemptRef = useRef<string | null>(null);
+  const automaticRecoveryRef = useRef<string | null>(null);
   const recoverySucceededRef = useRef<string | null>(null);
+  const recoveryRequestRef = useRef(0);
   const previousAvailabilityRef = useRef<string | null>(null);
 
   const interval = selected >= 0 ? intervals[selected] : null;
@@ -93,13 +94,17 @@ export function FramePreview({ videoId }: { videoId: string }) {
   }, [meta]);
 
   useEffect(() => {
-    recoveryAttemptRef.current = null;
+    automaticRecoveryRef.current = null;
     recoverySucceededRef.current = null;
-    setRequestedTier(preferredTier);
+    recoveryRequestRef.current += 1;
     setMissing(false);
     setRecoveryError(null);
     setLoading(true);
-  }, [videoId, frame, preferredTier]);
+  }, [videoId, frame]);
+
+  useEffect(() => {
+    setRequestedTier(preferredTier);
+  }, [preferredTier]);
 
   useEffect(() => {
     if (
@@ -137,9 +142,11 @@ export function FramePreview({ videoId }: { videoId: string }) {
     return () => images.forEach((image) => (image.src = ""));
   }, [videoId, frame, requestedTier, proxy?.complete]);
 
-  const recoverFrame = useCallback(() => {
-    const recoveryKey = `${videoId}:${frame}:${availabilityKey}`;
-    if (recoveryAttemptRef.current === recoveryKey) {
+  const recoverFrame = useCallback((manual = false) => {
+    // A mudança de generation/ranges recarrega o JPEG, mas não concede outra
+    // extração automática. O orçamento pertence ao frame nesta sessão do editor.
+    const recoveryKey = `${videoId}:${frame}`;
+    if (!manual && automaticRecoveryRef.current === recoveryKey) {
       if (recoverySucceededRef.current === recoveryKey) {
         setMissing(true);
         setLoading(false);
@@ -147,7 +154,9 @@ export function FramePreview({ videoId }: { videoId: string }) {
       }
       return;
     }
-    recoveryAttemptRef.current = recoveryKey;
+    if (!manual) automaticRecoveryRef.current = recoveryKey;
+    const request = recoveryRequestRef.current + 1;
+    recoveryRequestRef.current = request;
     recoverySucceededRef.current = null;
     setMissing(true);
     setLoading(true);
@@ -156,18 +165,24 @@ export function FramePreview({ videoId }: { videoId: string }) {
       .getState()
       .ensureFrameAvailable(frame)
       .then(() => {
-        if (recoveryAttemptRef.current !== recoveryKey) return;
+        if (
+          recoveryRequestRef.current !== request ||
+          useAnnotator.getState().videoId !== videoId
+        ) return;
         recoverySucceededRef.current = recoveryKey;
         setRequestedTier(preferredTier);
         setLoading(true);
         setReloadKey((value) => value + 1);
       })
       .catch((error) => {
-        if (recoveryAttemptRef.current !== recoveryKey) return;
+        if (
+          recoveryRequestRef.current !== request ||
+          useAnnotator.getState().videoId !== videoId
+        ) return;
         setLoading(false);
         setRecoveryError((error as Error).message || "não foi possível extrair este frame");
       });
-  }, [videoId, frame, availabilityKey, preferredTier]);
+  }, [videoId, frame, preferredTier]);
 
   // -- zoom e pan ---------------------------------------------------------
 
@@ -350,11 +365,7 @@ export function FramePreview({ videoId }: { videoId: string }) {
                 <button
                   type="button"
                   className="rounded border border-zinc-700 px-3 py-1 text-zinc-200 hover:bg-zinc-800"
-                  onClick={() => {
-                    recoveryAttemptRef.current = null;
-                    recoverySucceededRef.current = null;
-                    recoverFrame();
-                  }}
+                  onClick={() => recoverFrame(true)}
                 >
                   tentar novamente
                 </button>

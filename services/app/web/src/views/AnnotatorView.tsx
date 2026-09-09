@@ -10,6 +10,7 @@ import { Timeline } from "../components/Timeline";
 import { VideoPlayer } from "../components/VideoPlayer";
 import { Button, Panel, Spinner } from "../components/ui";
 import { cx, timecode } from "../lib/format";
+import { installNavigationGuard } from "../lib/routes";
 import { useFramePlayback } from "../lib/useFramePlayback";
 import { useKeyboard } from "../lib/useKeyboard";
 import { computeBlockers, useAnnotator } from "../store/annotator";
@@ -51,6 +52,27 @@ export function AnnotatorView({
     void open(video.video_id);
     return () => close();
   }, [video.video_id, open, close]);
+
+  useEffect(
+    () =>
+      installNavigationGuard(() => {
+        const state = useAnnotator.getState();
+        if (state.saving) return false;
+        if (!state.dirty) return true;
+        return window.confirm("Há alterações não salvas neste vídeo. Deseja descartá-las?");
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    if (!dirty && !saving) return;
+    const protectUnsavedWork = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", protectUnsavedWork);
+    return () => window.removeEventListener("beforeunload", protectUnsavedWork);
+  }, [dirty, saving]);
 
   const fps = meta?.media.fps ?? null;
   const offset = meta?.media.start_time_sec ?? 0;

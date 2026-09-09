@@ -325,6 +325,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       videoId,
       loading: true,
       error: null,
+      saving: false,
       meta: null,
       proxy: null,
       job: null,
@@ -447,6 +448,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       proxy: null,
       job: null,
       intervals: [],
+      saving: false,
       dirty: false,
       lock: null,
       readOnly: false,
@@ -649,6 +651,8 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   save: async () => {
     const { videoId, intervals, status, videoNotes, label, readOnly } = get();
     if (!videoId || readOnly) return false;
+    const generation = openGeneration;
+    const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
     try {
       const saved = await api.saveAnnotation(videoId, {
@@ -656,9 +660,11 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         intervals: toPayload(intervals, label),
         notes: videoNotes,
       });
+      if (!isActive()) return false;
       set({ intervals: saved.intervals.map(fromServer), dirty: false, saving: false });
       return true;
     } catch (error) {
+      if (!isActive()) return false;
       // 409 com trava: outra pessoa assumiu o vídeo enquanto esta aba editava.
       const lock = error instanceof ApiError ? error.lock : null;
       set({
@@ -673,14 +679,18 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   queueExport: async () => {
     const { videoId, readOnly } = get();
     if (!videoId || readOnly) return null;
+    const generation = openGeneration;
+    const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
     try {
       const queued = await api.exportVideo(videoId);
+      if (!isActive()) return null;
       // Criar o job é a barreira de durabilidade. O FFmpeg continua no worker
       // CPU e não deve prender o operador nesta tela durante centenas de frames.
       set({ saving: false, dirty: false });
       return queued;
     } catch (error) {
+      if (!isActive()) return null;
       set({ error: (error as Error).message, saving: false });
       return null;
     }
@@ -689,12 +699,16 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   markNoBoom: async () => {
     const { videoId, videoNotes, readOnly } = get();
     if (!videoId || readOnly) return false;
+    const generation = openGeneration;
+    const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
     try {
       await api.markNoObject(videoId, videoNotes);
+      if (!isActive()) return false;
       set({ status: "no_boom", intervals: [], selected: -1, dirty: false, saving: false });
       return true;
     } catch (error) {
+      if (!isActive()) return false;
       set({ error: (error as Error).message, saving: false });
       return false;
     }

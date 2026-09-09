@@ -57,9 +57,8 @@ export function AppShell({
           value={activeObject.object_id}
           onChange={(event) => {
             const objectId = event.target.value;
-            openObject(objectId);
             const stage = route.page === "operations" ? route.stage : "overview";
-            navigate({ page: "operations", objectId, stage });
+            if (navigate({ page: "operations", objectId, stage })) openObject(objectId);
           }}
           className="max-w-52 rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-200"
         >

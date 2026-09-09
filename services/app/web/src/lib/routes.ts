@@ -10,6 +10,9 @@ export type AppRoute =
   | { page: "export" }
   | { page: "objects" };
 
+type NavigationGuard = () => boolean;
+let navigationGuard: NavigationGuard | null = null;
+
 const OPERATION_STAGES = new Set<OperationsStage>([
   "overview",
   "triage",
@@ -62,8 +65,17 @@ export function routePath(route: AppRoute): string {
   return `/objects/${encodeURIComponent(route.objectId)}/${route.stage}`;
 }
 
-export function navigate(route: AppRoute | string, replace = false): void {
+export function installNavigationGuard(guard: NavigationGuard): () => void {
+  navigationGuard = guard;
+  return () => {
+    if (navigationGuard === guard) navigationGuard = null;
+  };
+}
+
+export function navigate(route: AppRoute | string, replace = false): boolean {
+  if (navigationGuard && !navigationGuard()) return false;
   const path = typeof route === "string" ? route : routePath(route);
   window.history[replace ? "replaceState" : "pushState"]({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
+  return true;
 }
