@@ -253,6 +253,9 @@ def get(job_id: str) -> dict[str, Any] | None:
         "attempts": row[7],
         "cancel_requested": row[11],
         "annotation_revision": payload.get("annotation_revision"),
+        "root_basename": payload.get("root_basename"),
+        "relpath": payload.get("relpath"),
+        "owner": payload.get("owner"),
     }
 
 

@@ -25,6 +25,22 @@ def _unlocked_video(*_args, **_kwargs):
     yield
 
 
+def _owner(*, video_id: str = "video-1", relpath: str = "clip.mp4", revision: int = 2) -> dict:
+    return {
+        "schema_version": 1,
+        "object_id": "boom",
+        "video_id": video_id,
+        "relpath": relpath,
+        "annotation_revision": revision,
+    }
+
+
+def _write_owner(root: Path, owner: dict) -> None:
+    (root / ".export-owner.json").write_text(
+        json.dumps(owner, sort_keys=True), encoding="utf-8"
+    )
+
+
 class CpuWorkerSafetyTests(unittest.TestCase):
     def test_export_staging_is_lease_specific(self) -> None:
         from services.app import worker as worker_module
@@ -88,6 +104,96 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker_module._export_root_from_basename(ctx, "linked")
 
+    def test_cleanup_preserves_legacy_root_without_owner_marker(self) -> None:
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "dataset"
+            root = output / "clip"
+            segment = root / "seg_00"
+            segment.mkdir(parents=True)
+            (segment / "000000.jpg").write_bytes(b"legacy")
+            owner = _owner(revision=2)
+            store = MagicMock()
+            store.entry.return_value = {
+                "status": "no_boom",
+                "annotation_revision": 3,
+                "export_cleanup": {
+                    "root_basename": "clip",
+                    "owner": owner,
+                },
+            }
+            ctx = SimpleNamespace(output_root=output, store=store)
+            queue = MagicMock()
+            queue.update_progress.return_value = True
+            job = {
+                "id": "cleanup-legacy",
+                "payload": {
+                    "object_id": "boom",
+                    "video_id": "video-1",
+                    "relpath": "clip.mp4",
+                    "annotation_revision": 3,
+                    "root_basename": "clip",
+                    "owner": owner,
+                },
+            }
+
+            with patch("services.app.worker._context", return_value=ctx), patch(
+                "server.durable_jobs.video_advisory_lock", _unlocked_video
+            ):
+                result = worker_module.run_video_export_cleanup(job, queue, "lease")
+
+            self.assertTrue(result["deferred"])
+            self.assertEqual(result["reason"], "owner_marker_missing")
+            self.assertEqual((segment / "000000.jpg").read_bytes(), b"legacy")
+
+    def test_cleanup_preserves_root_owned_by_another_video(self) -> None:
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "dataset"
+            root = output / "clip"
+            segment = root / "seg_00"
+            segment.mkdir(parents=True)
+            (segment / "000000.jpg").write_bytes(b"other")
+            expected_owner = _owner(revision=2)
+            _write_owner(
+                root,
+                _owner(video_id="other-video", relpath="other/clip.mp4", revision=2),
+            )
+            store = MagicMock()
+            store.entry.return_value = {
+                "status": "no_boom",
+                "annotation_revision": 3,
+                "export_cleanup": {
+                    "root_basename": "clip",
+                    "owner": expected_owner,
+                },
+            }
+            ctx = SimpleNamespace(output_root=output, store=store)
+            queue = MagicMock()
+            queue.update_progress.return_value = True
+            job = {
+                "id": "cleanup-wrong-owner",
+                "payload": {
+                    "object_id": "boom",
+                    "video_id": "video-1",
+                    "relpath": "clip.mp4",
+                    "annotation_revision": 3,
+                    "root_basename": "clip",
+                    "owner": expected_owner,
+                },
+            }
+
+            with patch("services.app.worker._context", return_value=ctx), patch(
+                "server.durable_jobs.video_advisory_lock", _unlocked_video
+            ):
+                result = worker_module.run_video_export_cleanup(job, queue, "lease")
+
+            self.assertTrue(result["deferred"])
+            self.assertEqual(result["reason"], "owner_mismatch")
+            self.assertEqual((segment / "000000.jpg").read_bytes(), b"other")
+
     def test_cleanup_deletes_only_direct_segments_and_is_idempotent(self) -> None:
         from services.app import worker as worker_module
 
@@ -98,6 +204,8 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             root = output / "clip"
             segment = root / "seg_00"
             segment.mkdir(parents=True)
+            owner = _owner(revision=2)
+            _write_owner(root, owner)
             (segment / "000000.jpg").write_bytes(b"jpeg")
             (root / "notes.txt").write_text("keep", encoding="utf-8")
             sibling_segment = output / "other" / "seg_00"
@@ -106,7 +214,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             store.entry.return_value = {
                 "status": "no_boom",
                 "annotation_revision": 3,
-                "export_cleanup": {"root_basename": "clip"},
+                "export_cleanup": {"root_basename": "clip", "owner": owner},
             }
             ctx = SimpleNamespace(output_root=output, store=store)
             queue = MagicMock()
@@ -119,6 +227,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                     "relpath": "clip.mp4",
                     "annotation_revision": 3,
                     "root_basename": "clip",
+                    "owner": owner,
                 },
             }
             with patch("services.app.worker._context", return_value=ctx), patch(
@@ -182,12 +291,14 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             output = Path(temporary) / "dataset"
             segment = output / "clip" / "seg_00"
             segment.mkdir(parents=True)
+            owner = _owner(revision=2)
+            _write_owner(output / "clip", owner)
             (segment / "000000.jpg").write_bytes(b"jpeg")
             store = MagicMock()
             store.entry.return_value = {
                 "status": "no_boom",
                 "annotation_revision": 3,
-                "export_cleanup": {"root_basename": "clip"},
+                "export_cleanup": {"root_basename": "clip", "owner": owner},
             }
             ctx = SimpleNamespace(output_root=output, store=store)
             queue = MagicMock()
@@ -200,6 +311,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                     "relpath": "clip.mp4",
                     "annotation_revision": 3,
                     "root_basename": "clip",
+                    "owner": owner,
                 },
             }
             held = False
@@ -275,18 +387,68 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             ffmpeg.assert_not_called()
             self.assertEqual(newer.read_bytes(), b"new")
 
+    def test_export_job_cannot_target_another_root(self) -> None:
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            output = base / "dataset"
+            victim = output / "victim" / "seg_00" / "000000.jpg"
+            victim.parent.mkdir(parents=True)
+            victim.write_bytes(b"victim")
+            source = base / "clip.mp4"
+            source.write_bytes(b"video")
+            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4", name="clip")
+            entry = {
+                "status": "in_progress",
+                "annotation_revision": 5,
+                "intervals": [{"segment": "seg_00", "frame_count": 1}],
+            }
+            ctx = SimpleNamespace(
+                object_id="boom",
+                output_root=output,
+                store=MagicMock(entry=MagicMock(return_value=entry)),
+                index=SimpleNamespace(
+                    get=lambda _id: video,
+                    cached_probe=lambda _id: {},
+                ),
+            )
+            queue = MagicMock()
+            queue.update_progress.return_value = True
+            job = {
+                "id": "malicious-export",
+                "payload": {
+                    "object_id": "boom",
+                    "video_id": "video-1",
+                    "annotation_revision": 5,
+                    "root_basename": "victim",
+                    "owner": _owner(revision=5),
+                },
+            }
+
+            with patch("services.app.worker._context", return_value=ctx), patch(
+                "server.durable_jobs.video_advisory_lock", _unlocked_video
+            ), patch("services.app.worker._run_ffmpeg") as ffmpeg, self.assertRaisesRegex(
+                ValueError, "corresponde ao video"
+            ):
+                worker_module.run_video_export(job, queue, "lease")
+
+            ffmpeg.assert_not_called()
+            self.assertEqual(victim.read_bytes(), b"victim")
+
     def test_export_rechecks_revision_after_extraction_before_publishing(self) -> None:
         from services.app import worker as worker_module
 
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             output = base / "dataset"
-            final_frame = output / "clip" / "seg_00" / "new.jpg"
+            final_frame = output / "clip__video-1" / "seg_00" / "new.jpg"
             final_frame.parent.mkdir(parents=True)
             final_frame.write_bytes(b"new")
+            _write_owner(output / "clip__video-1", _owner(revision=4))
             source = base / "clip.mp4"
             source.write_bytes(b"video")
-            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4")
+            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4", name="clip")
             current = {
                 "status": "in_progress",
                 "annotation_revision": 5,
@@ -306,7 +468,9 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                 "intervals": [],
             }
             store = MagicMock()
-            store.entry.side_effect = [current, stale]
+            # A seleção da raiz consulta o mesmo snapshot carregado antes de o
+            # worker liberar o lock; a terceira leitura simula a edição concorrente.
+            store.entry.side_effect = [current, current, stale]
             ctx = SimpleNamespace(
                 object_id="boom",
                 output_root=output,
@@ -325,7 +489,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                     "object_id": "boom",
                     "video_id": "video-1",
                     "annotation_revision": 5,
-                    "root_basename": "clip",
+                    "root_basename": "clip__video-1",
                 },
             }
 
@@ -348,8 +512,16 @@ class CpuWorkerSafetyTests(unittest.TestCase):
 
             self.assertTrue(result["stale"])
             self.assertEqual(final_frame.read_bytes(), b"new")
+            self.assertEqual(
+                json.loads(
+                    (output / "clip__video-1" / ".export-owner.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["annotation_revision"],
+                4,
+            )
             clean_segments.assert_not_called()
-            self.assertFalse(any((output / "clip").glob(".export-*.part")))
+            self.assertFalse(any(output.glob(".clip__video-1.export-*.part")))
 
     def test_export_releases_advisory_lock_before_recursive_gc(self) -> None:
         from services.app import worker as worker_module
@@ -357,12 +529,13 @@ class CpuWorkerSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             output = base / "dataset"
-            old = output / "clip" / "seg_00" / "old.jpg"
+            old = output / "clip__video-1" / "seg_00" / "old.jpg"
             old.parent.mkdir(parents=True)
             old.write_bytes(b"old")
+            _write_owner(output / "clip__video-1", _owner(revision=4))
             source = base / "clip.mp4"
             source.write_bytes(b"video")
-            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4")
+            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4", name="clip")
             entry = {
                 "status": "in_progress",
                 "annotation_revision": 5,
@@ -396,7 +569,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                     "object_id": "boom",
                     "video_id": "video-1",
                     "annotation_revision": 5,
-                    "root_basename": "clip",
+                    "root_basename": "clip__video-1",
                 },
             }
             held = False
@@ -434,10 +607,100 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                 result = worker_module.run_video_export(job, queue, "lease")
 
             self.assertEqual(result["annotation_revision"], 5)
+            self.assertEqual(result["owner"], _owner(revision=5))
             self.assertEqual(
-                (output / "clip" / "seg_00" / "000000.jpg").read_bytes(), b"new"
+                (output / "clip__video-1" / "seg_00" / "000000.jpg").read_bytes(),
+                b"new",
+            )
+            self.assertEqual(
+                json.loads(
+                    (output / "clip__video-1" / ".export-owner.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                _owner(revision=5),
             )
             self.assertFalse(old.exists())
+
+    def test_owner_marker_failure_rolls_back_published_segments(self) -> None:
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            output = base / "dataset"
+            root = output / "clip__video-1"
+            old = root / "seg_00" / "old.jpg"
+            old.parent.mkdir(parents=True)
+            old.write_bytes(b"old")
+            _write_owner(root, _owner(revision=4))
+            source = base / "clip.mp4"
+            source.write_bytes(b"video")
+            video = SimpleNamespace(video_id="video-1", relpath="clip.mp4", name="clip")
+            entry = {
+                "status": "in_progress",
+                "annotation_revision": 5,
+                "media": {"width": 640, "height": 360},
+                "intervals": [
+                    {
+                        "segment": "seg_00",
+                        "frame_count": 1,
+                        "start_frame": 0,
+                        "end_frame": 0,
+                    }
+                ],
+            }
+            store = MagicMock()
+            store.entry.return_value = entry
+            ctx = SimpleNamespace(
+                object_id="boom",
+                output_root=output,
+                store=store,
+                index=SimpleNamespace(
+                    get=lambda _id: video,
+                    resolve_path=lambda _id: source,
+                    cached_probe=lambda _id: {},
+                ),
+            )
+            queue = MagicMock()
+            queue.update_progress.return_value = True
+            job = {
+                "id": "export-marker-failure",
+                "payload": {
+                    "object_id": "boom",
+                    "video_id": "video-1",
+                    "annotation_revision": 5,
+                    "root_basename": root.name,
+                    "owner": _owner(revision=5),
+                },
+            }
+
+            def prepare(_source, segment_dir, _start, _end):
+                (segment_dir / "000000.jpg").write_bytes(b"new")
+                return ["fake-ffmpeg"]
+
+            with (
+                patch("services.app.worker._context", return_value=ctx),
+                patch("server.durable_jobs.video_advisory_lock", _unlocked_video),
+                patch("server.ffmpeg.resolve", return_value=SimpleNamespace(version="test")),
+                patch("server.ffmpeg.export_segment_argv", side_effect=prepare),
+                patch("server.export._frame_size", return_value=(640, 360)),
+                patch("server.export.write_prompt_json"),
+                patch("services.app.worker._run_ffmpeg"),
+                patch(
+                    "server.export.write_export_owner",
+                    side_effect=RuntimeError("marker falhou"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "marker falhou"),
+            ):
+                worker_module.run_video_export(job, queue, "lease")
+
+            self.assertEqual(old.read_bytes(), b"old")
+            self.assertFalse((root / "seg_00" / "000000.jpg").exists())
+            self.assertEqual(
+                json.loads((root / ".export-owner.json").read_text(encoding="utf-8")),
+                _owner(revision=4),
+            )
+            self.assertFalse(any(output.glob(".clip__video-1.export-*.part")))
 
     def test_failed_proxy_replacement_preserves_published_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

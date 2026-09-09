@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
+from uuid import uuid4
 
 from . import ffmpeg
 from .config import EXPORT_QSCALE
@@ -34,6 +36,8 @@ log = logging.getLogger("movies-screening-tool.export")
 _NAMING_RATIONALE = "restart_per_segment"
 
 PROMPT_SCHEMA_VERSION = 1
+EXPORT_OWNER_SCHEMA_VERSION = 1
+EXPORT_OWNER_MARKER = ".export-owner.json"
 
 _SAM3_USAGE = (
     "for o in objects: predictor.add_new_points_or_box("
@@ -42,15 +46,133 @@ _SAM3_USAGE = (
 )
 
 
+def export_owner(ctx, video: VideoFile, annotation_revision: int) -> dict:
+    if type(annotation_revision) is not int or annotation_revision < 0:
+        raise ValueError("annotation_revision invalida")
+    return {
+        "schema_version": EXPORT_OWNER_SCHEMA_VERSION,
+        "object_id": ctx.object_id,
+        "video_id": video.video_id,
+        "relpath": video.relpath,
+        "annotation_revision": annotation_revision,
+    }
+
+
+def valid_export_owner(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    revision = value.get("annotation_revision")
+    if (
+        value.get("schema_version") != EXPORT_OWNER_SCHEMA_VERSION
+        or not isinstance(value.get("object_id"), str)
+        or not value["object_id"]
+        or not isinstance(value.get("video_id"), str)
+        or not value["video_id"]
+        or not isinstance(value.get("relpath"), str)
+        or not value["relpath"]
+        or type(revision) is not int
+        or revision < 0
+    ):
+        return None
+    return {
+        "schema_version": EXPORT_OWNER_SCHEMA_VERSION,
+        "object_id": value["object_id"],
+        "video_id": value["video_id"],
+        "relpath": value["relpath"],
+        "annotation_revision": revision,
+    }
+
+
+def same_export_identity(left: object, right: object) -> bool:
+    first = valid_export_owner(left)
+    second = valid_export_owner(right)
+    if first is None or second is None:
+        return False
+    return all(
+        first[key] == second[key]
+        for key in ("schema_version", "object_id", "video_id", "relpath")
+    )
+
+
+def read_export_owner(root: Path) -> dict | None:
+    marker = root / EXPORT_OWNER_MARKER
+    if root.is_symlink() or marker.is_symlink() or not marker.is_file():
+        return None
+    try:
+        # O marker tem menos de 1 KiB. O limite evita transformar metadado
+        # corrompido em leitura arbitrariamente grande no request/worker.
+        if marker.stat().st_size > 16_384:
+            return None
+        return valid_export_owner(json.loads(marker.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def write_export_owner(root: Path, owner: dict) -> None:
+    normalized = valid_export_owner(owner)
+    if normalized is None:
+        raise ValueError("owner de export invalido")
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise ValueError("raiz de export invalida")
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / EXPORT_OWNER_MARKER
+    if marker.is_symlink():
+        raise ValueError("marker de ownership nao pode ser link simbolico")
+    temporary = root / f".{EXPORT_OWNER_MARKER}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(
+                json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _safe_recorded_root(ctx, raw: object) -> Path | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    candidate = Path(raw)
+    if candidate.is_symlink():
+        return None
+    try:
+        resolved = candidate.resolve()
+        output = ctx.output_root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved == output or resolved.parent != output:
+        return None
+    return resolved
+
+
 def export_root_for(ctx, video: VideoFile) -> Path:
-    output_root = ctx.output_root
-    taken = {
-        entry.name
-        for entry in output_root.iterdir()
-        if entry.is_dir() and not entry.name.startswith("_")
-    } if output_root.exists() else set()
-    taken.discard(export_folder_name(video))
-    return output_root / export_folder_name(video, taken)
+    """Return a stable, video-owned root without reusing ambiguous legacy data."""
+    entry = ctx.store.entry(video.relpath) if getattr(ctx, "store", None) else None
+    recorded = ((entry or {}).get("export") or {}).get("root")
+    previous = _safe_recorded_root(ctx, recorded)
+    expected = export_owner(
+        ctx, video, int((entry or {}).get("annotation_revision") or 0)
+    )
+    if previous is not None and same_export_identity(
+        read_export_owner(previous), expected
+    ):
+        return previous
+
+    root = ctx.output_root / export_folder_name(video)
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise ValueError("raiz deterministica de export invalida")
+    if root.exists():
+        actual = read_export_owner(root)
+        if not same_export_identity(actual, expected):
+            raise ValueError(
+                "raiz deterministica ja existe sem ownership verificavel"
+            )
+    return root
 
 
 def write_prompt_json(
@@ -192,6 +314,10 @@ async def export_video(
             job.current = done_frames
             jobs._publish(job)
 
+        owner = export_owner(
+            ctx, video, int(entry.get("annotation_revision") or 0)
+        )
+        await asyncio.to_thread(write_export_owner, root, owner)
         job.state = "done"
         job.result = {
             "root": root.as_posix(),
@@ -201,6 +327,7 @@ async def export_video(
             "frame_naming": _NAMING_RATIONALE,
             "ffmpeg_version": binaries.version,
             "annotation_revision": int(entry.get("annotation_revision") or 0),
+            "owner": owner,
         }
         job.finished_at = iso()
         jobs._publish(job)

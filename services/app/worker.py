@@ -96,7 +96,7 @@ def _stale_result(expected: int, current: int) -> dict:
 def _staging_export_root(root: Path, job_id: object, lease_token: object) -> Path:
     identity = f"{job_id}:{lease_token}"
     token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-    return root / f".export-{token}.part"
+    return root.parent / f".{root.name}.export-{token}.part"
 
 
 def _trash_export_root(root: Path, job_id: object, operation: str) -> Path:
@@ -317,11 +317,25 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             raise ValueError("anotacao ou intervalos ausentes")
         intervals = entry["intervals"]
         media = entry.get("media") or ctx.index.cached_probe(video_id) or {}
+        expected_owner = video_export.export_owner(ctx, video, expected_revision)
+        declared_owner = payload.get("owner")
+        if (
+            declared_owner is not None
+            and video_export.valid_export_owner(declared_owner) != expected_owner
+        ):
+            raise ValueError("owner do job de export nao corresponde ao video")
+        selected_root = video_export.export_root_for(ctx, video)
         basename = payload.get("root_basename")
         if basename is None:
             # Compatibilidade com jobs enfileirados antes do fence por revisão.
-            basename = video_export.export_root_for(ctx, video).name
+            basename = selected_root.name
         root = _export_root_from_basename(ctx, basename)
+        if root.resolve() != selected_root.resolve():
+            raise ValueError("raiz do job de export nao corresponde ao video")
+        if root.exists() and not video_export.same_export_identity(
+            video_export.read_export_owner(root), expected_owner
+        ):
+            raise ValueError("raiz de export existente sem ownership verificavel")
 
     keep = {interval["segment"] for interval in intervals}
     if any(
@@ -334,12 +348,11 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     ):
         raise ValueError("nome de segmento invalido")
 
-    root.mkdir(parents=True, exist_ok=True)
     staging = _staging_export_root(root, job["id"], token)
     if staging.exists() or staging.is_symlink():
         if staging.is_symlink():
             raise ValueError("staging de export nao pode ser link simbolico")
-        _remove_tree(staging, root)
+        _remove_tree(staging, ctx.output_root)
     staging.mkdir()
     publish_trash = _trash_export_root(
         root, f"{job['id']}:{time.time_ns()}", "replace"
@@ -398,6 +411,20 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
                 {"current": completed, "total": total, "message": "publicando frames"},
             ):
                 raise Cancelled("cancelamento solicitado")
+            selected_root = video_export.export_root_for(ctx, video)
+            if selected_root.resolve() != root.resolve():
+                raise ValueError("raiz do export mudou antes da publicacao")
+            root_created = False
+            if root.exists():
+                if not video_export.same_export_identity(
+                    video_export.read_export_owner(root), expected_owner
+                ):
+                    raise ValueError(
+                        "raiz de export existente sem ownership verificavel"
+                    )
+            else:
+                root.mkdir(parents=True)
+                root_created = True
             publish_trash.mkdir()
             moved_old: list[str] = []
             published: list[str] = []
@@ -416,6 +443,7 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
                 for segment in segments:
                     (staging / segment).replace(root / segment)
                     published.append(segment)
+                video_export.write_export_owner(root, expected_owner)
             except Exception:
                 # Falhas normais de publicação restauram a geração anterior.
                 # Em uma queda abrupta a lixeira permanece para recuperação,
@@ -430,6 +458,15 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
                     destination = root / segment
                     if previous.exists() and not destination.exists():
                         previous.replace(destination)
+                try:
+                    publish_trash.rmdir()
+                except OSError:
+                    pass
+                if root_created:
+                    try:
+                        root.rmdir()
+                    except OSError:
+                        pass
                 raise
 
         if publish_trash.exists():
@@ -448,14 +485,16 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             "frame_naming": video_export._NAMING_RATIONALE,
             "ffmpeg_version": binaries.version,
             "annotation_revision": expected_revision,
+            "owner": expected_owner,
         }
     finally:
         if staging.exists():
-            _remove_tree(staging, root)
+            _remove_tree(staging, ctx.output_root)
 
 
 def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     from server import durable_jobs
+    from server import export as video_export
 
     ctx = _context(job)
     payload = job["payload"]
@@ -473,10 +512,15 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
     trash = _trash_export_root(root, job["id"], "cleanup")
     if trash.is_symlink():
         raise ValueError("lixeira de cleanup nao pode ser link simbolico")
-    if trash.exists():
-        # Uma tentativa anterior já isolou estes diretórios sob o mesmo job.
-        # Removê-los não disputa o lock e não toca um re-export posterior.
-        _remove_tree(trash, root)
+
+    def deferred(reason: str) -> dict:
+        return {
+            "deferred": True,
+            "reason": reason,
+            "removed": [],
+            "root": root.as_posix(),
+            "annotation_revision": expected_revision,
+        }
 
     removed: list[str] = []
     with durable_jobs.video_advisory_lock(payload["object_id"], video_id):
@@ -497,7 +541,24 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
         ):
             return _stale_result(expected_revision, current_revision)
 
+        expected_owner = video_export.valid_export_owner(payload.get("owner"))
+        marker_owner = video_export.valid_export_owner(marker.get("owner"))
+        if expected_owner is None:
+            return deferred("owner_missing")
+        if (
+            expected_owner["object_id"] != payload.get("object_id")
+            or expected_owner["video_id"] != video_id
+            or expected_owner["relpath"] != relpath
+            or marker_owner != expected_owner
+        ):
+            return deferred("owner_mismatch")
+
         if root.exists():
+            actual_owner = video_export.read_export_owner(root)
+            if actual_owner is None:
+                return deferred("owner_marker_missing")
+            if actual_owner != expected_owner:
+                return deferred("owner_mismatch")
             for child in sorted(root.iterdir(), key=lambda path: path.name):
                 if not child.name.startswith("seg_"):
                     continue

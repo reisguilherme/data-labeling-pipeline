@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -109,11 +110,16 @@ def _proxy_mode(previous: dict, media: dict) -> str:
 
 
 def _cleanup_basename(output_root: Path, export_data: dict | None) -> str | None:
+    if not isinstance(export_data, dict):
+        return None
     raw = (export_data or {}).get("root")
     if not isinstance(raw, str) or not raw:
         return None
+    original = Path(raw)
+    if original.is_symlink():
+        return None
     try:
-        root = Path(raw).resolve()
+        root = original.resolve()
         parent = output_root.resolve()
     except (OSError, RuntimeError):
         return None
@@ -266,21 +272,87 @@ async def mark_no_object(
     _require_lock(ctx, video_id, client_id, force)
     media_hint = await _media_for_write(ctx, video_id, allow_probe=False)
     cleanup: dict | None = None
+    should_enqueue = False
+    revision_changed = False
 
     def apply(doc: dict) -> dict:
-        nonlocal cleanup
+        nonlocal cleanup, should_enqueue, revision_changed
         previous = doc["videos"].get(video.relpath) or {}
+        previous_cleanup = previous.get("export_cleanup")
+        requested_notes = payload.notes or previous.get("notes", "")
+        same_decision = (
+            previous.get("status") == "no_boom"
+            and not previous.get("intervals")
+            and previous.get("export") is None
+            and requested_notes == previous.get("notes", "")
+        )
+        if same_decision:
+            entry = copy.deepcopy(previous)
+            cleanup = (
+                copy.deepcopy(previous_cleanup)
+                if isinstance(previous_cleanup, dict)
+                else None
+            )
+            if cleanup is not None:
+                previous_export = cleanup.get("previous_export")
+                previous_export_data = (
+                    previous_export if isinstance(previous_export, dict) else {}
+                )
+                prior_owner = export_module.valid_export_owner(cleanup.get("owner"))
+                owner_revision = previous_export_data.get(
+                    "annotation_revision",
+                    (prior_owner or {}).get("annotation_revision", 0),
+                )
+                if type(owner_revision) is not int or owner_revision < 0:
+                    owner_revision = 0
+                cleanup["owner"] = export_module.export_owner(
+                    ctx, video, owner_revision
+                )
+                safe_basename = _cleanup_basename(ctx.output_root, previous_export)
+                if safe_basename != cleanup.get("root_basename"):
+                    cleanup["status"] = "deferred"
+                    cleanup["root_basename"] = None
+                    cleanup["error"] = "raiz legada sem ownership verificavel"
+                    entry["export_cleanup"] = cleanup
+            if (
+                payload.delete_exported
+                and cleanup is not None
+                and cleanup.get("status") in {"pending", "deferred", "queued"}
+                and cleanup.get("root_basename")
+            ):
+                cleanup["status"] = "pending"
+                cleanup.pop("error", None)
+                cleanup.pop("job_id", None)
+                entry["export_cleanup"] = cleanup
+                entry.pop("cleanup_job_id", None)
+                should_enqueue = True
+            doc["videos"][video.relpath] = entry
+            return entry
+
         revision = _next_revision(previous)
+        revision_changed = True
         previous_export = previous.get("export")
         basename = _cleanup_basename(ctx.output_root, previous_export)
         if payload.delete_exported and previous_export:
+            owner_revision = (
+                previous_export.get(
+                    "annotation_revision", previous.get("annotation_revision", 0)
+                )
+                if isinstance(previous_export, dict)
+                else previous.get("annotation_revision", 0)
+            )
+            if type(owner_revision) is not int or owner_revision < 0:
+                owner_revision = 0
+            owner = export_module.export_owner(ctx, video, owner_revision)
             cleanup = {
                 "status": "pending" if basename else "deferred",
                 "annotation_revision": revision,
                 "root_basename": basename,
+                "owner": owner,
                 "previous_export": previous_export,
                 "requested_at": iso(),
             }
+            should_enqueue = basename is not None
         entry = {
             **previous,
             "video_id": video_id,
@@ -290,7 +362,7 @@ async def mark_no_object(
             "media": _effective_media(previous, media_hint),
             "status": "no_boom",
             "intervals": [],
-            "notes": payload.notes or previous.get("notes", ""),
+            "notes": requested_notes,
             "created_at": previous.get("created_at") or iso(),
             "updated_at": iso(),
             "exported_at": None,
@@ -308,8 +380,9 @@ async def mark_no_object(
     async with _video_mutation_lock(ctx, video_id):
         entry = await ctx.store.mutate(apply)
     revision = entry["annotation_revision"]
-    await _cancel_stale_exports(ctx, video_id, revision)
-    if cleanup is not None and cleanup.get("root_basename") and durable_jobs.enabled():
+    if revision_changed:
+        await _cancel_stale_exports(ctx, video_id, revision)
+    if should_enqueue and cleanup is not None and durable_jobs.enabled():
         try:
             cleanup_job_id = await asyncio.to_thread(
                 durable_jobs.create,
@@ -320,6 +393,7 @@ async def mark_no_object(
                     "relpath": video.relpath,
                     "annotation_revision": revision,
                     "root_basename": cleanup["root_basename"],
+                    "owner": cleanup["owner"],
                     "previous_export": cleanup["previous_export"],
                     "message": "limpando export anterior",
                 },
@@ -328,29 +402,39 @@ async def mark_no_object(
                     f"video-export-cleanup:{ctx.object_id}:{video_id}:r{revision}"
                 ),
             )
-            cleanup["status"] = "queued"
-            cleanup["job_id"] = cleanup_job_id
-            entry["cleanup_job_id"] = cleanup_job_id
+            updated_cleanup = {**cleanup, "status": "queued", "job_id": cleanup_job_id}
+            updated_cleanup.pop("error", None)
         except Exception:  # decision is already durable
-            cleanup["status"] = "deferred"
-            cleanup["error"] = "fila de limpeza temporariamente indisponivel"
+            cleanup_job_id = None
+            updated_cleanup = {
+                **cleanup,
+                "status": "deferred",
+                "error": "fila de limpeza temporariamente indisponivel",
+            }
+            updated_cleanup.pop("job_id", None)
             log.warning(
                 "falha ao enfileirar cleanup de export para %s",
                 video_id,
                 exc_info=True,
             )
         async with _video_mutation_lock(ctx, video_id):
-            await ctx.store.mutate(
+            entry = await ctx.store.mutate(
                 lambda doc: _update_cleanup_marker(
-                    doc, video.relpath, revision, cleanup, entry.get("cleanup_job_id")
+                    doc, video.relpath, revision, updated_cleanup, cleanup_job_id
                 )
             )
-    elif cleanup is not None and cleanup.get("status") == "pending":
-        cleanup["status"] = "deferred"
-        cleanup["error"] = "fila duravel indisponivel"
+    elif should_enqueue and cleanup is not None:
+        updated_cleanup = {
+            **cleanup,
+            "status": "deferred",
+            "error": "fila duravel indisponivel",
+        }
+        updated_cleanup.pop("job_id", None)
         async with _video_mutation_lock(ctx, video_id):
-            await ctx.store.mutate(
-                lambda doc: _update_cleanup_marker(doc, video.relpath, revision, cleanup, None)
+            entry = await ctx.store.mutate(
+                lambda doc: _update_cleanup_marker(
+                    doc, video.relpath, revision, updated_cleanup, None
+                )
             )
     return entry
 
@@ -392,6 +476,7 @@ async def export_video(
             )
             revision = int(entry.get("annotation_revision") or 0)
             export_root = await asyncio.to_thread(export_module.export_root_for, ctx, video)
+            owner = export_module.export_owner(ctx, video, revision)
             job_id = await asyncio.to_thread(
                 durable_jobs.create,
                 kind="video_export",
@@ -405,6 +490,7 @@ async def export_video(
                     "message": "exportando frames",
                     "annotation_revision": revision,
                     "root_basename": export_root.name,
+                    "owner": owner,
                 },
                 priority=50,
                 idempotency_key=f"video-export:{ctx.object_id}:{video_id}:r{revision}",
@@ -441,6 +527,8 @@ async def finish_export(
     if local_job is None and durable_job is None:
         raise HTTPException(404, "job não encontrado")
     job_object_id = local_job.object_id if local_job is not None else durable_job["object_id"]
+    job_kind = local_job.kind if local_job is not None else durable_job["kind"]
+    job_video_id = local_job.video_id if local_job is not None else durable_job["video_id"]
     job_state = local_job.state if local_job is not None else durable_job["state"]
     job_result = local_job.result if local_job is not None else durable_job["result"]
     job_revision = (
@@ -448,10 +536,40 @@ async def finish_export(
         if local_job is not None
         else durable_job.get("annotation_revision")
     )
+    expected_kind = "export" if local_job is not None else "video_export"
+    if job_kind != expected_kind:
+        raise HTTPException(409, "job tem tipo diferente de video_export")
+    if job_video_id != video_id:
+        raise HTTPException(409, "job pertence a outro video")
     if job_object_id != ctx.object_id:
         raise HTTPException(409, "job pertence a outro objeto")
     if job_state != "done":
         raise HTTPException(409, f"job está em {job_state}")
+
+    if not isinstance(job_result, dict):
+        raise HTTPException(409, "job nao possui resultado valido")
+    result_revision = job_result.get("annotation_revision")
+    if (
+        type(job_revision) is not int
+        or job_revision < 0
+        or type(result_revision) is not int
+        or result_revision != job_revision
+    ):
+        raise HTTPException(409, "resultado possui revisao invalida")
+    expected_owner = export_module.export_owner(ctx, video, job_revision)
+    if export_module.valid_export_owner(job_result.get("owner")) != expected_owner:
+        raise HTTPException(409, "resultado possui ownership invalido")
+    result_basename = _cleanup_basename(ctx.output_root, job_result)
+    expected_basename = (
+        export_module.export_root_for(ctx, video).name
+        if local_job is not None
+        else durable_job.get("root_basename")
+    )
+    if not expected_basename or result_basename != expected_basename:
+        raise HTTPException(409, "resultado possui raiz de export inesperada")
+    result_root = ctx.output_root / result_basename
+    if export_module.read_export_owner(result_root) != expected_owner:
+        raise HTTPException(409, "raiz de export nao pertence ao job")
 
     def apply(doc: dict) -> dict:
         entry = doc["videos"].get(video.relpath)
@@ -465,6 +583,31 @@ async def finish_export(
                 409,
                 "resultado pertence a uma revisao antiga da anotacao",
             )
+        expected_segments = [
+            interval.get("segment") for interval in entry.get("intervals") or []
+        ]
+        result_segments = job_result.get("segments")
+        if result_segments != expected_segments or any(
+            not isinstance(segment, str)
+            or not segment.startswith("seg_")
+            or Path(segment).name != segment
+            for segment in result_segments or []
+        ):
+            raise HTTPException(
+                409, "resultado possui segmentos diferentes da anotacao"
+            )
+        expected_total = sum(
+            int(interval.get("frame_count") or 0)
+            for interval in entry.get("intervals") or []
+        )
+        if job_result.get("total_frames") != expected_total:
+            raise HTTPException(409, "resultado possui total de frames invalido")
+        if any(
+            (result_root / segment).is_symlink()
+            or not (result_root / segment).is_dir()
+            for segment in result_segments
+        ):
+            raise HTTPException(409, "resultado possui segmento ausente ou inseguro")
         entry["export"] = job_result
         entry["exported_at"] = iso()
         entry["status"] = "done"

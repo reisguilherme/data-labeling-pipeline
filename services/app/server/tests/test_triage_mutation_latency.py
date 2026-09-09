@@ -13,11 +13,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from server import durable_jobs
+from server import durable_jobs, export as export_module
 from server.models import BBoxIn, IntervalIn, VideoEntryIn
 from server.routers.annotations import (
     FinishPayload,
     NoBoomPayload,
+    _cleanup_basename,
     finish_export,
     mark_no_object,
     put_one,
@@ -117,6 +118,60 @@ async def _no_lock(*_args, **_kwargs):
 
 
 class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_export_roots_are_stable_and_distinct_for_equal_stems(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            legacy = ctx.output_root / "clip"
+            legacy.mkdir(parents=True)
+            (legacy / "seg_00").mkdir()
+            (legacy / "seg_00" / "000000.jpg").write_bytes(b"legacy")
+            first = VideoFile(
+                video_id="111111111111",
+                relpath="a/clip.mp4",
+                abspath=Path(temporary) / "a" / "clip.mp4",
+                name="clip",
+                size_bytes=1,
+                file_mtime="2026-01-01T00:00:00Z",
+            )
+            second = VideoFile(
+                video_id="222222222222",
+                relpath="b/clip.mp4",
+                abspath=Path(temporary) / "b" / "clip.mp4",
+                name="clip",
+                size_bytes=1,
+                file_mtime="2026-01-01T00:00:00Z",
+            )
+
+            first_root = export_module.export_root_for(ctx, first)
+            first_root_again = export_module.export_root_for(ctx, first)
+            first_root.mkdir(parents=True)
+            (first_root / "legacy.txt").write_text("first", encoding="utf-8")
+            second_root = export_module.export_root_for(ctx, second)
+
+            self.assertNotEqual(first_root, second_root)
+            self.assertEqual(first_root, first_root_again)
+            self.assertIn(first.video_id, first_root.name)
+            self.assertIn(second.video_id, second_root.name)
+            self.assertEqual((first_root / "legacy.txt").read_text(encoding="utf-8"), "first")
+            self.assertEqual(
+                (legacy / "seg_00" / "000000.jpg").read_bytes(), b"legacy"
+            )
+
+    async def test_cleanup_basename_rejects_original_symlink_to_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "dataset"
+            owned = output / "owned"
+            owned.mkdir(parents=True)
+            link = output / "alias"
+            try:
+                link.symlink_to(owned, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlink indisponivel neste host: {exc}")
+
+            self.assertIsNone(
+                _cleanup_basename(output, {"root": link.as_posix()})
+            )
+
     async def test_put_uses_bounded_media_and_never_scans_or_cleans_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             ctx = _context(Path(temporary))
@@ -205,6 +260,10 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(create_thread, [threading.get_ident()])
             self.assertIsNone(result["export"])
             self.assertEqual(result["export_cleanup"]["previous_export"]["segments"], ["seg_00"])
+            self.assertEqual(
+                result["export_cleanup"]["owner"],
+                export_module.export_owner(ctx, ctx.index.video, 7),
+            )
 
     async def test_failed_cleanup_enqueue_keeps_no_object_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -248,6 +307,74 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted["status"], "no_boom")
             self.assertEqual(persisted["export_cleanup"]["status"], "deferred")
             self.assertNotIn("db unavailable", persisted["export_cleanup"]["error"])
+
+    async def test_deferred_cleanup_retry_keeps_revision_and_requeues_same_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ctx = _context(root)
+            owner = {
+                "schema_version": 1,
+                "object_id": "boom",
+                "video_id": "video-1",
+                "relpath": "clip.mp4",
+                "annotation_revision": 1,
+            }
+            cleanup = {
+                "status": "deferred",
+                "annotation_revision": 2,
+                "root_basename": "clip__video-1",
+                "owner": owner,
+                "previous_export": {
+                    "root": (ctx.output_root / "clip__video-1").as_posix(),
+                    "segments": ["seg_00"],
+                    "annotation_revision": 1,
+                    "owner": owner,
+                },
+                "requested_at": "2026-01-01T00:00:00Z",
+                "error": "fila de limpeza temporariamente indisponivel",
+            }
+            await ctx.store.put_entry(
+                "clip.mp4",
+                {
+                    "video_id": "video-1",
+                    "relpath": "clip.mp4",
+                    "status": "no_boom",
+                    "annotation_revision": 2,
+                    "intervals": [],
+                    "export": None,
+                    "export_cleanup": cleanup,
+                    "history": [{"revision": 2, "action": "no_object"}],
+                },
+            )
+            creates: list[dict] = []
+
+            def create(**kwargs):
+                creates.append(kwargs)
+                return "cleanup-retry"
+
+            with (
+                patch("server.routers.annotations.proxy.is_complete", return_value=None),
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch(
+                    "server.routers.annotations.durable_jobs.video_advisory_lock_async",
+                    _no_lock,
+                ),
+                patch("server.routers.annotations.durable_jobs.cancel_stale_video_exports"),
+                patch("server.routers.annotations.durable_jobs.create", side_effect=create),
+            ):
+                result = await mark_no_object(
+                    "video-1", NoBoomPayload(), False, ctx, _user(), "tab-1"
+                )
+
+            self.assertEqual(result["annotation_revision"], 2)
+            self.assertEqual(len(result["history"]), 1)
+            self.assertEqual(result["export_cleanup"]["status"], "queued")
+            self.assertEqual(result["cleanup_job_id"], "cleanup-retry")
+            self.assertEqual(len(creates), 1)
+            self.assertEqual(creates[0]["payload"]["owner"], owner)
+            self.assertEqual(
+                creates[0]["idempotency_key"], "video-export-cleanup:boom:video-1:r2"
+            )
 
     async def test_same_video_mutations_increment_revision_and_preserve_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -457,6 +584,195 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(ctx.store.entry("clip.mp4")["status"], "no_boom")
 
+    async def test_finish_rejects_job_for_another_video_or_wrong_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            await ctx.store.put_entry(
+                "clip.mp4",
+                {
+                    "status": "in_progress",
+                    "annotation_revision": 4,
+                    "intervals": [{"segment": "seg_00"}],
+                    "export": None,
+                },
+            )
+            base = {
+                "job_id": "00000000-0000-0000-0000-000000000003",
+                "kind": "video_export",
+                "object_id": "boom",
+                "video_id": "other-video",
+                "annotation_revision": 4,
+                "root_basename": "clip__video-1",
+                "state": "done",
+                "result": {
+                    "root": (ctx.output_root / "clip__video-1").as_posix(),
+                    "segments": ["seg_00"],
+                    "annotation_revision": 4,
+                },
+            }
+            with (
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch("server.routers.annotations.durable_jobs.get", return_value=base),
+                patch(
+                    "server.routers.annotations.durable_jobs.video_advisory_lock_async",
+                    _no_lock,
+                ),
+            ):
+                with self.assertRaisesRegex(Exception, "outro video"):
+                    await finish_export(
+                        "video-1", FinishPayload(job_id=base["job_id"]), ctx, _user()
+                    )
+
+            wrong_kind = {**base, "video_id": "video-1", "kind": "proxy_full"}
+            with (
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch("server.routers.annotations.durable_jobs.get", return_value=wrong_kind),
+                patch(
+                    "server.routers.annotations.durable_jobs.video_advisory_lock_async",
+                    _no_lock,
+                ),
+            ):
+                with self.assertRaisesRegex(Exception, "tipo"):
+                    await finish_export(
+                        "video-1", FinishPayload(job_id=base["job_id"]), ctx, _user()
+                    )
+
+    async def test_finish_rejects_result_root_different_from_job_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            await ctx.store.put_entry(
+                "clip.mp4",
+                {
+                    "status": "in_progress",
+                    "annotation_revision": 4,
+                    "intervals": [{"segment": "seg_00"}],
+                    "export": None,
+                },
+            )
+            job = {
+                "job_id": "00000000-0000-0000-0000-000000000004",
+                "kind": "video_export",
+                "object_id": "boom",
+                "video_id": "video-1",
+                "annotation_revision": 4,
+                "root_basename": "clip__video-1",
+                "state": "done",
+                "result": {
+                    "root": (ctx.output_root / "victim").as_posix(),
+                    "segments": ["seg_00"],
+                    "annotation_revision": 4,
+                    "owner": {
+                        "schema_version": 1,
+                        "object_id": "boom",
+                        "video_id": "video-1",
+                        "relpath": "clip.mp4",
+                        "annotation_revision": 4,
+                    },
+                },
+            }
+            with (
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch("server.routers.annotations.durable_jobs.get", return_value=job),
+            ):
+                with self.assertRaisesRegex(Exception, "raiz"):
+                    await finish_export(
+                        "video-1", FinishPayload(job_id=job["job_id"]), ctx, _user()
+                    )
+
+    async def test_finish_rejects_segments_different_from_current_annotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            ctx.config.auto_sam3 = False
+            owner = export_module.export_owner(ctx, ctx.index.video, 4)
+            root = ctx.output_root / "clip__video-1"
+            (root / "seg_99").mkdir(parents=True)
+            export_module.write_export_owner(root, owner)
+            await ctx.store.put_entry(
+                "clip.mp4",
+                {
+                    "status": "in_progress",
+                    "annotation_revision": 4,
+                    "intervals": [{"segment": "seg_00", "frame_count": 1}],
+                    "export": None,
+                },
+            )
+            job = {
+                "job_id": "00000000-0000-0000-0000-000000000005",
+                "kind": "video_export",
+                "object_id": "boom",
+                "video_id": "video-1",
+                "annotation_revision": 4,
+                "root_basename": root.name,
+                "state": "done",
+                "result": {
+                    "root": root.as_posix(),
+                    "segments": ["seg_99"],
+                    "total_frames": 1,
+                    "annotation_revision": 4,
+                    "owner": owner,
+                },
+            }
+            with (
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch("server.routers.annotations.durable_jobs.get", return_value=job),
+                patch(
+                    "server.routers.annotations.durable_jobs.video_advisory_lock_async",
+                    _no_lock,
+                ),
+            ):
+                with self.assertRaisesRegex(Exception, "segmentos"):
+                    await finish_export(
+                        "video-1", FinishPayload(job_id=job["job_id"]), ctx, _user()
+                    )
+
+    async def test_finish_accepts_only_matching_owned_export_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            ctx.config.auto_sam3 = False
+            owner = export_module.export_owner(ctx, ctx.index.video, 4)
+            root = ctx.output_root / "clip__video-1"
+            (root / "seg_00").mkdir(parents=True)
+            export_module.write_export_owner(root, owner)
+            await ctx.store.put_entry(
+                "clip.mp4",
+                {
+                    "status": "in_progress",
+                    "annotation_revision": 4,
+                    "intervals": [{"segment": "seg_00", "frame_count": 1}],
+                    "export": None,
+                },
+            )
+            job = {
+                "job_id": "00000000-0000-0000-0000-000000000006",
+                "kind": "video_export",
+                "object_id": "boom",
+                "video_id": "video-1",
+                "annotation_revision": 4,
+                "root_basename": root.name,
+                "state": "done",
+                "result": {
+                    "root": root.as_posix(),
+                    "segments": ["seg_00"],
+                    "total_frames": 1,
+                    "annotation_revision": 4,
+                    "owner": owner,
+                },
+            }
+            with (
+                patch("server.routers.annotations.durable_jobs.enabled", return_value=True),
+                patch("server.routers.annotations.durable_jobs.get", return_value=job),
+                patch(
+                    "server.routers.annotations.durable_jobs.video_advisory_lock_async",
+                    _no_lock,
+                ),
+            ):
+                result = await finish_export(
+                    "video-1", FinishPayload(job_id=job["job_id"]), ctx, _user()
+                )
+
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["export"], job["result"])
+
     async def test_export_job_is_revision_specific_and_created_off_event_loop(self) -> None:
         from server.routers.annotations import export_video
 
@@ -476,6 +792,11 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
             def create(**kwargs):
                 create_threads.append(threading.get_ident())
                 self.assertEqual(kwargs["payload"]["annotation_revision"], 4)
+                self.assertEqual(kwargs["payload"]["root_basename"], "clip__video-1")
+                self.assertEqual(
+                    kwargs["payload"]["owner"],
+                    export_module.export_owner(ctx, ctx.index.video, 4),
+                )
                 self.assertEqual(kwargs["idempotency_key"], "video-export:boom:video-1:r4")
                 return "export-job"
 

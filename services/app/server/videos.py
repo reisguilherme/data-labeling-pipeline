@@ -221,10 +221,13 @@ _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 def export_folder_name(video: VideoFile, taken: set[str] | None = None) -> str:
     """Nome da pasta de saída a partir do stem do arquivo.
 
-    Dois vídeos com o mesmo stem em subpastas diferentes colidiriam; desempata de
-    forma determinística com um sufixo do video_id.
+    O ``video_id`` faz parte do nome sempre. Consultar o conteúdo atual da pasta
+    tornava a identidade dependente da ordem das requisições e permitia que dois
+    ``clip.mp4`` em subpastas diferentes apontassem para o mesmo export.
+
+    ``taken`` permanece no contrato apenas para compatibilidade com chamadas
+    antigas; a identidade nova não depende dele.
     """
     base = _UNSAFE.sub("_", video.name).strip(" .") or video.video_id
-    if taken is not None and base in taken:
-        base = f"{base}__{video.video_id[:6]}"
-    return base
+    safe_id = _UNSAFE.sub("_", video.video_id).strip(" .")
+    return f"{base}__{safe_id or hashlib.sha1(video.relpath.encode('utf-8')).hexdigest()[:12]}"
