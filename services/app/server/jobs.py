@@ -275,13 +275,22 @@ class JobManager:
                 if on_cleanup:
                     await asyncio.to_thread(on_cleanup, job)
             else:
-                job.state = "done"
                 if on_success:
                     try:
                         job.result = await asyncio.to_thread(on_success, job)
                     except Exception as exc:  # noqa: BLE001
-                        job.state = "error"
-                        job.error = f"pós-processamento falhou: {exc}"
+                        if job._cancelled:
+                            job.state = "cancelled"
+                            job.message = "cancelado"
+                        else:
+                            job.state = "error"
+                            job.error = f"pós-processamento falhou: {exc}"
+                        if on_cleanup:
+                            await asyncio.to_thread(on_cleanup, job)
+                    else:
+                        job.state = "done"
+                else:
+                    job.state = "done"
 
             job.finished_at = iso()
             self._publish(job)

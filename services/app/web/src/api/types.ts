@@ -465,6 +465,7 @@ export interface ProxyStatus {
   complete: boolean;
   frame_count: number | null;
   available_ranges: [number, number][];
+  generation?: string | null;
   jobs: JobInfo[];
 }
 

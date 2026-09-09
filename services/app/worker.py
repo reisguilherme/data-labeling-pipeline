@@ -100,26 +100,42 @@ def run_proxy_full(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     payload = job["payload"]
     video_id = payload["video_id"]
     out = proxy.proxy_dir(ctx, video_id)
-    _remove_tree(out, ctx.cache_dir)
+    staging = proxy.new_staging_generation(out)
     for tier in proxy.TIERS:
-        proxy.proxy_dir(ctx, video_id, tier).mkdir(parents=True, exist_ok=True)
+        (staging / tier).mkdir(parents=True, exist_ok=True)
     source = ctx.index.resolve_path(video_id)
     total = int(payload.get("frame_count") or 0)
-    _run_ffmpeg(
-        ffmpeg.proxy_full_argv(
-            source,
-            proxy.proxy_dir(ctx, video_id, proxy.SMALL),
-            proxy.proxy_dir(ctx, video_id, proxy.FULL),
-        ),
-        job,
-        queue,
-        token,
-        total=total,
-    )
-    produced = len(list(proxy.proxy_dir(ctx, video_id, proxy.SMALL).glob("*.jpg")))
-    proxy._write_marker(out, produced)
-    ctx.index.update_frame_count(video_id, produced, "proxy_extraction")
-    return {"frames": produced, "dir": str(out)}
+    try:
+        _run_ffmpeg(
+            ffmpeg.proxy_full_argv(source, staging / proxy.SMALL, staging / proxy.FULL),
+            job,
+            queue,
+            token,
+            total=total,
+        )
+        validated = proxy.validate_generation(staging)
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {"current": validated.frames, "total": total, "message": "publicando proxy"},
+        ):
+            raise Cancelled("cancelamento solicitado antes da publicação")
+        generation = proxy.publish_generation(
+            staging,
+            out,
+            ctx.cache_dir,
+            kind="full",
+            job_id=str(job["id"]),
+        )
+        ctx.index.update_frame_count(video_id, generation.frames, "proxy_extraction")
+        return {
+            "frames": generation.frames,
+            "dir": str(generation.path),
+            "generation": generation.token,
+        }
+    except Exception:
+        _remove_tree(staging, ctx.cache_dir)
+        raise
 
 
 def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
@@ -130,28 +146,49 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     video_id = payload["video_id"]
     start, end = int(payload["start"]), int(payload["end"])
     final = proxy.window_dir(ctx, video_id, start, end)
-    staging = final.with_name(final.name + ".part")
-    _remove_tree(staging, ctx.cache_dir)
+    staging = proxy.new_staging_generation(final)
     for tier in proxy.TIERS:
         (staging / tier).mkdir(parents=True, exist_ok=True)
     source = ctx.index.resolve_path(video_id)
-    _run_ffmpeg(
-        ffmpeg.proxy_window_argv(source, staging / proxy.SMALL, staging / proxy.FULL, start, end),
-        job,
-        queue,
-        token,
-        total=end - start + 1,
-    )
-    if final.exists():
-        _remove_tree(final, ctx.cache_dir)
-    staging.replace(final)
-    proxy._touch(final)
-    proxy._evict_if_needed(ctx)
-    return {
-        "start": start,
-        "end": end,
-        "frames": len(list((final / proxy.SMALL).glob("*.jpg"))),
-    }
+    expected = end - start + 1
+    try:
+        _run_ffmpeg(
+            ffmpeg.proxy_window_argv(
+                source, staging / proxy.SMALL, staging / proxy.FULL, start, end
+            ),
+            job,
+            queue,
+            token,
+            total=expected,
+        )
+        validated = proxy.validate_generation(staging, expected_frames=expected)
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {"current": validated.frames, "total": expected, "message": "publicando janela"},
+        ):
+            raise Cancelled("cancelamento solicitado antes da publicação")
+        generation = proxy.publish_generation(
+            staging,
+            final,
+            ctx.cache_dir,
+            kind="window",
+            job_id=str(job["id"]),
+            start=start,
+            end=end,
+            expected_frames=expected,
+        )
+        proxy._touch(final)
+        proxy._evict_if_needed(ctx)
+        return {
+            "start": start,
+            "end": end,
+            "frames": generation.frames,
+            "generation": generation.token,
+        }
+    except Exception:
+        _remove_tree(staging, ctx.cache_dir)
+        raise
 
 
 def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:

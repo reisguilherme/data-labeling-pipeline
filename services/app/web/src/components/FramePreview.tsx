@@ -61,7 +61,7 @@ export function FramePreview({ videoId }: { videoId: string }) {
   // boom. Tocando, usa a versão pequena: 24 fps de JPEG 4K (~300 KB cada) não
   // sustenta reprodução fluida, e durante a passagem o detalhe não é o que importa.
   const preferredTier: FrameTier = playing ? "small" : "full";
-  const availabilityKey = `${proxy?.mode ?? "none"}:${proxy?.complete ?? false}:${JSON.stringify(proxy?.available_ranges ?? [])}`;
+  const availabilityKey = `${proxy?.generation ?? "none"}:${proxy?.mode ?? "none"}:${proxy?.complete ?? false}:${JSON.stringify(proxy?.available_ranges ?? [])}`;
   const [requestedTier, setRequestedTier] = useState<FrameTier>(preferredTier);
   const src = api.frameUrl(videoId, frame, requestedTier);
 

@@ -227,9 +227,9 @@ async def get_frame(
         return FileResponse(
             path,
             media_type="image/jpeg",
-            # Frame N de um vídeo nunca muda: deixa o cache do browser fazer a
-            # evicção em vez de segurar bitmaps em JS.
-            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            # A URL é estável, mas uma geração reparada pode substituir o JPEG.
+            # Revalidar evita que o browser retenha para sempre um frame defeituoso.
+            headers={"Cache-Control": "private, max-age=0, must-revalidate"},
         )
 
     frame_count = await frame_count_for(ctx, video_id)

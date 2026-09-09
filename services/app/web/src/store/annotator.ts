@@ -404,16 +404,6 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
             if (!isActive()) return;
             set({ job: job.state === "running" || job.state === "queued" ? job : null });
 
-            // O modo completo escreve os JPEGs em ordem, então o progresso do job
-            // já diz o que está disponível — sem precisar consultar o servidor a
-            // cada tick para o filmstrip preencher ao vivo.
-            if (job.kind === "proxy_full" && job.current > 0) {
-              const current = get().proxy;
-              if (current && !current.complete) {
-                set({ proxy: { ...current, available_ranges: [[0, job.current - 1]] } });
-              }
-            }
-
             if (job.state === "done") {
               void api
                 .proxyStatus(videoId)
