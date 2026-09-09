@@ -849,6 +849,74 @@ class ProxyReliabilityTests(unittest.TestCase):
             self.assertEqual(result["roots_scanned"], 1)
             self.assertEqual(sum(path.exists() for path in abandoned), remaining)
 
+    def test_operational_sweep_streams_discovery_with_an_entry_budget(self) -> None:
+        proxy_base = self.cache / "proxy"
+        for index in range(12):
+            (proxy_base / f"video-{index:02d}").mkdir(parents=True)
+
+        real_iterdir = Path.iterdir
+        observed = 0
+
+        def guarded_iterdir(path: Path):
+            nonlocal observed
+            for entry in real_iterdir(path):
+                if path == proxy_base:
+                    observed += 1
+                    if observed > 3:
+                        raise AssertionError("discovery varreu alem do budget")
+                yield entry
+
+        with patch.object(Path, "iterdir", new=guarded_iterdir):
+            result = proxy.sweep_cache(
+                self.ctx,
+                max_roots=2,
+                discovery_entry_budget=3,
+                time_budget_seconds=10,
+            )
+
+        self.assertEqual(result["roots_scanned"], 2)
+        self.assertLessEqual(result["entries_scanned"], 3)
+        self.assertLessEqual(observed, 3)
+
+    def test_streaming_sweep_cursor_eventually_visits_every_root(self) -> None:
+        tombstones: list[Path] = []
+        for index in range(7):
+            root = proxy.proxy_dir(self.ctx, f"fair-{index}")
+            trash = root / (".gc-" + f"{index:032x}")
+            trash.mkdir(parents=True)
+            (trash / "payload").write_bytes(b"garbage")
+            tombstones.append(trash)
+
+        for _ in range(14):
+            proxy.sweep_cache(
+                self.ctx,
+                max_roots=1,
+                discovery_entry_budget=2,
+                time_budget_seconds=10,
+            )
+            if not any(path.exists() for path in tombstones):
+                break
+
+        self.assertFalse(any(path.exists() for path in tombstones))
+
+    def test_operational_sweep_stops_discovery_at_its_time_budget(self) -> None:
+        proxy_base = self.cache / "proxy"
+        for index in range(12):
+            (proxy_base / f"timed-{index:02d}").mkdir(parents=True)
+
+        with patch(
+            "server.proxy.time.monotonic", side_effect=[0.0, 0.0, 1.0]
+        ):
+            result = proxy.sweep_cache(
+                self.ctx,
+                max_roots=12,
+                discovery_entry_budget=100,
+                time_budget_seconds=0.5,
+            )
+
+        self.assertEqual(result["entries_scanned"], 2)
+        self.assertEqual(result["roots_scanned"], 2)
+
     def test_operational_sweep_retries_gc_trash_after_delete_failure(self) -> None:
         sweep = getattr(proxy, "sweep_cache", None)
         self.assertTrue(callable(sweep), "sweep operacional ausente")

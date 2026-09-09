@@ -54,11 +54,18 @@ _MAX_MARKER_BYTES = 16 * 1024
 _MAX_WINDOWS_INDEX_BYTES = 4 * 1024 * 1024
 _MAX_SWEEP_CURSOR_BYTES = 4 * 1024
 _DEFAULT_GC_DELETE_LIMIT = 8
+_DEFAULT_SWEEP_ENTRY_LIMIT = 1024
+_DEFAULT_SWEEP_TIME_BUDGET_SECONDS = 0.25
+_MAX_SWEEP_STREAMS = 64
 GENERATION_RETIRE_GRACE_SECONDS = 120.0
 STAGING_ORPHAN_GRACE_SECONDS = 24 * 60 * 60.0
 _GENERATION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _GC_TRASH = re.compile(r"^\.gc-[0-9a-f]{32}$")
 _WINDOW_ROOT = re.compile(r"^([0-9]{8,12})_([0-9]{8,12})$")
+
+_SweepRoot = tuple[str, Path, tuple[int, int] | None]
+_SWEEP_STREAMS: dict[str, Iterator[_SweepRoot | None]] = {}
+_SWEEP_STREAMS_LOCK = threading.Lock()
 
 # "small" alimenta filmstrip e reprodução; "full" é a imagem grande do palco.
 Tier = str
@@ -846,76 +853,161 @@ def current_generation(
     )
 
 
-def _sweep_roots(cache_root: Path) -> list[tuple[str, Path, tuple[int, int] | None]]:
-    """Descobre roots de manutencao; nunca e chamada no caminho de request."""
-    roots: list[tuple[str, Path, tuple[int, int] | None]] = []
+def _scan_sweep_events(cache_root: Path) -> Iterator[_SweepRoot | None]:
+    """Um evento por dir entry; nenhum nivel e materializado ou ordenado."""
     proxy_base = cache_root / "proxy"
     if _regular_directory(proxy_base) and _resolved_child(proxy_base, cache_root):
         try:
-            for root in proxy_base.iterdir():
-                if _regular_directory(root) and _resolved_child(
-                    root, proxy_base, cache_root
-                ):
-                    roots.append(
-                        (root.relative_to(cache_root).as_posix(), root, None)
-                    )
+            with os.scandir(proxy_base) as entries:
+                for raw in entries:
+                    root = Path(raw.path)
+                    candidate: _SweepRoot | None = None
+                    try:
+                        if raw.is_dir(follow_symlinks=False) and _resolved_child(
+                            root, proxy_base, cache_root
+                        ):
+                            candidate = (
+                                root.relative_to(cache_root).as_posix(),
+                                root,
+                                None,
+                            )
+                    except OSError:
+                        pass
+                    yield candidate
         except OSError:
             log.warning(
                 "falha ao enumerar roots de proxy em %s", proxy_base, exc_info=True
             )
 
     windows_base = cache_root / "windows"
-    if _regular_directory(windows_base) and _resolved_child(windows_base, cache_root):
-        try:
-            videos = list(windows_base.iterdir())
-        except OSError:
-            videos = []
-            log.warning(
-                "falha ao enumerar videos com janelas em %s",
-                windows_base,
-                exc_info=True,
-            )
-        for video in videos:
-            if not _regular_directory(video) or not _resolved_child(
-                video, windows_base, cache_root
-            ):
-                continue
-            try:
-                for root in video.iterdir():
-                    match = _WINDOW_ROOT.fullmatch(root.name)
-                    if (
-                        match is None
-                        or not _regular_directory(root)
-                        or not _resolved_child(root, video, windows_base, cache_root)
-                    ):
-                        continue
-                    start, end = int(match.group(1)), int(match.group(2))
-                    if end < start or root.name != f"{start:08d}_{end:08d}":
-                        continue
-                    roots.append(
-                        (root.relative_to(cache_root).as_posix(), root, (start, end))
+    if not _regular_directory(windows_base) or not _resolved_child(
+        windows_base, cache_root
+    ):
+        return
+    try:
+        with os.scandir(windows_base) as videos:
+            for raw_video in videos:
+                video = Path(raw_video.path)
+                try:
+                    valid_video = raw_video.is_dir(
+                        follow_symlinks=False
+                    ) and _resolved_child(video, windows_base, cache_root)
+                except OSError:
+                    valid_video = False
+                # A propria entrada do video tambem consome o budget.
+                yield None
+                if not valid_video:
+                    continue
+                try:
+                    with os.scandir(video) as windows:
+                        for raw_root in windows:
+                            root = Path(raw_root.path)
+                            candidate = None
+                            match = _WINDOW_ROOT.fullmatch(root.name)
+                            try:
+                                valid_root = raw_root.is_dir(
+                                    follow_symlinks=False
+                                ) and _resolved_child(
+                                    root, video, windows_base, cache_root
+                                )
+                            except OSError:
+                                valid_root = False
+                            if match is not None and valid_root:
+                                start, end = int(match.group(1)), int(match.group(2))
+                                if end >= start and root.name == f"{start:08d}_{end:08d}":
+                                    candidate = (
+                                        root.relative_to(cache_root).as_posix(),
+                                        root,
+                                        (start, end),
+                                    )
+                            yield candidate
+                except OSError:
+                    log.warning(
+                        "falha ao enumerar janelas de %s", video, exc_info=True
                     )
-            except OSError:
-                log.warning(
-                    "falha ao enumerar janelas de %s", video, exc_info=True
-                )
-    return sorted(roots, key=lambda item: item[0])
+    except OSError:
+        log.warning(
+            "falha ao enumerar videos com janelas em %s",
+            windows_base,
+            exc_info=True,
+        )
 
 
-def _select_sweep_roots(
-    cache_root: Path,
-    roots: list[tuple[str, Path, tuple[int, int] | None]],
-    max_roots: int,
-) -> list[tuple[str, Path, tuple[int, int] | None]]:
-    if not roots or max_roots == 0:
-        return []
+def _rotating_sweep_events(
+    cache_root: Path, cursor: str | None
+) -> Iterator[_SweepRoot | None]:
+    """Percorre ciclos fisicos completos, iniciando depois do cursor salvo."""
+    anchor = cursor
+    while True:
+        saw_entry = False
+        found_anchor = anchor is None
+        if anchor is not None:
+            for candidate in _scan_sweep_events(cache_root):
+                saw_entry = True
+                if not found_anchor:
+                    yield None
+                    if candidate is not None and candidate[0] == anchor:
+                        found_anchor = True
+                else:
+                    yield candidate
+
+            # Completa a volta do inicio ate o anchor. Se o root sumiu, esta
+            # segunda passagem vira um ciclo completo e recupera o progresso.
+            for candidate in _scan_sweep_events(cache_root):
+                saw_entry = True
+                yield candidate
+                if found_anchor and candidate is not None and candidate[0] == anchor:
+                    break
+        else:
+            for candidate in _scan_sweep_events(cache_root):
+                saw_entry = True
+                yield candidate
+        if not saw_entry:
+            return
+
+
+def _discovery_stream(cache_root: Path) -> Iterator[_SweepRoot | None]:
+    key = str(cache_root.resolve())
+    stream = _SWEEP_STREAMS.get(key)
+    if stream is not None:
+        return stream
+    if len(_SWEEP_STREAMS) >= _MAX_SWEEP_STREAMS:
+        stale_key = next(iter(_SWEEP_STREAMS))
+        stale = _SWEEP_STREAMS.pop(stale_key)
+        stale.close()
     cursor = _bounded_text(cache_root / SWEEP_CURSOR, _MAX_SWEEP_CURSOR_BYTES)
-    keys = [item[0] for item in roots]
-    position = bisect_right(keys, cursor) if cursor is not None else 0
-    if position >= len(roots):
-        position = 0
-    count = min(max_roots, len(roots))
-    return [roots[(position + offset) % len(roots)] for offset in range(count)]
+    stream = _rotating_sweep_events(cache_root, cursor)
+    _SWEEP_STREAMS[key] = stream
+    return stream
+
+
+def _take_sweep_roots(
+    cache_root: Path,
+    *,
+    max_roots: int,
+    entry_budget: int,
+    time_budget_seconds: float,
+) -> tuple[list[_SweepRoot], int]:
+    selected: list[_SweepRoot] = []
+    scanned = 0
+    deadline = time.monotonic() + time_budget_seconds
+    if max_roots == 0 or entry_budget == 0 or time_budget_seconds == 0:
+        return selected, scanned
+    key = str(cache_root.resolve())
+    with _SWEEP_STREAMS_LOCK:
+        stream = _discovery_stream(cache_root)
+        while scanned < entry_budget and len(selected) < max_roots:
+            if scanned and time.monotonic() >= deadline:
+                break
+            try:
+                candidate = next(stream)
+            except StopIteration:
+                _SWEEP_STREAMS.pop(key, None)
+                break
+            scanned += 1
+            if candidate is not None:
+                selected.append(candidate)
+    return selected, scanned
 
 
 def _store_sweep_cursor(cache_root: Path, key: str) -> None:
@@ -1022,6 +1114,8 @@ def sweep_cache(
     max_delete_per_root: int = _DEFAULT_GC_DELETE_LIMIT,
     retire_grace_seconds: float = GENERATION_RETIRE_GRACE_SECONDS,
     staging_grace_seconds: float = STAGING_ORPHAN_GRACE_SECONDS,
+    discovery_entry_budget: int = _DEFAULT_SWEEP_ENTRY_LIMIT,
+    time_budget_seconds: float = _DEFAULT_SWEEP_TIME_BUDGET_SECONDS,
 ) -> dict[str, int]:
     """Manutencao limitada e retomavel de artefatos deixados por crashes.
 
@@ -1033,18 +1127,33 @@ def sweep_cache(
         raise ValueError("limite de roots do sweep invalido")
     if type(max_delete_per_root) is not int or max_delete_per_root < 0:
         raise ValueError("limite de remocao do sweep invalido")
+    if type(discovery_entry_budget) is not int or discovery_entry_budget < 0:
+        raise ValueError("budget de entradas do sweep invalido")
+    if (
+        not isinstance(time_budget_seconds, (int, float))
+        or not math.isfinite(time_budget_seconds)
+        or time_budget_seconds < 0
+    ):
+        raise ValueError("budget de tempo do sweep invalido")
     cache_root = Path(ctx.cache_dir)
     result = {
         "roots_scanned": 0,
         "artifacts_removed": 0,
         "trash_removed": 0,
         "index_repairs": 0,
+        "entries_scanned": 0,
         "errors": 0,
     }
     if not _regular_directory(cache_root) or cache_root.is_symlink():
         return result
 
-    roots = _select_sweep_roots(cache_root, _sweep_roots(cache_root), max_roots)
+    roots, entries_scanned = _take_sweep_roots(
+        cache_root,
+        max_roots=max_roots,
+        entry_budget=discovery_entry_budget,
+        time_budget_seconds=float(time_budget_seconds),
+    )
+    result["entries_scanned"] = entries_scanned
     for key, root, window_range in roots:
         result["roots_scanned"] += 1
         try:

@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from pipeline_core.jobs import PostgresJobQueue
 from pipeline_core.storage import MinioBlobStore
@@ -578,6 +579,54 @@ def _run_proxy_maintenance() -> None:
             )
 
 
+class _ProxyMaintenanceScheduler:
+    """Agenda maintenance fora do claim loop, com no maximo um voo ativo."""
+
+    def __init__(
+        self, runner: Callable[[], None], *, interval_seconds: float
+    ) -> None:
+        self._runner = runner
+        self._interval_seconds = float(interval_seconds)
+        self._next_due = 0.0
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def _run(self) -> None:
+        try:
+            self._runner()
+        except Exception:  # noqa: BLE001 - maintenance nunca derruba o worker
+            log.warning("falha na maintenance periodica de proxy", exc_info=True)
+
+    def maybe_start(self, now: float) -> bool:
+        with self._lock:
+            if now < self._next_due:
+                return False
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._next_due = now + self._interval_seconds
+            self._thread = threading.Thread(
+                target=self._run,
+                name="proxy-maintenance",
+                daemon=True,
+            )
+            try:
+                self._thread.start()
+            except Exception:  # noqa: BLE001 - claim loop continua sem maintenance
+                self._thread = None
+                log.warning("nao foi possivel iniciar maintenance", exc_info=True)
+                return False
+            return True
+
+    def wait(self, *, timeout: float | None = None) -> bool:
+        """Hook de teste/shutdown; o loop normal nunca espera maintenance."""
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
+
 def _settle_job_best_effort(job_id: str, action) -> None:
     """Perder a lease abandona o resultado; nunca encerra o consumidor CPU."""
     try:
@@ -597,15 +646,12 @@ def main() -> int:
     url = os.environ["DATABASE_URL"]
     queue = PostgresJobQueue(lambda: psycopg.connect(url))
     worker_id = os.environ.get("CPU_WORKER_ID", f"cpu-{socket.gethostname()}")
-    next_proxy_maintenance = 0.0
+    maintenance = _ProxyMaintenanceScheduler(
+        _run_proxy_maintenance,
+        interval_seconds=_PROXY_SWEEP_INTERVAL_SECONDS,
+    )
     while True:
-        now = time.monotonic()
-        if now >= next_proxy_maintenance:
-            try:
-                _run_proxy_maintenance()
-            except Exception:  # pragma: no cover - defesa contra regressao futura
-                log.warning("falha na manutencao periodica de proxy", exc_info=True)
-            next_proxy_maintenance = now + _PROXY_SWEEP_INTERVAL_SECONDS
+        maintenance.maybe_start(time.monotonic())
         job = queue.claim(worker_id=worker_id, worker_kind="cpu", lease_seconds=180)
         if job is None:
             time.sleep(2)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -224,12 +225,32 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             pass
 
         queue = MagicMock()
-        queue.claim.side_effect = [None, StopWorker("stop test loop")]
+        first_run = threading.Event()
+        second_run = threading.Event()
+        calls = 0
+
+        def maintenance() -> None:
+            nonlocal calls
+            calls += 1
+            (first_run if calls == 1 else second_run).set()
+
+        claims = 0
+
+        def claim(**_kwargs):
+            nonlocal claims
+            claims += 1
+            expected = first_run if claims == 1 else second_run
+            self.assertTrue(expected.wait(timeout=1), "maintenance nao foi agendada")
+            if claims == 1:
+                return None
+            raise StopWorker("stop test loop")
+
+        queue.claim.side_effect = claim
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://unused"}), patch(
             "services.app.worker.PostgresJobQueue", return_value=queue
         ), patch(
-            "services.app.worker._run_proxy_maintenance", create=True
-        ) as maintenance, patch(
+            "services.app.worker._run_proxy_maintenance", side_effect=maintenance
+        ), patch(
             "services.app.worker.time.monotonic", side_effect=[0.0, 301.0]
         ), patch(
             "services.app.worker.time.sleep"
@@ -237,7 +258,87 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(StopWorker, "stop test loop"):
                 worker_main()
 
-        self.assertEqual(maintenance.call_count, 2)
+        self.assertEqual(calls, 2)
+
+    def test_blocked_proxy_gc_rmtree_never_delays_job_claim(self) -> None:
+        class StopWorker(RuntimeError):
+            pass
+
+        started = threading.Event()
+        release = threading.Event()
+        claimed = threading.Event()
+        errors: list[BaseException] = []
+
+        def blocked_rmtree(_path) -> None:
+            started.set()
+            release.wait(timeout=2)
+
+        def maintenance() -> None:
+            proxy.shutil.rmtree(Path("maintenance-tombstone"))
+
+        queue = MagicMock()
+
+        def claim(**_kwargs):
+            claimed.set()
+            raise StopWorker("stop test loop")
+
+        queue.claim.side_effect = claim
+
+        def run_worker() -> None:
+            try:
+                worker_main()
+            except BaseException as exc:  # surfaced below
+                errors.append(exc)
+
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://unused"}), patch(
+            "services.app.worker.PostgresJobQueue", return_value=queue
+        ), patch(
+            "services.app.worker._run_proxy_maintenance", side_effect=maintenance
+        ), patch(
+            "server.proxy.shutil.rmtree", side_effect=blocked_rmtree
+        ):
+            worker = threading.Thread(target=run_worker)
+            worker.start()
+            try:
+                self.assertTrue(started.wait(timeout=1))
+                self.assertTrue(
+                    claimed.wait(timeout=0.2),
+                    "claim ficou bloqueado pela maintenance",
+                )
+            finally:
+                release.set()
+                worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], StopWorker)
+
+    def test_proxy_maintenance_scheduler_is_single_flight(self) -> None:
+        from services.app import worker as worker_module
+
+        scheduler_type = getattr(worker_module, "_ProxyMaintenanceScheduler", None)
+        self.assertTrue(callable(scheduler_type), "scheduler de maintenance ausente")
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def maintenance() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                release.wait(timeout=2)
+
+        scheduler = scheduler_type(maintenance, interval_seconds=300)
+        self.assertTrue(scheduler.maybe_start(0.0))
+        self.assertTrue(started.wait(timeout=1))
+        self.assertFalse(scheduler.maybe_start(301.0))
+        self.assertEqual(calls, 1)
+        release.set()
+        self.assertTrue(scheduler.wait(timeout=1))
+        self.assertTrue(scheduler.maybe_start(301.0))
+        self.assertTrue(scheduler.wait(timeout=1))
+        self.assertEqual(calls, 2)
 
 
 if __name__ == "__main__":
