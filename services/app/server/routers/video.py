@@ -24,7 +24,9 @@ async def frame_count_for(ctx: ObjectContext, video_id: str) -> int | None:
         return exact
     cached = ctx.index.cached_probe(video_id)
     if cached is None:
-        cached = await ctx.index.probe(video_id, count_packets=True)
+        # Nunca percorra o arquivo inteiro dentro de uma requisição. A extração
+        # completa promove a contagem exata quando terminar no worker.
+        cached = await ctx.index.probe(video_id, count_packets=False)
     return cached.get("frame_count")
 
 
@@ -42,11 +44,11 @@ async def get_meta(
     video = _require(ctx, video_id)
 
     cached = None if refresh else ctx.index.cached_probe(video_id)
-    if cached is None or cached.get("frame_count_source") == "container":
-        # Ao abrir o vídeo vale pagar o count_packets (demux, sem decode): a
-        # contagem de container em mp4 costuma estar ausente ou ser estimada.
+    if cached is None or refresh:
+        # Um probe de cabeçalho é limitado; contar todos os pacotes de um vídeo
+        # grande fazia abrir a triagem levar vários minutos.
         try:
-            cached = await ctx.index.probe(video_id, count_packets=True)
+            cached = await ctx.index.probe(video_id, count_packets=False)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(422, f"ffprobe falhou: {exc}") from exc
 
