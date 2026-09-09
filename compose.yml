@@ -20,6 +20,7 @@ x-app-base: &app-base
     MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_password
     MST_WORKER_TOKEN_FILE: /run/secrets/worker_token
     MST_WORKSPACE: /workspace
+    MST_FFMPEG_THREADS: "${MST_FFMPEG_THREADS:-4}"
     GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcs_credentials
     MST_CACHE_LIMIT_GB: "${MST_CACHE_LIMIT_GB:-40}"
   secrets:
@@ -69,6 +70,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    deploy:
+      replicas: ${CPU_WORKER_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: "${CPU_WORKER_CPUS:-4.0}"
+          memory: "${CPU_WORKER_MEMORY:-8G}"
 
   sam3-worker:
     image: boom/sam3-worker:0.2.0
@@ -111,6 +118,7 @@ services:
       app:
         condition: service_healthy
     deploy:
+      replicas: 1
       resources:
         reservations:
           devices:

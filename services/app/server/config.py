@@ -61,6 +61,11 @@ EXPORT_QSCALE = 2
 # limite rígido de trabalho.
 CACHE_LIMIT_GB = float(os.environ.get("MST_CACHE_LIMIT_GB", 40.0))
 
+# Cada processo CPU tem orçamento próprio. Sem um limite explícito, duas
+# réplicas do worker permitem que cada processo do FFmpeg ocupe todos os cores,
+# aumentando a latência de todas as ações concorrentes em vez de reduzi-la.
+FFMPEG_THREADS = max(1, int(os.environ.get("MST_FFMPEG_THREADS", "4")))
+
 # Codecs que Chrome/Edge conseguem decodificar em <video>. HEVC fica de fora.
 BROWSER_CODECS = frozenset({"h264", "vp8", "vp9", "av1"})
 

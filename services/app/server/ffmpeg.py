@@ -26,6 +26,7 @@ from pathlib import Path
 from .config import (
     BROWSER_CODECS,
     EXPORT_QSCALE,
+    FFMPEG_THREADS,
     PROXY_QSCALE,
     PROXY_WIDTH,
     STAGE_QSCALE,
@@ -285,6 +286,14 @@ _BASE = ("-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"
 _NO_EXTRA_STREAMS = ("-an", "-sn", "-dn")
 
 
+def _decoder_threads() -> list[str]:
+    return ["-threads", str(FFMPEG_THREADS)]
+
+
+def _encoder_threads() -> list[str]:
+    return ["-threads", str(FFMPEG_THREADS)]
+
+
 def _dual_output_args(small_dir: Path, full_dir: Path, count: int | None) -> tuple[str, list[str]]:
     """Filtergraph e saídas para produzir as duas resoluções num passe só.
 
@@ -303,9 +312,11 @@ def _dual_output_args(small_dir: Path, full_dir: Path, count: int | None) -> tup
     outputs = [
         "-map", "[small]", *limit,
         "-fps_mode", "passthrough", "-q:v", str(PROXY_QSCALE), "-start_number", "0",
+        *_encoder_threads(),
         str(small_dir / "%06d.jpg"),
         "-map", full_label, *limit,
         "-fps_mode", "passthrough", "-q:v", str(STAGE_QSCALE), "-start_number", "0",
+        *_encoder_threads(),
         str(full_dir / "%06d.jpg"),
     ]
     return ";".join(graph), outputs
@@ -317,6 +328,7 @@ def proxy_full_argv(src: Path, small_dir: Path, full_dir: Path) -> list[str]:
     graph, outputs = _dual_output_args(small_dir, full_dir, None)
     return [
         resolve().ffmpeg, *_BASE, "-y",
+        *_decoder_threads(),
         "-i", str(src),
         *_NO_EXTRA_STREAMS,
         "-filter_complex", graph,
@@ -339,6 +351,7 @@ def proxy_window_argv(
     )
     return [
         resolve().ffmpeg, *_BASE, "-y",
+        *_decoder_threads(),
         "-i", str(src),
         *_NO_EXTRA_STREAMS,
         "-filter_complex", graph,
@@ -357,6 +370,7 @@ def export_segment_argv(src: Path, out_dir: Path, start: int, end: int) -> list[
     count = end - start + 1
     return [
         resolve().ffmpeg, *_BASE, "-y",
+        *_decoder_threads(),
         "-i", str(src),
         *_NO_EXTRA_STREAMS,
         # end_frame é EXCLUSIVO.
@@ -365,6 +379,7 @@ def export_segment_argv(src: Path, out_dir: Path, start: int, end: int) -> list[
         "-frames:v", str(count),
         "-q:v", str(EXPORT_QSCALE),
         "-start_number", "0",
+        *_encoder_threads(),
         str(out_dir / "%06d.jpg"),
     ]
 
@@ -378,9 +393,11 @@ def thumb_argv(src: Path, out_path: Path, seek_sec: float) -> list[str]:
     return [
         resolve().ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{max(seek_sec, 0):.3f}",
+        *_decoder_threads(),
         "-i", str(src),
         "-frames:v", "1",
         "-vf", f"scale={THUMB_WIDTH}:-2:flags=bilinear",
         "-q:v", str(THUMB_QSCALE),
+        *_encoder_threads(),
         str(out_path),
     ]

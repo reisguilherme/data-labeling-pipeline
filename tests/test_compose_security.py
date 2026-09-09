@@ -88,5 +88,26 @@ class ComposeSecurityTests(unittest.TestCase):
             environment["MST_WORKER_TOKEN_FILE"], "/run/secrets/worker_token"
         )
 
+    def test_cpu_workers_are_bounded_and_gpu_worker_stays_single(self) -> None:
+        worker = self.services["worker"]
+        self.assertEqual(worker["deploy"]["replicas"], "${CPU_WORKER_REPLICAS:-2}")
+        self.assertEqual(
+            worker["deploy"]["resources"]["limits"]["cpus"],
+            "${CPU_WORKER_CPUS:-4.0}",
+        )
+        self.assertEqual(
+            worker["deploy"]["resources"]["limits"]["memory"],
+            "${CPU_WORKER_MEMORY:-8G}",
+        )
+        self.assertEqual(self.services["sam3-worker"]["deploy"]["replicas"], 1)
+
+    def test_ffmpeg_threads_are_bounded_for_app_and_cpu_workers(self) -> None:
+        for name in ("app", "worker"):
+            self.assertEqual(
+                self.services[name]["environment"]["MST_FFMPEG_THREADS"],
+                "${MST_FFMPEG_THREADS:-4}",
+                name,
+            )
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,12 +57,23 @@ UID=1000
 GID=1000
 APP_BIND=0.0.0.0
 APP_PORT=3000
+CPU_WORKER_REPLICAS=2
+CPU_WORKER_CPUS=4.0
+CPU_WORKER_MEMORY=8G
+MST_FFMPEG_THREADS=4
 ```
 
 Mantenha os demais valores que ja funcionam, inclusive o registro do modelo e
 os arquivos em `secrets/`. O cache Hugging Face pode ser baixado novamente; o
 checkpoint finetunado precisa estar em `models/releases/...` e continuar
 coerente com `config/models.local.yaml`.
+
+O `docker compose up -d` sobe duas replicas do worker CPU por padrao, cada uma
+limitada a quatro CPUs, 8 GiB de RAM e quatro threads por processo FFmpeg. O
+`sam3-worker` continua com exatamente uma replica para nao disputar VRAM. Para
+alterar a concorrencia de forma permanente, edite `CPU_WORKER_REPLICAS` no
+`.env`; nao combine `docker compose up --scale worker=N` com
+`deploy.replicas`, pois seriam duas fontes de configuracao concorrentes.
 
 ## 3. Restaurar o estado e subir
 
