@@ -79,6 +79,9 @@ export function AnnotatorView({
   const handleSaveExportNext = useCallback(async () => {
     const state = useAnnotator.getState();
     if (state.blockers().length) return;
+    // A lista atual é a referência estável para navegar. A mutação precisa ser
+    // confirmada primeiro, mas um refresh lento não deve manter o operador preso.
+    const next = useLibrary.getState().nextPending(video.video_id);
     if (!(await handleSave())) return;
     const queued = await state.queueExport();
     if (!queued) return;
@@ -93,19 +96,18 @@ export function AnnotatorView({
           .catch((exception) => console.error("falha ao finalizar export da triagem", exception));
       }
     });
-    await refresh();
-    const next = useLibrary.getState().nextPending(video.video_id);
     if (next) onNavigate(next);
     else onBack();
+    void refresh();
   }, [handleSave, refresh, video.video_id, onNavigate, onBack]);
 
   const handleNoBoom = useCallback(async () => {
     if (!confirm("Marcar este vídeo como SEM OBJETO? Os frames exportados serão apagados.")) return;
-    if (!(await useAnnotator.getState().markNoBoom())) return;
-    await refresh();
     const next = useLibrary.getState().nextPending(video.video_id);
+    if (!(await useAnnotator.getState().markNoBoom())) return;
     if (next) onNavigate(next);
     else onBack();
+    void refresh();
   }, [refresh, video.video_id, onNavigate, onBack]);
 
   const go = useCallback(

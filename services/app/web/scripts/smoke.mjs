@@ -307,6 +307,13 @@ const PROXY_STATUS = {
   available_ranges: [[0, 95]],
   jobs: [],
 };
+const WINDOW_PROXY_STATUS = {
+  mode: "window",
+  complete: false,
+  frame_count: 96,
+  available_ranges: [],
+  jobs: [],
+};
 
 /**
  * Cada cenário = um estado de /api/config + o que se espera ver na tela.
@@ -458,6 +465,62 @@ const SCENARIOS = {
       [/\/api\/objects\/boom\/videos\/aaa\/export$/, "exportação foi enfileirada"],
     ],
   },
+  "triage-window-bootstrap": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: (() => {
+      let calls = 0;
+      return () => (++calls === 1
+        ? WINDOW_PROXY_STATUS
+        : { ...WINDOW_PROXY_STATUS, available_ranges: [[0, 95]] });
+    })(),
+    proxyStart: { mode: "window", job_id: null, total_frames: 96, already_complete: false },
+    windowStart: { job_id: "window-job-1", start: 0, end: 95, already_available: false },
+    terminalJobs: { "window-job-1": "done" },
+    action: "triage-window-bootstrap",
+  },
+  "triage-full-frame-fallback": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: "repair-job-1", total_frames: 96, already_complete: false },
+    terminalJobs: { "repair-job-1": "done" },
+    action: "triage-full-frame-fallback",
+  },
+  "triage-stale-open": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    initialWait: 80,
+    delayMetaVideo: "aaa",
+    annotation: (url) => url.includes("/eee")
+      ? { ...TRIAGE_ANNOTATION, video_id: "eee", relpath: "proximo.mp4", name: "proximo", intervals: [] }
+      : TRIAGE_ANNOTATION,
+    action: "triage-stale-open",
+    expectPath: "/objects/boom/videos/eee/triage",
+    reject: [["10 → 19", "resposta atrasada do vídeo anterior não sobrescreve o novo"]],
+  },
+  "triage-submit-next-slow-refresh": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayAnnotationMutation: true,
+    action: "submit-triage-slow-refresh",
+    expectPath: "/objects/boom/videos/eee/triage",
+  },
+  "triage-submit-failure": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    failAnnotationSave: true,
+    action: "submit-triage-failure",
+    expectPath: "/objects/boom/videos/aaa/triage",
+  },
   "triage-submit-last": {
     url: "/objects/boom/videos/aaa/triage",
     config: CONFIG,
@@ -480,6 +543,14 @@ const SCENARIOS = {
     expectedRequests: [
       [/\/api\/objects\/boom\/annotations\/aaa\/no-object$/, "status sem objeto foi persistido"],
     ],
+  },
+  "triage-no-object-next-slow-refresh": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayAnnotationMutation: true,
+    action: "mark-no-object-slow-refresh",
+    expectPath: "/objects/boom/videos/eee/triage",
   },
   login: {
     config: { ...CONFIG, user: null },
@@ -590,10 +661,11 @@ const routes = [
   [/\/api\/objects\/[^/]+\/lock\/release$/, { released: true }],
   [/\/api\/objects\/[^/]+\/lock$/, { lock: { user: "Guilherme", since: "2026-01-01T00:00:00-03:00" }, heartbeat_seconds: 30, ttl_seconds: 90 }],
   [/\/api\/objects\/[^/]+\/annotations\/[^/]+\/no-object$/, { ...TRIAGE_ANNOTATION, status: "no_boom", intervals: [] }],
-  [/\/api\/objects\/[^/]+\/annotations\/[^/]+$/, TRIAGE_ANNOTATION],
-  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/meta$/, VIDEO_META],
-  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/proxy\/status$/, PROXY_STATUS],
-  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/proxy$/, { mode: "full", job_id: null, total_frames: 96, already_complete: true }],
+  [/\/api\/objects\/[^/]+\/annotations\/[^/]+$/, scenario.annotation ?? TRIAGE_ANNOTATION],
+  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/meta$/, scenario.videoMeta ?? VIDEO_META],
+  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/proxy\/status$/, scenario.proxyStatus ?? PROXY_STATUS],
+  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/window$/, scenario.windowStart ?? { job_id: null, start: 0, end: 95, already_available: true }],
+  [/\/api\/objects\/[^/]+\/videos\/[^/]+\/proxy$/, scenario.proxyStart ?? { mode: "full", job_id: null, total_frames: 96, already_complete: true }],
   [/\/api\/objects\/[^/]+\/videos\/[^/]+\/export$/, { job_id: "export-job-1", total: 10 }],
   [/\/api\/datasets\/preview$/, scenario.globalPreview ?? { export_allowed: false, blocking_reasons: [] }],
   [/\/api\/datasets$/, { datasets: [] }],
@@ -619,12 +691,51 @@ const dom = new JSDOM(
 
 const { window } = dom;
 const requests = [];
+const requestLog = [];
+let frameStageMounts = 0;
 let maskFrameRequests = 0;
+let videosRequests = 0;
+let mutationAcked = false;
+let navigatedBeforeMutationAck = false;
 window.confirm = () => true;
 
-window.fetch = async (input) => {
+window.fetch = async (input, init = {}) => {
   const url = String(input);
   requests.push(url);
+  requestLog.push({ url, method: init.method ?? "GET" });
+  if (scenario.delayMetaVideo && url.includes(`/videos/${scenario.delayMetaVideo}/meta`)) {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+  }
+  if (
+    scenario.delayAnnotationMutation &&
+    ["PUT", "POST"].includes(init.method) &&
+    /\/api\/objects\/[^/]+\/annotations\/[^/]+(?:\/no-object)?$/.test(url)
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    mutationAcked = true;
+  }
+  if (/\/api\/objects\/[^/]+\/videos(\?|$)/.test(url)) {
+    videosRequests += 1;
+    if (videosRequests > 1 && scenario.action?.includes("slow-refresh")) {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    }
+  }
+  if (
+    scenario.failAnnotationSave &&
+    init.method === "PUT" &&
+    /\/api\/objects\/[^/]+\/annotations\/[^/]+$/.test(url)
+  ) {
+    return {
+      ok: false,
+      status: 500,
+      statusText: "save failed",
+      json: async () => ({ detail: "falha controlada ao salvar" }),
+    };
+  }
+  if (init.method === "POST" && /\/proxy$/.test(url) && JSON.parse(init.body ?? "{}").force) {
+    const result = scenario.repairStart ?? scenario.proxyStart;
+    return { ok: true, status: 200, statusText: "OK", json: async () => result };
+  }
   if (scenario.action === "review-walk-save" && /\/mask-review\/\d+$/.test(url)) {
     maskFrameRequests += 1;
     if (maskFrameRequests === 2) await new Promise((resolve) => setTimeout(resolve, 120));
@@ -639,6 +750,26 @@ window.fetch = async (input) => {
 };
 
 window.EventSource = class {
+  constructor(url) {
+    this.url = String(url);
+    const jobId = this.url.match(/\/api\/jobs\/([^/]+)\/events/)?.[1];
+    const state = scenario.terminalJobs?.[jobId];
+    if (state) {
+      setTimeout(() => this.onmessage?.({ data: JSON.stringify({
+        job_id: jobId,
+        kind: jobId.startsWith("repair") ? "proxy_full" : "proxy_window",
+        state,
+        current: 96,
+        total: 96,
+        progress: 1,
+        message: "pronto",
+        error: null,
+        result: {},
+        queue_pos: 0,
+        user: null,
+      }) }), 25);
+    }
+  }
   close() {}
 };
 window.ResizeObserver = class {
@@ -652,6 +783,16 @@ Object.defineProperties(window.HTMLImageElement.prototype, {
   clientWidth: { configurable: true, get: () => 640 },
   clientHeight: { configurable: true, get: () => 360 },
 });
+const stageObserver = new window.MutationObserver((records) => {
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (!(node instanceof window.Element)) continue;
+      if (node.matches?.('img[alt^="frame "]')) frameStageMounts += 1;
+      frameStageMounts += node.querySelectorAll?.('img[alt^="frame "]').length ?? 0;
+    }
+  }
+});
+stageObserver.observe(window.document.getElementById("root"), { childList: true, subtree: true });
 
 // O loop de render do React estoura como exceção não-capturada e mataria o
 // processo antes das checagens; converte num relatório legível.
@@ -710,7 +851,7 @@ try {
   console.error(`[ FALHA] o bundle nem carregou — ${error.message}`);
   process.exit(1);
 }
-await new Promise((resolve) => setTimeout(resolve, 600));
+await new Promise((resolve) => setTimeout(resolve, scenario.initialWait ?? 600));
 
 if (scenario.action === "open-sam3") {
   const action = [...window.document.querySelectorAll('[role="button"]')].find(
@@ -759,7 +900,20 @@ if (scenario.action === "submit-triage") {
     (element) => element.textContent?.includes("salvar + exportar + próximo") || element.textContent?.includes("Salvar, enviar ao SAM3 e próximo"),
   );
   action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  navigatedBeforeMutationAck = !mutationAcked && !window.location.pathname.includes("/aaa/");
+  await new Promise((resolve) => setTimeout(resolve, 210));
+}
+if (scenario.action === "submit-triage-slow-refresh" || scenario.action === "submit-triage-failure") {
+  requests.length = 0;
+  requestLog.length = 0;
+  const action = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.includes("Salvar, enviar ao SAM3"),
+  );
+  action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  navigatedBeforeMutationAck = !mutationAcked && !window.location.pathname.includes("/aaa/");
+  await new Promise((resolve) => setTimeout(resolve, 210));
 }
 if (scenario.action === "mark-no-object") {
   requests.length = 0;
@@ -768,6 +922,38 @@ if (scenario.action === "mark-no-object") {
   );
   action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   await new Promise((resolve) => setTimeout(resolve, 250));
+}
+if (scenario.action === "mark-no-object-slow-refresh") {
+  requests.length = 0;
+  requestLog.length = 0;
+  const action = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.includes("Sem objeto"),
+  );
+  action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  navigatedBeforeMutationAck = !mutationAcked && !window.location.pathname.includes("/aaa/");
+  await new Promise((resolve) => setTimeout(resolve, 210));
+}
+if (scenario.action === "triage-full-frame-fallback") {
+  requests.length = 0;
+  requestLog.length = 0;
+  const stage = window.document.querySelector('img[alt^="frame "]');
+  stage?.dispatchEvent(new window.Event("error"));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const fallback = window.document.querySelector('img[alt^="frame "]');
+  if (!fallback?.getAttribute("src")?.includes("tier=small")) {
+    errors.push("frame full ausente nao fez fallback para small");
+  }
+  fallback?.dispatchEvent(new window.Event("error"));
+  fallback?.dispatchEvent(new window.Event("error"));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+if (scenario.action === "triage-stale-open") {
+  requests.length = 0;
+  requestLog.length = 0;
+  const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
+  next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 900));
 }
 if (scenario.action === "review-walk-save") {
   requests.length = 0;
@@ -828,6 +1014,45 @@ if (scenario.assertReviewControlsOutsideFrame) {
     "nenhum controle fica sobreposto ao frame",
     overlaidControl?.outerHTML ?? "",
   );
+}
+
+if (scenario.action === "triage-window-bootstrap") {
+  const windowPosts = requestLog.filter(
+    (request) => request.method === "POST" && /\/videos\/aaa\/window$/.test(request.url),
+  );
+  check(windowPosts.length === 1, "bootstrap de janela foi coalescido", `${windowPosts.length} POSTs`);
+  check(frameStageMounts >= 2, "frame foi recarregado depois do job", `${frameStageMounts} montagens`);
+}
+if (scenario.action === "triage-full-frame-fallback") {
+  const repairs = requestLog.filter(
+    (request) => request.method === "POST" && /\/videos\/aaa\/proxy$/.test(request.url),
+  );
+  check(!errors.some((item) => item.includes("fallback para small")), "frame full cai para o tier small");
+  check(repairs.length === 1, "falha dos dois tiers inicia um unico reparo", `${repairs.length} POSTs`);
+}
+if (scenario.action === "submit-triage-slow-refresh") {
+  const saveAt = requestLog.findIndex(
+    (request) => request.method === "PUT" && /\/annotations\/aaa$/.test(request.url),
+  );
+  const exportAt = requestLog.findIndex(
+    (request) => request.method === "POST" && /\/videos\/aaa\/export$/.test(request.url),
+  );
+  check(saveAt >= 0 && exportAt > saveAt, "salvamento precede o enqueue da exportacao");
+  check(!navigatedBeforeMutationAck, "navegação espera o ACK da mutação");
+  check(window.location.pathname.includes("/eee/"), "navegacao nao espera refresh lento", window.location.pathname);
+}
+if (scenario.action === "mark-no-object-slow-refresh") {
+  const mutationAt = requestLog.findIndex(
+    (request) => request.method === "POST" && /\/annotations\/aaa\/no-object$/.test(request.url),
+  );
+  check(mutationAt >= 0, "sem objeto foi persistido antes da navegacao");
+  check(!navigatedBeforeMutationAck, "sem objeto espera o ACK da mutação");
+  check(window.location.pathname.includes("/eee/"), "sem objeto nao espera refresh lento", window.location.pathname);
+}
+if (scenario.action === "submit-triage-failure") {
+  check(window.location.pathname.includes("/aaa/"), "falha de mutacao preserva o video atual", window.location.pathname);
+  check(!requestLog.some((request) => /\/videos\/aaa\/export$/.test(request.url)), "falha de mutacao nao enfileira exportacao");
+  check(text.includes("falha controlada ao salvar"), "erro de salvamento continua visivel");
 }
 
 for (const [needle, label] of scenario.expect ?? []) {

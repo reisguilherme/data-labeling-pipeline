@@ -216,6 +216,9 @@ function toPayload(intervals: DraftInterval[], label: string): IntervalPayload[]
 const HEARTBEAT_MS = 30_000;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let beaconBound: string | null = null;
+let openGeneration = 0;
+let stopProxyWatcher: (() => void) | null = null;
+const frameAvailabilityFlights = new Map<string, Promise<void>>();
 
 function stopHeartbeat(): void {
   if (heartbeatTimer !== null) {
@@ -280,6 +283,10 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   adjust: { ...NEUTRAL_ADJUST },
 
   open: async (videoId) => {
+    const generation = ++openGeneration;
+    const isActive = () => openGeneration === generation && get().videoId === videoId;
+    stopProxyWatcher?.();
+    stopProxyWatcher = null;
     stopHeartbeat();
     set({
       videoId,
@@ -309,15 +316,21 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
     try {
       // Cancela extrações do vídeo anterior antes de disputar o semáforo pesado.
       await api.setActiveVideo(videoId);
+      if (!isActive()) return;
 
       // A trava é pedida ANTES de carregar: se outra pessoa está com o vídeo, a
       // tela abre em leitura desde o primeiro render, em vez de deixar alguém
       // marcar dez intervalos para só então descobrir que não pode salvar.
       try {
         await api.acquireLock(videoId);
+        if (!isActive()) {
+          void api.releaseLock(videoId).catch(() => undefined);
+          return;
+        }
         startHeartbeat(videoId);
       } catch (error) {
         const lock = error instanceof ApiError ? error.lock : null;
+        if (!isActive()) return;
         if (lock) set({ lock, readOnly: true });
         else throw error;
       }
@@ -328,6 +341,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       ]);
 
       const intervals = (entry.intervals ?? []).map(fromServer);
+      if (!isActive()) return;
       set({
         meta,
         label: meta.label,
@@ -336,16 +350,24 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         status: entry.status === "pending" ? "in_progress" : entry.status,
         videoNotes: entry.notes ?? "",
         suggestedFlags: entry.suggested_flags ?? {},
-        loading: false,
       });
 
       const started = await api.startProxy(videoId);
+      if (!isActive()) return;
       const status = await api.proxyStatus(videoId);
-      set({ proxy: status });
+      if (!isActive()) return;
+      set({ proxy: status, loading: false });
+
+      if (
+        status.mode === "window" &&
+        !status.available_ranges.some(([start, end]) => start <= 0 && 0 <= end)
+      ) {
+        void get().ensureFrameAvailable(0);
+      }
 
       if (started.job_id) {
-        watchJob(started.job_id, (job) => {
-          if (get().videoId !== videoId) return;
+        stopProxyWatcher = watchJob(started.job_id, (job) => {
+          if (!isActive()) return;
           set({ job: job.state === "running" || job.state === "queued" ? job : null });
 
           // O modo completo escreve os JPEGs em ordem, então o progresso do job
@@ -358,15 +380,22 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
             }
           }
 
-          if (job.state === "done") void api.proxyStatus(videoId).then((s) => set({ proxy: s }));
+          if (job.state === "done") {
+            void api.proxyStatus(videoId).then((nextStatus) => {
+              if (isActive()) set({ proxy: nextStatus });
+            });
+          }
         });
       }
     } catch (error) {
-      set({ error: (error as Error).message, loading: false });
+      if (isActive()) set({ error: (error as Error).message, loading: false });
     }
   },
 
   close: () => {
+    openGeneration += 1;
+    stopProxyWatcher?.();
+    stopProxyWatcher = null;
     const { videoId, readOnly } = get();
     stopHeartbeat();
     void api.setActiveVideo(null);
@@ -634,29 +663,62 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
 
   ensureFrameAvailable: async (frame) => {
     const { videoId, proxy } = get();
-    if (!videoId || !proxy || proxy.complete) return;
+    if (!videoId || !proxy) return;
 
-    // Em modo completo o frame ainda não saiu porque a extração está rodando —
-    // pedir uma janela aqui dispararia um segundo ffmpeg sobre o mesmo vídeo.
-    if (proxy.mode !== "window") return;
+    const key = `${videoId}:${frame}`;
+    const existing = frameAvailabilityFlights.get(key);
+    if (existing) return existing;
 
-    const covered = proxy.available_ranges.some(([start, end]) => start <= frame && frame <= end);
-    if (covered) return;
+    const flight = (async () => {
+      const isActive = () => get().videoId === videoId;
+      let jobId: string | null = null;
 
-    const { job_id } = await api.startWindow(videoId, frame);
-    if (!job_id) {
-      set({ proxy: await api.proxyStatus(videoId) });
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      watchJob(job_id, (job) => {
-        if (get().videoId !== videoId) return resolve();
-        set({ job: job.state === "running" || job.state === "queued" ? job : null });
-        if (job.state !== "running" && job.state !== "queued") resolve();
+      if (proxy.complete) {
+        // Falhar nos dois tiers contradiz o marcador de completude: reconstrua
+        // uma vez, sem permitir uma tempestade de requests do <img>.
+        jobId = (await api.startProxy(videoId, true)).job_id;
+      } else if (proxy.mode === "window") {
+        const covered = proxy.available_ranges.some(
+          ([start, end]) => start <= frame && frame <= end,
+        );
+        if (covered) return;
+        jobId = (await api.startWindow(videoId, frame)).job_id;
+      } else {
+        // O proxy completo já possui watcher próprio. Não crie um FFmpeg rival.
+        return;
+      }
+
+      if (jobId) {
+        await new Promise<void>((resolve) => {
+          let stop: () => void = () => undefined;
+          stop = watchJob(jobId!, (job) => {
+            if (!isActive() || !["running", "queued"].includes(job.state)) {
+              stop();
+              resolve();
+              return;
+            }
+            set({ job });
+          });
+        });
+      }
+
+      if (!isActive()) return;
+      const nextStatus = await api.proxyStatus(videoId);
+      if (isActive()) set({ proxy: nextStatus, job: null });
+    })()
+      .catch((error) => {
+        if (get().videoId === videoId) {
+          set({ error: (error as Error).message, job: null });
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (frameAvailabilityFlights.get(key) === flight) {
+          frameAvailabilityFlights.delete(key);
+        }
       });
-    });
-    if (get().videoId === videoId) {
-      set({ proxy: await api.proxyStatus(videoId) });
-    }
+
+    frameAvailabilityFlights.set(key, flight);
+    return flight;
   },
 }));

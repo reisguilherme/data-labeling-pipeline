@@ -15,6 +15,8 @@ interface Rect {
   height: number;
 }
 
+type FrameTier = "small" | "full";
+
 /**
  * Exibição frame-exata.
  *
@@ -40,10 +42,13 @@ export function FramePreview({ videoId }: { videoId: string }) {
 
   const [missing, setMissing] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [rect, setRect] = useState<Rect | null>(null);
   const [panning, setPanning] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
+  const recoveryAttemptRef = useRef<string | null>(null);
+  const previousAvailabilityRef = useRef<string | null>(null);
 
   const interval = selected >= 0 ? intervals[selected] : null;
   // O bbox pertence ao frame do prompt: só é desenhado e só APARECE ali.
@@ -54,8 +59,10 @@ export function FramePreview({ videoId }: { videoId: string }) {
   // Parado, mostra a resolução original — é onde se decide se aquilo é mesmo o
   // boom. Tocando, usa a versão pequena: 24 fps de JPEG 4K (~300 KB cada) não
   // sustenta reprodução fluida, e durante a passagem o detalhe não é o que importa.
-  const tier = playing ? "small" : "full";
-  const src = api.frameUrl(videoId, frame, tier);
+  const preferredTier: FrameTier = playing ? "small" : "full";
+  const availabilityKey = `${proxy?.mode ?? "none"}:${proxy?.complete ?? false}:${JSON.stringify(proxy?.available_ranges ?? [])}`;
+  const [requestedTier, setRequestedTier] = useState<FrameTier>(preferredTier);
+  const src = api.frameUrl(videoId, frame, requestedTier);
 
   /**
    * Retângulo realmente ocupado pela imagem dentro do <img>.
@@ -85,9 +92,22 @@ export function FramePreview({ videoId }: { videoId: string }) {
   }, [meta]);
 
   useEffect(() => {
+    recoveryAttemptRef.current = null;
+    setRequestedTier(preferredTier);
     setMissing(false);
+    setRecoveryError(null);
     setLoading(true);
-  }, [src]);
+  }, [videoId, frame, preferredTier, availabilityKey]);
+
+  useEffect(() => {
+    if (
+      previousAvailabilityRef.current !== null &&
+      previousAvailabilityRef.current !== availabilityKey
+    ) {
+      setReloadKey((value) => value + 1);
+    }
+    previousAvailabilityRef.current = availabilityKey;
+  }, [availabilityKey]);
 
   // O frame pode não existir ainda porque a extração está em andamento. Quando o
   // progresso alcança este índice, recarrega — um <img> com o mesmo src não
@@ -117,17 +137,41 @@ export function FramePreview({ videoId }: { videoId: string }) {
     if (!proxy?.complete) return;
     // Raio menor no tier grande: cada frame 4K é ~20x mais pesado, e prefetchar
     // 60 deles a cada passo entupiria a rede em vez de acelerar a navegação.
-    const radius = tier === "full" ? FULL_PREFETCH_RADIUS : PREFETCH_RADIUS;
+    const radius = requestedTier === "full" ? FULL_PREFETCH_RADIUS : PREFETCH_RADIUS;
     const images: HTMLImageElement[] = [];
     for (let offset = -radius; offset <= radius; offset += 1) {
       const target = frame + offset;
       if (target < 0 || offset === 0) continue;
       const image = new Image();
-      image.src = api.frameUrl(videoId, target, tier);
+      image.src = api.frameUrl(videoId, target, requestedTier);
       images.push(image);
     }
     return () => images.forEach((image) => (image.src = ""));
-  }, [videoId, frame, tier, proxy?.complete]);
+  }, [videoId, frame, requestedTier, proxy?.complete]);
+
+  const recoverFrame = useCallback(() => {
+    const recoveryKey = `${videoId}:${frame}:${availabilityKey}`;
+    if (recoveryAttemptRef.current === recoveryKey) return;
+    recoveryAttemptRef.current = recoveryKey;
+    setMissing(true);
+    setLoading(true);
+    setRecoveryError(null);
+    void useAnnotator
+      .getState()
+      .ensureFrameAvailable(frame)
+      .then(() => {
+        if (recoveryAttemptRef.current !== recoveryKey) return;
+        setRequestedTier(preferredTier);
+        setMissing(false);
+        setLoading(true);
+        setReloadKey((value) => value + 1);
+      })
+      .catch((error) => {
+        if (recoveryAttemptRef.current !== recoveryKey) return;
+        setLoading(false);
+        setRecoveryError((error as Error).message || "não foi possível extrair este frame");
+      });
+  }, [videoId, frame, availabilityKey, preferredTier]);
 
   // -- zoom e pan ---------------------------------------------------------
 
@@ -230,8 +274,14 @@ export function FramePreview({ videoId }: { videoId: string }) {
           }}
           onError={() => {
             setLoading(false);
-            setMissing(true);
-            void useAnnotator.getState().ensureFrameAvailable(frame);
+            if (requestedTier === "full") {
+              setRequestedTier("small");
+              setMissing(false);
+              setRecoveryError(null);
+              setLoading(true);
+              return;
+            }
+            recoverFrame();
           }}
         />
 
@@ -296,9 +346,27 @@ export function FramePreview({ videoId }: { videoId: string }) {
 
       {missing && (
         <div className="absolute inset-0 grid place-items-center bg-zinc-950/80">
-          <p className="flex items-center gap-2 text-xs text-zinc-400">
-            <Spinner /> extraindo os frames deste vídeo…
-          </p>
+          <div className="flex flex-col items-center gap-2 text-xs text-zinc-400">
+            {recoveryError ? (
+              <>
+                <p>{recoveryError}</p>
+                <button
+                  type="button"
+                  className="rounded border border-zinc-700 px-3 py-1 text-zinc-200 hover:bg-zinc-800"
+                  onClick={() => {
+                    recoveryAttemptRef.current = null;
+                    recoverFrame();
+                  }}
+                >
+                  tentar novamente
+                </button>
+              </>
+            ) : (
+              <p className="flex items-center gap-2">
+                <Spinner /> extraindo os frames deste vídeo…
+              </p>
+            )}
+          </div>
         </div>
       )}
 
