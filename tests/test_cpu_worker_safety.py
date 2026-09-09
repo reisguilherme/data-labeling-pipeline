@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from server import proxy
-from services.app.worker import _remove_tree, run_proxy_full
+from services.app.worker import Cancelled, _remove_tree, run_proxy_full
 
 
 class CpuWorkerSafetyTests(unittest.TestCase):
@@ -99,9 +99,43 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             with patch("services.app.worker._context", return_value=ctx), patch(
                 "services.app.worker._run_ffmpeg", side_effect=produce
             ):
+                with self.assertRaisesRegex(Cancelled, "cancelamento"):
+                    run_proxy_full(job, queue, "lease-token")
+
+            self.assertFalse((proxy.proxy_dir(ctx, "video-1") / proxy.CURRENT_POINTER).exists())
+
+    def test_proxy_commit_revalidates_lease_after_pointer_is_prepared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            source = Path(temporary) / "video.mp4"
+            source.write_bytes(b"video")
+            ctx = SimpleNamespace(
+                cache_dir=cache,
+                index=SimpleNamespace(
+                    resolve_path=lambda _video_id: source,
+                    update_frame_count=MagicMock(),
+                ),
+            )
+            queue = MagicMock()
+            queue.update_progress.side_effect = [True, False]
+
+            def produce(argv, *_args, **_kwargs):
+                outputs = [Path(value).parent for value in argv if "%06d.jpg" in str(value)]
+                for output in outputs:
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / "000000.jpg").write_bytes(b"jpeg")
+
+            job = {
+                "id": "job-2",
+                "payload": {"object_id": "boom", "video_id": "video-1", "frame_count": 1},
+            }
+            with patch("services.app.worker._context", return_value=ctx), patch(
+                "services.app.worker._run_ffmpeg", side_effect=produce
+            ):
                 with self.assertRaisesRegex(Exception, "cancelamento"):
                     run_proxy_full(job, queue, "lease-token")
 
+            self.assertEqual(queue.update_progress.call_count, 2)
             self.assertFalse((proxy.proxy_dir(ctx, "video-1") / proxy.CURRENT_POINTER).exists())
 
 

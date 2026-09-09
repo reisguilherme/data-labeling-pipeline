@@ -16,10 +16,11 @@ import shutil
 import stat
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from . import ffmpeg
 from .config import (
@@ -37,9 +38,13 @@ log = logging.getLogger("movies-screening-tool.proxy")
 COMPLETE_MARKER = ".complete"
 CURRENT_POINTER = "CURRENT"
 GENERATIONS_DIR = "generations"
+WINDOWS_INDEX = "INDEX.json"
 MARKER_SCHEMA_VERSION = 2
+WINDOWS_INDEX_SCHEMA_VERSION = 1
 _MAX_POINTER_BYTES = 128
 _MAX_MARKER_BYTES = 16 * 1024
+_MAX_WINDOWS_INDEX_BYTES = 4 * 1024 * 1024
+_DEFAULT_GC_DELETE_LIMIT = 8
 _GENERATION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 
 # "small" alimenta filmstrip e reprodução; "full" é a imagem grande do palco.
@@ -100,6 +105,71 @@ def _regular_nonempty(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISREG(info.st_mode) and not path.is_symlink() and info.st_size > 0
+
+
+def _regular_directory(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not path.is_symlink()
+
+
+def _resolved_child(path: Path, *roots: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        for root in roots:
+            parent = root.resolve(strict=True)
+            if resolved == parent or not resolved.is_relative_to(parent):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _safe_frame(path: Path, generation_root: Path, cache_root: Path | None = None) -> bool:
+    roots = (generation_root,) if cache_root is None else (generation_root, cache_root)
+    return _resolved_child(path, *roots) and _regular_nonempty(path)
+
+
+def _require_cache_child(path: Path, cache_root: Path) -> tuple[Path, Path]:
+    resolved = path.resolve()
+    cache_resolved = cache_root.resolve()
+    if resolved == cache_resolved or not resolved.is_relative_to(cache_resolved):
+        raise ValueError("raiz do proxy fora do cache")
+    return resolved, cache_resolved
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterator[None]:
+    """Trava de processo para commits curtos; o SO a libera após crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("arquivo de lock nao pode ser symlink")
+    with path.open("a+b") as raw:
+        handle = raw
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def validate_generation(path: Path, *, expected_frames: int | None = None) -> ProxyGeneration:
@@ -163,13 +233,16 @@ def publish_generation(
     expected_frames: int | None = None,
     publish_guard: Callable[[], bool] | None = None,
 ) -> ProxyGeneration:
-    """Promove a geração e troca atomicamente apenas o ponteiro CURRENT."""
+    """Promove a geração e troca atomicamente apenas o ponteiro CURRENT.
+
+    ``publish_guard`` roda depois do fsync do ponteiro temporário e imediatamente
+    antes do syscall que torna a geração visível. Essa é a menor janela prática
+    de fencing: a lease ainda pode mudar depois da guarda, mas nesse ponto
+    ``os.replace`` é a única operação linearizável restante.
+    """
     if root.is_symlink():
         raise ValueError("raiz do proxy não pode ser symlink")
-    root_resolved = root.resolve()
-    cache_resolved = cache_root.resolve()
-    if root_resolved == cache_resolved or not root_resolved.is_relative_to(cache_resolved):
-        raise ValueError("raiz do proxy fora do cache")
+    _require_cache_child(root, cache_root)
     generations = root / GENERATIONS_DIR
     if generations.is_symlink():
         raise ValueError("pasta de gerações não pode ser symlink")
@@ -182,8 +255,6 @@ def publish_generation(
         raise ValueError("intervalo da janela inválido")
     if kind == "window" and generation.frames != end - start + 1:
         raise ValueError("janela não contém todos os frames esperados")
-    if publish_guard is not None and not publish_guard():
-        raise RuntimeError("publicação cancelada")
 
     marker = {
         "schema_version": MARKER_SCHEMA_VERSION,
@@ -204,22 +275,35 @@ def publish_generation(
 
     final = generations / generation.token
     generations.mkdir(parents=True, exist_ok=True)
-    if final.exists():
-        raise FileExistsError(f"geração já existe: {generation.token}")
-    staging.replace(final)
-    _fsync_directory(generations)
-
-    if publish_guard is not None and not publish_guard():
-        raise RuntimeError("publicação cancelada")
-
     pointer = root / CURRENT_POINTER
     pointer_part = root / f".{generation.token}.CURRENT.part"
+    with _exclusive_file_lock(root / ".publish.lock"):
+        if final.exists():
+            raise FileExistsError(f"geração já existe: {generation.token}")
+        staging.replace(final)
+        _fsync_directory(generations)
+
+        # O índice vem antes do CURRENT. Se houver falha, o leitor apenas ignora
+        # a entrada sem uma geração atual válida. O inverso deixaria uma janela
+        # já publicada invisível até uma nova atualização do índice.
+        if kind == "window":
+            assert start is not None and end is not None
+            _publish_window_index(root, start, end, cache_root)
+
+        try:
+            _fsync_file(pointer_part, generation.token + "\n")
+            if publish_guard is not None and not publish_guard():
+                raise RuntimeError("publicação cancelada")
+            os.replace(pointer_part, pointer)
+            _fsync_directory(root)
+        finally:
+            pointer_part.unlink(missing_ok=True)
+
+    # Best-effort, depois do commit e fora da seção crítica que troca CURRENT.
     try:
-        _fsync_file(pointer_part, generation.token + "\n")
-        os.replace(pointer_part, pointer)
-        _fsync_directory(root)
-    finally:
-        pointer_part.unlink(missing_ok=True)
+        collect_stale_generations(root, cache_root)
+    except Exception:
+        log.warning("falha ao coletar gerações antigas de %s", root, exc_info=True)
 
     return ProxyGeneration(
         final, generation.token, generation.frames, generation.tier_counts, kind, start, end
@@ -236,32 +320,162 @@ def _bounded_text(path: Path, limit: int) -> str | None:
         return None
 
 
-def current_generation(root: Path, *, expected_kind: str | None = None) -> ProxyGeneration | None:
+def _parse_windows_index(base: Path) -> list[tuple[int, int, str]]:
+    raw = _bounded_text(base / WINDOWS_INDEX, _MAX_WINDOWS_INDEX_BYTES)
+    if raw is None:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        return []
+    if not isinstance(data, dict) or data.get("schema_version") != WINDOWS_INDEX_SCHEMA_VERSION:
+        return []
+    windows = data.get("windows")
+    if type(windows) is not list:
+        return []
+
+    parsed: dict[tuple[int, int], str] = {}
+    for item in windows:
+        if not isinstance(item, dict):
+            return []
+        start, end, name = item.get("start"), item.get("end"), item.get("root")
+        if type(start) is not int or type(end) is not int or end < start:
+            return []
+        if type(name) is not str or name != f"{start:08d}_{end:08d}":
+            return []
+        parsed[(start, end)] = name
+    return [(start, end, parsed[(start, end)]) for start, end in sorted(parsed)]
+
+
+def _publish_window_index(root: Path, start: int, end: int, cache_root: Path) -> None:
+    base = root.parent
+    _require_cache_child(base, cache_root)
+    expected_name = f"{start:08d}_{end:08d}"
+    if root.name != expected_name or root.parent.is_symlink():
+        raise ValueError("raiz de janela inválida")
+
+    index_path = base / WINDOWS_INDEX
+    lock_path = base / ".index.lock"
+    with _exclusive_file_lock(lock_path):
+        entries = {
+            (item_start, item_end): name
+            for item_start, item_end, name in _parse_windows_index(base)
+        }
+        entries[(start, end)] = expected_name
+        payload = {
+            "schema_version": WINDOWS_INDEX_SCHEMA_VERSION,
+            "windows": [
+                {"start": item_start, "end": item_end, "root": entries[(item_start, item_end)]}
+                for item_start, item_end in sorted(entries)
+            ],
+        }
+        part = base / f".{uuid.uuid4().hex}.{WINDOWS_INDEX}.part"
+        try:
+            _fsync_file(part, json.dumps(payload, sort_keys=True))
+            os.replace(part, index_path)
+            _fsync_directory(base)
+        finally:
+            part.unlink(missing_ok=True)
+
+
+def collect_stale_generations(
+    root: Path,
+    cache_root: Path,
+    *,
+    max_delete: int = _DEFAULT_GC_DELETE_LIMIT,
+) -> int:
+    """Remove gerações imutáveis antigas sem tocar CURRENT ou stagings ativos."""
+    _require_cache_child(root, cache_root)
+    if type(max_delete) is not int or max_delete < 0:
+        raise ValueError("limite de coleta inválido")
+    if max_delete == 0:
+        return 0
+    generations = root / GENERATIONS_DIR
+    if not _regular_directory(generations) or not _resolved_child(generations, root):
+        return 0
+
+    victims: list[Path] = []
+    trash: Path | None = None
+    with _exclusive_file_lock(root / ".publish.lock"):
+        current = _bounded_text(root / CURRENT_POINTER, _MAX_POINTER_BYTES)
+        protected = current if current is not None and _GENERATION_TOKEN.fullmatch(current) else None
+        candidates: list[tuple[int, str, Path]] = []
+        for entry in generations.iterdir():
+            if entry.name == protected or not _GENERATION_TOKEN.fullmatch(entry.name):
+                continue
+            try:
+                info = entry.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or entry.is_symlink():
+                continue
+            if not _resolved_child(entry, generations, root):
+                continue
+            candidates.append((info.st_mtime_ns, entry.name, entry))
+
+        selected = [entry for _, _, entry in sorted(candidates)[:max_delete]]
+        if selected:
+            trash = root / f".gc-{uuid.uuid4().hex}"
+            trash.mkdir()
+            for entry in selected:
+                destination = trash / entry.name
+                entry.replace(destination)
+                victims.append(destination)
+            _fsync_directory(generations)
+            _fsync_directory(root)
+
+    # A movimentação curta acima retira as vítimas do namespace publicado. A
+    # deleção potencialmente lenta acontece sem segurar a trava de publicação.
+    if trash is not None:
+        shutil.rmtree(trash)
+    return len(victims)
+
+
+def current_generation(
+    root: Path,
+    *,
+    expected_kind: str | None = None,
+    cache_root: Path | None = None,
+) -> ProxyGeneration | None:
     """Resolve a geração publicada usando somente metadados e frames-limite."""
-    if root.is_symlink() or (root / GENERATIONS_DIR).is_symlink():
+    generations = root / GENERATIONS_DIR
+    if not _regular_directory(root) or not _regular_directory(generations):
+        return None
+    if cache_root is not None:
+        try:
+            _require_cache_child(root, cache_root)
+        except ValueError:
+            return None
+    if not _resolved_child(generations, root):
         return None
     token = _bounded_text(root / CURRENT_POINTER, _MAX_POINTER_BYTES)
     if token is None or not _GENERATION_TOKEN.fullmatch(token):
         return None
-    path = root / GENERATIONS_DIR / token
-    if not path.is_dir() or path.is_symlink():
+    path = generations / token
+    if not _regular_directory(path) or not _resolved_child(path, generations, root):
         return None
     raw = _bounded_text(path / COMPLETE_MARKER, _MAX_MARKER_BYTES)
     if raw is None:
         return None
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None
     if not isinstance(data, dict) or data.get("schema_version") != MARKER_SCHEMA_VERSION:
         return None
-    if data.get("generation") != token or data.get("kind") not in {"full", "window"}:
+    kind = data.get("kind")
+    if data.get("generation") != token or type(kind) is not str:
         return None
-    if expected_kind is not None and data.get("kind") != expected_kind:
+    if kind not in {"full", "window"}:
+        return None
+    if expected_kind is not None and kind != expected_kind:
         return None
     if data.get("width") != PROXY_WIDTH or data.get("stage_width") != STAGE_WIDTH:
         return None
-    if data.get("qscale") != PROXY_QSCALE or list(data.get("tiers") or []) != list(TIERS):
+    tiers = data.get("tiers")
+    if data.get("qscale") != PROXY_QSCALE or type(tiers) is not list:
+        return None
+    if tiers != list(TIERS):
         return None
     frames = data.get("frames")
     counts = data.get("tier_counts")
@@ -270,18 +484,21 @@ def current_generation(root: Path, *, expected_kind: str | None = None) -> Proxy
     if any(type(counts.get(tier)) is not int or counts.get(tier) != frames for tier in TIERS):
         return None
     for tier in TIERS:
-        if not _regular_nonempty(frame_file(path / tier, 0)):
+        tier_dir = path / tier
+        if not _regular_directory(tier_dir) or not _resolved_child(tier_dir, path):
             return None
-        if not _regular_nonempty(frame_file(path / tier, frames - 1)):
+        if not _safe_frame(frame_file(tier_dir, 0), path, cache_root):
+            return None
+        if not _safe_frame(frame_file(tier_dir, frames - 1), path, cache_root):
             return None
     start, end = data.get("start"), data.get("end")
-    if data.get("kind") == "window":
+    if kind == "window":
         if type(start) is not int or type(end) is not int or end < start:
             return None
         if frames != end - start + 1:
             return None
     return ProxyGeneration(
-        path, token, frames, {tier: frames for tier in TIERS}, data["kind"], start, end
+        path, token, frames, {tier: frames for tier in TIERS}, kind, start, end
     )
 
 
@@ -292,7 +509,9 @@ def is_complete(ctx, video_id: str) -> int | None:
     sozinho, senão vídeos já visitados continuariam mostrando o proxy antigo e de
     baixa resolução para sempre, sem nenhum sinal do porquê.
     """
-    generation = current_generation(proxy_dir(ctx, video_id), expected_kind="full")
+    generation = current_generation(
+        proxy_dir(ctx, video_id), expected_kind="full", cache_root=ctx.cache_dir
+    )
     return generation.frames if generation is not None else None
 
 def plan_for(video_id: str, frame_count: int | None) -> ProxyPlan:
@@ -310,18 +529,18 @@ def plan_for(video_id: str, frame_count: int | None) -> ProxyPlan:
 
 def _windows_for(ctx, video_id: str) -> list[tuple[int, int]]:
     base = ctx.cache_dir / "windows" / video_id
-    if not base.is_dir():
+    if not _regular_directory(base):
+        return []
+    try:
+        _require_cache_child(base, ctx.cache_dir)
+    except ValueError:
         return []
     ranges: list[tuple[int, int]] = []
-    for entry in base.iterdir():
-        if not entry.is_dir() or entry.name.endswith(".part"):
-            continue
-        try:
-            raw_start, raw_end = entry.name.split("_")
-            start, end = int(raw_start), int(raw_end)
-        except ValueError:
-            continue
-        generation = current_generation(entry, expected_kind="window")
+    for start, end, name in _parse_windows_index(base):
+        entry = base / name
+        generation = current_generation(
+            entry, expected_kind="window", cache_root=ctx.cache_dir
+        )
         if generation is None or generation.start != start or generation.end != end:
             continue
         ranges.append((start, end))
@@ -347,20 +566,24 @@ def locate_frame(ctx, video_id: str, frame: int, tier: Tier = SMALL) -> Path | N
     if tier not in TIERS:
         tier = SMALL
 
-    full = current_generation(proxy_dir(ctx, video_id), expected_kind="full")
+    full = current_generation(
+        proxy_dir(ctx, video_id), expected_kind="full", cache_root=ctx.cache_dir
+    )
     if full is not None and 0 <= frame < full.frames:
         candidate = frame_file(full.path / tier, frame)
-        if _regular_nonempty(candidate):
+        if _safe_frame(candidate, full.path, ctx.cache_dir):
             return candidate
 
     for start, end in _windows_for(ctx, video_id):
         if start <= frame <= end:
             root = window_dir(ctx, video_id, start, end)
-            generation = current_generation(root, expected_kind="window")
+            generation = current_generation(
+                root, expected_kind="window", cache_root=ctx.cache_dir
+            )
             if generation is None:
                 continue
             candidate = frame_file(generation.path / tier, frame - start)
-            if _regular_nonempty(candidate):
+            if _safe_frame(candidate, generation.path, ctx.cache_dir):
                 _touch(root)
                 return candidate
 
@@ -368,7 +591,9 @@ def locate_frame(ctx, video_id: str, frame: int, tier: Tier = SMALL) -> Path | N
 
 
 def status(ctx, video_id: str, frame_count: int | None) -> dict:
-    generation = current_generation(proxy_dir(ctx, video_id), expected_kind="full")
+    generation = current_generation(
+        proxy_dir(ctx, video_id), expected_kind="full", cache_root=ctx.cache_dir
+    )
     complete = generation.frames if generation is not None else None
     plan = plan_for(video_id, frame_count)
     active = [job.payload() for job in jobs.active_for_video(ctx.object_id, video_id)]

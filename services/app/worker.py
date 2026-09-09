@@ -120,12 +120,23 @@ def run_proxy_full(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             {"current": validated.frames, "total": total, "message": "publicando proxy"},
         ):
             raise Cancelled("cancelamento solicitado antes da publicação")
+
+        def publish_guard() -> bool:
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {"current": validated.frames, "total": total, "message": "publicando proxy"},
+            ):
+                raise Cancelled("cancelamento solicitado no commit do proxy")
+            return True
+
         generation = proxy.publish_generation(
             staging,
             out,
             ctx.cache_dir,
             kind="full",
             job_id=str(job["id"]),
+            publish_guard=publish_guard,
         )
         ctx.index.update_frame_count(video_id, generation.frames, "proxy_extraction")
         return {
@@ -168,6 +179,20 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             {"current": validated.frames, "total": expected, "message": "publicando janela"},
         ):
             raise Cancelled("cancelamento solicitado antes da publicação")
+
+        def publish_guard() -> bool:
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {
+                    "current": validated.frames,
+                    "total": expected,
+                    "message": "publicando janela",
+                },
+            ):
+                raise Cancelled("cancelamento solicitado no commit da janela")
+            return True
+
         generation = proxy.publish_generation(
             staging,
             final,
@@ -177,6 +202,7 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             start=start,
             end=end,
             expected_frames=expected,
+            publish_guard=publish_guard,
         )
         proxy._touch(final)
         proxy._evict_if_needed(ctx)
