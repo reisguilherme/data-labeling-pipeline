@@ -878,6 +878,19 @@ class ProxyReliabilityTests(unittest.TestCase):
         self.assertLessEqual(result["entries_scanned"], 3)
         self.assertLessEqual(observed, 3)
 
+    def test_operational_sweep_selects_each_root_at_most_once_per_batch(self) -> None:
+        only_root = proxy.proxy_dir(self.ctx, "only-root")
+        only_root.mkdir(parents=True)
+
+        result = proxy.sweep_cache(
+            self.ctx,
+            max_roots=8,
+            discovery_entry_budget=32,
+            time_budget_seconds=10,
+        )
+
+        self.assertEqual(result["roots_scanned"], 1)
+
     def test_streaming_sweep_cursor_eventually_visits_every_root(self) -> None:
         tombstones: list[Path] = []
         for index in range(7):

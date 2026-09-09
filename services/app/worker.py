@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -552,30 +554,62 @@ log = logging.getLogger("pipeline.cpu-worker")
 _PROXY_SWEEP_INTERVAL_SECONDS = 300.0
 
 
+@dataclass(frozen=True, slots=True)
+class _ProxyMaintenanceTarget:
+    object_id: str
+    cache_dir: Path
+
+
+def _proxy_maintenance_targets(
+    workspace_root: Path,
+) -> tuple[_ProxyMaintenanceTarget, ...]:
+    """Le um snapshot do registro sem tocar no Workspace mutavel do processo."""
+    from server.workspace import ObjectConfig
+
+    try:
+        raw = (workspace_root / "objects.json").read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError, RecursionError):
+        return ()
+    if not isinstance(payload, dict) or not isinstance(payload.get("objects"), list):
+        return ()
+
+    targets: list[_ProxyMaintenanceTarget] = []
+    for raw in payload["objects"]:
+        if not isinstance(raw, dict) or not raw.get("object_id"):
+            continue
+        try:
+            config = ObjectConfig.from_json(raw, workspace_root)
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+        targets.append(
+            _ProxyMaintenanceTarget(
+                object_id=config.object_id,
+                cache_dir=config.output_root / "_cache",
+            )
+        )
+    return tuple(targets)
+
+
 def _run_proxy_maintenance() -> None:
     """Executa um lote curto de recuperacao sem carregar indices de videos."""
     workspace_root = os.environ.get("MST_WORKSPACE")
     if not workspace_root:
         return
     from server import proxy
-    from server.config import settings
-    from server.workspace import workspace
 
-    settings.workspace_root = Path(workspace_root)
-    workspace.load()
-    for config in workspace.list(include_archived=True):
+    for target in _proxy_maintenance_targets(Path(workspace_root).resolve()):
         try:
-            workspace.invalidate(config.object_id)
-            result = proxy.sweep_cache(workspace.context(config.object_id))
+            result = proxy.sweep_cache(target)
             if result["errors"]:
                 log.warning(
                     "sweep de proxy de %s terminou com %s erro(s)",
-                    config.object_id,
+                    target.object_id,
                     result["errors"],
                 )
         except Exception:  # noqa: BLE001 - manutencao nunca derruba consumidor
             log.warning(
-                "falha no sweep de proxy de %s", config.object_id, exc_info=True
+                "falha no sweep de proxy de %s", target.object_id, exc_info=True
             )
 
 

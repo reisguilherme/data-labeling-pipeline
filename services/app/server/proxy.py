@@ -989,6 +989,7 @@ def _take_sweep_roots(
     time_budget_seconds: float,
 ) -> tuple[list[_SweepRoot], int]:
     selected: list[_SweepRoot] = []
+    selected_keys: set[str] = set()
     scanned = 0
     deadline = time.monotonic() + time_budget_seconds
     if max_roots == 0 or entry_budget == 0 or time_budget_seconds == 0:
@@ -1005,8 +1006,9 @@ def _take_sweep_roots(
                 _SWEEP_STREAMS.pop(key, None)
                 break
             scanned += 1
-            if candidate is not None:
+            if candidate is not None and candidate[0] not in selected_keys:
                 selected.append(candidate)
+                selected_keys.add(candidate[0])
     return selected, scanned
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -339,6 +340,117 @@ class CpuWorkerSafetyTests(unittest.TestCase):
         self.assertTrue(scheduler.maybe_start(301.0))
         self.assertTrue(scheduler.wait(timeout=1))
         self.assertEqual(calls, 2)
+
+    def test_proxy_maintenance_never_reloads_workspace_during_object_purge(
+        self,
+    ) -> None:
+        from server.config import settings
+        from server.workspace import ObjectConfig, Workspace
+        from services.app import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            videos_root = root / "boom" / "raw"
+            output_root = root / "boom" / "dataset"
+            videos_root.mkdir(parents=True)
+            (output_root / "_cache" / "proxy").mkdir(parents=True)
+            config = ObjectConfig(
+                object_id="boom",
+                display_name="Boom",
+                label="boom",
+                videos_root=videos_root,
+                output_root=output_root,
+                archived=True,
+            )
+            registry = root / "objects.json"
+            registry.write_text(
+                json.dumps({"schema_version": 2, "objects": [config.to_json(root)]}),
+                encoding="utf-8",
+            )
+
+            test_workspace = Workspace()
+            purge_reached_save = threading.Event()
+            release_save = threading.Event()
+            purge_errors: list[BaseException] = []
+
+            with patch.object(settings, "workspace_root", root), patch.object(
+                settings, "legacy", None
+            ):
+                test_workspace.load()
+                original_save = test_workspace.save
+
+                def blocked_save() -> None:
+                    purge_reached_save.set()
+                    if not release_save.wait(timeout=2):
+                        raise TimeoutError("purge save was not released")
+                    original_save()
+
+                job = {
+                    "id": "purge-1",
+                    "payload": {
+                        "object_id": "boom",
+                        "actor": "guilherme",
+                        "managed_paths": [str(videos_root), str(output_root)],
+                    },
+                }
+                inventory = root / "purge-inventory.json"
+
+                def purge() -> None:
+                    try:
+                        worker_module.run_object_purge(job, MagicMock(), "lease")
+                    except BaseException as exc:  # surfaced below
+                        purge_errors.append(exc)
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MST_WORKSPACE": str(root),
+                        "DATABASE_URL": "postgresql://unused",
+                    },
+                ), patch(
+                    "server.workspace.workspace", test_workspace
+                ), patch.object(
+                    test_workspace, "save", side_effect=blocked_save
+                ), patch(
+                    "services.app.worker.MinioBlobStore.from_env", return_value=None
+                ), patch(
+                    "server.object_lifecycle.write_purge_inventory",
+                    return_value=(inventory, {"file_count": 0, "total_bytes": 0}),
+                ), patch(
+                    "server.object_lifecycle.preserve_exported_datasets",
+                    return_value=[],
+                ), patch(
+                    "server.object_lifecycle.delete_project_records", return_value={}
+                ):
+                    purge_thread = threading.Thread(target=purge)
+                    purge_thread.start()
+                    try:
+                        self.assertTrue(
+                            purge_reached_save.wait(timeout=1),
+                            f"purge did not reach save: {purge_errors!r}",
+                        )
+                        with patch.object(
+                            test_workspace, "load", wraps=test_workspace.load
+                        ) as load, patch.object(
+                            test_workspace, "list", wraps=test_workspace.list
+                        ) as list_objects, patch.object(
+                            test_workspace, "invalidate", wraps=test_workspace.invalidate
+                        ) as invalidate, patch.object(
+                            test_workspace, "context", wraps=test_workspace.context
+                        ) as context:
+                            worker_module._run_proxy_maintenance()
+                            load.assert_not_called()
+                            list_objects.assert_not_called()
+                            invalidate.assert_not_called()
+                            context.assert_not_called()
+                    finally:
+                        release_save.set()
+                        purge_thread.join(timeout=2)
+
+            self.assertFalse(purge_thread.is_alive())
+            self.assertEqual(purge_errors, [])
+            saved = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(saved["objects"], [])
 
 
 if __name__ == "__main__":
