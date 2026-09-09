@@ -68,6 +68,19 @@ os arquivos em `secrets/`. O cache Hugging Face pode ser baixado novamente; o
 checkpoint finetunado precisa estar em `models/releases/...` e continuar
 coerente com `config/models.local.yaml`.
 
+Gere o override local que monta, separadamente, as raízes `raw` e `dataset` de
+cada objeto nos três processos que as utilizam. O comando apenas lê
+`objects.json` e grava configuração; não move, copia nem cria dados:
+
+```bash
+python3 scripts/generate_compose_object_mounts.py \
+  --workspace /srv/boom-pipeline/data/workspace
+docker compose config --quiet
+```
+
+`compose.override.yml` fica fora do Git, portanto uma atualização de código não
+o sobrescreve. Regenere-o depois de cadastrar ou rehomear uma classe.
+
 O `docker compose up -d` sobe duas replicas do worker CPU por padrao, cada uma
 limitada a quatro CPUs, 8 GiB de RAM e quatro threads por processo FFmpeg. O
 `sam3-worker` continua com exatamente uma replica para nao disputar VRAM. Para
@@ -117,7 +130,8 @@ docker compose run --rm --no-deps app backup
 
 Atualize apenas os arquivos versionados com `git pull --ff-only` (depois que a
 branch aprovada tiver sido enviada ao remoto). Nao substitua nem apague `.env`,
-`config/models.local.yaml`, `secrets/`, `data/`, `models/` ou `backups/`.
+`compose.override.yml`, `config/models.local.yaml`, `secrets/`, `data/`,
+`models/` ou `backups/`.
 
 Para a versao que torna a conclusao da exportacao independente do navegador,
 reconstrua e recrie apenas a API e o worker CPU:

@@ -23,7 +23,9 @@ tests/                        testes de core, infraestrutura e isolamento
 Requisitos: Docker Engine + Compose recente, NVIDIA Container Toolkit, GPU
 compativel e acesso apenas pela propria maquina.
 
-1. Copie `.env.example` para `.env` e ajuste `WORKSPACE_DIR`, `UID` e `GID`.
+1. Copie `.env.example` para `.env`. O padrão autocontido usa
+   `WORKSPACE_DIR=./data/workspace`; mantenha outro valor apenas quando estiver
+   apontando deliberadamente para um acervo já existente.
 2. Gere os secrets:
    - Windows: `./scripts/bootstrap-secrets.ps1`
    - Linux: `./scripts/bootstrap-secrets.sh`
@@ -38,9 +40,15 @@ compativel e acesso apenas pela propria maquina.
    `./scripts/stage-model.ps1 -SourcePath ../model.pt -ModelId sam3-finetuned -Version v1`.
    Copie `config/models.yaml` para `config/models.local.yaml`, atualize
    `model_id`, caminho e SHA-256 e associe cada `object_id` ao modelo.
-4. Valide: `docker compose -f compose.yml config --quiet`.
-5. Suba: `docker compose -f compose.yml up -d --build`.
-6. Abra `http://127.0.0.1:8000`.
+4. Depois de preparar ou cadastrar objetos, gere os mounts explícitos sem mover
+   nenhum arquivo:
+   `python scripts/generate_compose_object_mounts.py --workspace ./data/workspace`.
+   O arquivo local `compose.override.yml` é ignorado pelo Git e carregado
+   automaticamente pelo Compose. A geração falha se uma raiz estiver ausente,
+   for symlink, escapar do workspace ou se duas raízes estiverem sobrepostas.
+5. Valide: `docker compose config --quiet`.
+6. Suba: `docker compose up -d --build`.
+7. Abra `http://127.0.0.1:8000`.
 
 Por padrao somente a porta `127.0.0.1:8000` e publicada. PostgreSQL e MinIO
 existem apenas na rede interna. Para mover a instalacao e os dados para uma
@@ -49,6 +57,12 @@ maquina remota que atende em `0.0.0.0:3000`, siga
 confiavel e firewall, pois a aplicacao ainda nao tem autenticacao de acesso.
 O mesmo guia inclui a atualizacao incremental do codigo sem substituir
 `data/`, modelos, secrets ou os volumes persistentes.
+
+Cada objeto mantém dados independentes em
+`data/workspace/<objeto>/raw` e `data/workspace/<objeto>/dataset`. Recriar ou
+atualizar os containers não recria, copia ou apaga essas pastas. Regenere
+`compose.override.yml` somente depois de cadastrar/rehomear um objeto; o
+gerador descreve os mounts existentes e nunca cria uma raiz vazia.
 
 ## Servicos
 

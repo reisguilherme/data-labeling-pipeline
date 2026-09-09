@@ -30,7 +30,7 @@ x-app-base: &app-base
     - worker_token
     - gcs_credentials
   volumes:
-    - "${WORKSPACE_DIR:?defina WORKSPACE_DIR no .env}:/workspace"
+    - "${WORKSPACE_DIR:-./data/workspace}:/workspace"
     - app-config:/config
     - ./config:/registry:ro
     - ./backups:/backups
@@ -110,7 +110,7 @@ services:
       - minio_user
       - minio_password
     volumes:
-      - "${WORKSPACE_DIR}:/workspace"
+      - "${WORKSPACE_DIR:-./data/workspace}:/workspace"
       - ./config:/config:ro
       - ./models:/models:ro
       - model-cache:/model-cache

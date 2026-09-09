@@ -62,6 +62,11 @@ class ComposeSecurityTests(unittest.TestCase):
         self.assertIn("./config:/config:ro", volumes)
         self.assertIn("./models:/models:ro", volumes)
 
+    def test_workspace_mount_has_a_self_contained_default(self) -> None:
+        expected = "${WORKSPACE_DIR:-./data/workspace}:/workspace"
+        for name in ("app", "worker", "sam3-worker"):
+            self.assertIn(expected, self.services[name]["volumes"], name)
+
     def test_huggingface_cache_is_persistent_and_writable(self) -> None:
         worker = self.services["sam3-worker"]
         self.assertEqual(worker["environment"]["HF_HOME"], "/model-cache/huggingface")

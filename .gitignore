@@ -50,6 +50,7 @@ htmlcov/
 *.tsbuildinfo
 services/app/static/
 graphify-out/
+compose.override.yml
 .superpowers/
 .worktrees/
 
