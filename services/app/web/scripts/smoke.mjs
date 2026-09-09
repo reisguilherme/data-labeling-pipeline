@@ -599,6 +599,25 @@ const SCENARIOS = {
     terminalJobs: { "repair-reopen-1": "done", "repair-reopen-2": "done" },
     action: "triage-close-reopen-flight",
   },
+  "triage-keyboard-recovery-failure": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: { ...WINDOW_PROXY_STATUS, available_ranges: [[0, 95]] },
+    proxyStart: { mode: "window", job_id: null, total_frames: 96, already_complete: false },
+    windowStart: { job_id: "keyboard-repair-error", start: 0, end: 95, already_available: false },
+    terminalJobs: { "keyboard-repair-error": "error" },
+    terminalJobErrors: { "keyboard-repair-error": "falha no atalho" },
+    action: "triage-keyboard-recovery-failure",
+  },
+  "triage-active-video-order": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    delayActiveVideoNull: true,
+    action: "triage-active-video-order",
+  },
   "triage-stale-open": {
     url: "/objects/boom/videos/aaa/triage",
     config: CONFIG,
@@ -803,6 +822,7 @@ const requestLog = [];
 const eventLog = [];
 const jobPolls = new Map();
 const eventSourceCloses = new Map();
+const unhandledRejections = [];
 let frameStageMounts = 0;
 let maskFrameRequests = 0;
 let videosRequests = 0;
@@ -823,11 +843,32 @@ window.history.pushState = (...args) => {
   eventLog.push(`navigate:${String(args[2] ?? "")}`);
   return originalPushState(...args);
 };
+process.on("unhandledRejection", (reason) => {
+  unhandledRejections.push(String(reason instanceof Error ? reason.message : reason));
+});
 
 window.fetch = async (input, init = {}) => {
   const url = String(input);
   requests.push(url);
   requestLog.push({ url, method: init.method ?? "GET", body: init.body });
+  if (init.method === "POST" && /\/session\/active-video$/.test(url)) {
+    const activeVideo = JSON.parse(init.body ?? "{}").video_id ?? null;
+    if (activeVideo === null && scenario.delayActiveVideoNull) {
+      await new Promise((resolve) => setTimeout(resolve, 160));
+    }
+    eventLog.push(`active:${activeVideo ?? "null"}:ack`);
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ cancelled: 0, lock: null }),
+    };
+  }
+  if (init.method === "POST" && /\/lock\/release$/.test(url)) {
+    eventLog.push("release:ack");
+  } else if (init.method === "POST" && /\/lock$/.test(url)) {
+    eventLog.push(`acquire:${JSON.parse(init.body ?? "{}").video_id}:ack`);
+  }
   if (scenario.delayMetaVideo && url.includes(`/videos/${scenario.delayMetaVideo}/meta`)) {
     await new Promise((resolve) => setTimeout(resolve, 700));
   }
@@ -1186,6 +1227,17 @@ if (
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
+if (scenario.action === "triage-keyboard-recovery-failure") {
+  unhandledRejections.length = 0;
+  window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "i", bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+if (scenario.action === "triage-active-video-order") {
+  eventLog.length = 0;
+  const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
+  next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 350));
+}
 if (scenario.action === "triage-stale-open") {
   requests.length = 0;
   requestLog.length = 0;
@@ -1307,6 +1359,23 @@ if (scenario.action === "triage-close-reopen-flight") {
     repairsWhileFirstPending === 2 && repairs.length === 2,
     "reabrir o mesmo vídeo não reutiliza flight da sessão fechada",
     `${repairsWhileFirstPending} pendentes; ${repairs.length} total`,
+  );
+}
+if (scenario.action === "triage-keyboard-recovery-failure") {
+  check(unhandledRejections.length === 0, "falha de recuperação pelo teclado é tratada", unhandledRejections[0] ?? "");
+  check((window.document.body.textContent ?? "").includes("falha no atalho"), "erro do atalho permanece visível");
+}
+if (scenario.action === "triage-active-video-order") {
+  const lifecycle = eventLog.filter((event) =>
+    event.startsWith("active:") || event.startsWith("release:") || event.startsWith("acquire:"),
+  );
+  check(
+    lifecycle[0] === "active:null:ack" &&
+      lifecycle[1] === "release:ack" &&
+      lifecycle[2] === "active:eee:ack" &&
+      lifecycle[3] === "acquire:eee:ack",
+    "desativação e release antigos terminam antes da nova ativação",
+    lifecycle.join(" | "),
   );
 }
 if (scenario.action === "submit-triage-slow-refresh") {

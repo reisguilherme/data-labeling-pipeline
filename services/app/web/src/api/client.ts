@@ -558,7 +558,12 @@ export function watchJob(
     if (stopped) return;
     const reason = error instanceof Error ? error : new Error(String(error));
     stop();
-    onFailure?.(reason);
+    try {
+      onFailure?.(reason);
+    } catch {
+      // O watcher já foi encerrado; uma falha do consumidor não pode reabrir
+      // polling nem virar uma rejeição global sem dono.
+    }
   };
 
   const publish = (job: JobInfo) => {

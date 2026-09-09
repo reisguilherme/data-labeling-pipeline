@@ -223,6 +223,16 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let beaconBound: string | null = null;
 let openGeneration = 0;
 let stopProxyWatcher: (() => void) | null = null;
+let lifecycleTransition: Promise<void> = Promise.resolve();
+
+function sequenceLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+  const result = lifecycleTransition.then(operation, operation);
+  lifecycleTransition = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
 
 class FrameRecoveryCancelled extends Error {
   constructor() {
@@ -260,7 +270,7 @@ function releaseOnUnload(): void {
 function startHeartbeat(videoId: string): void {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
-    void api.setActiveVideo(videoId).catch(() => undefined);
+    void sequenceLifecycle(() => api.setActiveVideo(videoId)).catch(() => undefined);
   }, HEARTBEAT_MS);
   // `pagehide` em vez de `beforeunload`: dispara também quando a aba vai para o
   // cache de navegação do browser, e é o evento em que o sendBeacon ainda vale.
@@ -338,16 +348,15 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
 
     try {
       // Cancela extrações do vídeo anterior antes de disputar o semáforo pesado.
-      await api.setActiveVideo(videoId);
+      await sequenceLifecycle(() => api.setActiveVideo(videoId));
       if (!isActive()) return;
 
       // A trava é pedida ANTES de carregar: se outra pessoa está com o vídeo, a
       // tela abre em leitura desde o primeiro render, em vez de deixar alguém
       // marcar dez intervalos para só então descobrir que não pode salvar.
       try {
-        await api.acquireLock(videoId);
+        await sequenceLifecycle(() => api.acquireLock(videoId));
         if (!isActive()) {
-          void api.releaseLock(videoId).catch(() => undefined);
           return;
         }
         startHeartbeat(videoId);
@@ -389,26 +398,37 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       }
 
       if (started.job_id) {
-        stopProxyWatcher = watchJob(started.job_id, (job) => {
-          if (!isActive()) return;
-          set({ job: job.state === "running" || job.state === "queued" ? job : null });
+        stopProxyWatcher = watchJob(
+          started.job_id,
+          (job) => {
+            if (!isActive()) return;
+            set({ job: job.state === "running" || job.state === "queued" ? job : null });
 
-          // O modo completo escreve os JPEGs em ordem, então o progresso do job
-          // já diz o que está disponível — sem precisar consultar o servidor a
-          // cada tick para o filmstrip preencher ao vivo.
-          if (job.kind === "proxy_full" && job.current > 0) {
-            const current = get().proxy;
-            if (current && !current.complete) {
-              set({ proxy: { ...current, available_ranges: [[0, job.current - 1]] } });
+            // O modo completo escreve os JPEGs em ordem, então o progresso do job
+            // já diz o que está disponível — sem precisar consultar o servidor a
+            // cada tick para o filmstrip preencher ao vivo.
+            if (job.kind === "proxy_full" && job.current > 0) {
+              const current = get().proxy;
+              if (current && !current.complete) {
+                set({ proxy: { ...current, available_ranges: [[0, job.current - 1]] } });
+              }
             }
-          }
 
-          if (job.state === "done") {
-            void api.proxyStatus(videoId).then((nextStatus) => {
-              if (isActive()) set({ proxy: nextStatus });
-            });
-          }
-        });
+            if (job.state === "done") {
+              void api
+                .proxyStatus(videoId)
+                .then((nextStatus) => {
+                  if (isActive()) set({ proxy: nextStatus });
+                })
+                .catch((error) => {
+                  if (isActive()) set({ error: (error as Error).message, job: null });
+                });
+            }
+          },
+          (error) => {
+            if (isActive()) set({ error: error.message, job: null });
+          },
+        );
       }
     } catch (error) {
       if (isActive()) set({ error: (error as Error).message, loading: false });
@@ -422,10 +442,15 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
     stopProxyWatcher = null;
     const { videoId, readOnly } = get();
     stopHeartbeat();
-    void api.setActiveVideo(null);
-    // Liberar explicitamente evita segurar o vídeo pelos 90 s do TTL só porque
-    // alguém voltou para a biblioteca.
-    if (videoId && !readOnly) void api.releaseLock(videoId).catch(() => undefined);
+    void sequenceLifecycle(async () => {
+      try {
+        await api.setActiveVideo(null);
+      } finally {
+        // A liberação faz parte da mesma transição: uma abertura seguinte só
+        // ativa/adquire depois que o vídeo anterior terminou de fechar.
+        if (videoId && !readOnly) await api.releaseLock(videoId);
+      }
+    }).catch(() => undefined);
     set({
       videoId: null,
       meta: null,

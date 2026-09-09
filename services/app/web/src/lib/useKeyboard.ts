@@ -85,7 +85,7 @@ export function useKeyboard(handlers: KeyboardHandlers) {
           // Marcar no player só ancora: leva direto ao filmstrip para confirmar.
           if (state.phase === "scan") {
             state.setPhase("refine");
-            void state.ensureFrameAvailable(state.currentFrame);
+            void state.ensureFrameAvailable(state.currentFrame).catch(() => undefined);
           }
           break;
 
@@ -94,7 +94,7 @@ export function useKeyboard(handlers: KeyboardHandlers) {
           state.setOut(state.currentFrame, state.frameProvisional);
           if (state.phase === "scan") {
             state.setPhase("refine");
-            void state.ensureFrameAvailable(state.currentFrame);
+            void state.ensureFrameAvailable(state.currentFrame).catch(() => undefined);
           }
           break;
 
@@ -129,7 +129,7 @@ export function useKeyboard(handlers: KeyboardHandlers) {
             state.setPlaying(false);
             state.setFrame(interval.start, false);
             state.setPhase("bbox");
-            void state.ensureFrameAvailable(interval.start);
+            void state.ensureFrameAvailable(interval.start).catch(() => undefined);
           }
           break;
 
