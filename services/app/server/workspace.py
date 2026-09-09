@@ -18,12 +18,13 @@ definiu. Passar `ctx` como argumento torna o acoplamento visível.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from .config import CACHE_LIMIT_GB, settings
 from .manifest import DownloadManifest, ExclusionList
@@ -42,9 +43,38 @@ _WIN_RESERVED = {
     *(f"lpt{i}" for i in range(1, 10)),
 }
 
-log = logging.getLogger("movies-screening-tool.workspace")
-
 WORKSPACE_SCHEMA_VERSION = 2
+
+
+@contextmanager
+def _exclusive_registry_lock(path: Path) -> Iterator[None]:
+    """Serializa mutacoes curtas do registro entre app e workers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("arquivo de lock do registro nao pode ser symlink")
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def rewrite_path(value: str | None, old_root: str, new_root: str) -> str | None:
@@ -76,6 +106,10 @@ class ObjectNotFound(KeyError):
 
 
 class InvalidObjectId(ValueError):
+    pass
+
+
+class ObjectRootUnavailable(RuntimeError):
     pass
 
 
@@ -141,33 +175,16 @@ def _resolve_root(
     object_id: str | None = None,
     kind: str | None = None,
 ) -> Path:
-    """Caminho de um root, tolerando registros feitos noutro sistema.
-
-    Ordem: relativo ao workspace (o caso normal e portátil) -> absoluto local ->
-    e, se o registro veio de outro SO ou aponta para um lugar que não existe
-    mais, o LAYOUT PADRÃO `<workspace>/<objeto>/{raw,dataset}`. A última regra é
-    o que faz mover o workspace de máquina simplesmente funcionar, em vez de
-    exigir reescrever caminho a caminho.
-    """
+    """Resolve a raiz persistida sem inventar um diretório substituto vazio."""
     path = Path(raw)
-
-    if not _is_foreign_absolute(raw) and path.is_absolute():
-        if path.is_dir() or workspace_root is None:
-            return path
-    elif not path.is_absolute() and workspace_root is not None and not _is_foreign_absolute(raw):
-        return workspace_root / path
-
-    # Chegou aqui: o caminho gravado não serve nesta máquina.
-    if workspace_root is not None and object_id and kind:
-        fallback = workspace_root / object_id / kind
-        log.warning(
-            "objeto %s: o caminho gravado (%s) não existe aqui; usando o layout "
-            "padrão %s. Rode tools/rehome_workspace.py para gravar isso.",
-            object_id, raw, fallback,
+    if _is_foreign_absolute(raw):
+        raise ValueError(
+            f"objeto {object_id or '?'}: caminho de {kind or 'dados'} pertence "
+            "a outro sistema operacional; monte os dados ou execute o rehome"
         )
-        return fallback
-
-    return workspace_root / path if workspace_root is not None else path
+    if path.is_absolute() or workspace_root is None:
+        return path
+    return workspace_root / path
 
 
 @dataclass
@@ -301,8 +318,34 @@ class ObjectContext:
     def require_roots(self) -> tuple[Path, Path]:
         return self.config.videos_root, self.config.output_root
 
+    def _require_registered_roots(self) -> None:
+        for kind, path in (
+            ("videos", self.config.videos_root),
+            ("dataset", self.config.output_root),
+        ):
+            if path.is_symlink():
+                raise ObjectRootUnavailable(
+                    f"raiz de {kind} registrada para {self.object_id} e um symlink"
+                )
+            if not path.is_dir():
+                raise ObjectRootUnavailable(
+                    f"raiz de {kind} registrada para {self.object_id} nao existe: "
+                    f"{path}. Restaure/monte os dados ou execute o rehome."
+                )
+
+    def initialize_dirs(self) -> None:
+        """Cria somente as raízes de um objeto novo já validado."""
+        for path in (self.config.videos_root, self.config.output_root):
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise RuntimeError(f"raiz do objeto nao e um diretorio seguro: {path}")
+            path.mkdir(parents=True, exist_ok=True)
+        self.ensure_dirs()
+
     def ensure_dirs(self) -> None:
-        self.config.videos_root.mkdir(parents=True, exist_ok=True)
+        """Cria cache auxiliar, mas nunca recria roots registrados ausentes."""
+        self._require_registered_roots()
+        if self.cache_dir.is_symlink():
+            raise RuntimeError(f"cache de {self.object_id} nao pode ser symlink")
         for sub in ("thumbs", "proxy", "windows", "history"):
             (self.cache_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -339,7 +382,8 @@ class Workspace:
         self.root: Path | None = None
         self._objects: dict[str, ObjectConfig] = {}
         self._contexts: dict[str, ObjectContext] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._registry_stamp: tuple[int, int, int] | None = None
 
     # -- persistência ------------------------------------------------------
 
@@ -348,6 +392,10 @@ class Workspace:
         if self.root is None:
             raise RuntimeError("workspace_root não configurado")
         return self.root / "objects.json"
+
+    @property
+    def registry_lock_path(self) -> Path:
+        return self.registry_path.with_name("objects.json.lock")
 
     @property
     def ready(self) -> bool:
@@ -361,23 +409,54 @@ class Workspace:
             self._read_registry()
         self.adopt_legacy()
 
-    def _read_registry(self) -> None:
+    @staticmethod
+    def _file_stamp(path: Path) -> tuple[int, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size, getattr(stat, "st_ino", 0)
+
+    def _read_registry_unlocked(self) -> None:
         path = self.registry_path
         if not path.exists():
             self._objects = {}
+            self._registry_stamp = None
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._objects = {}
-            return
-        self._objects = {
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"registro de objetos invalido: {path}") from exc
+        previous = self._objects
+        loaded = {
             item["object_id"]: ObjectConfig.from_json(item, self.root)
             for item in data.get("objects", [])
             if item.get("object_id")
         }
+        changed = {
+            object_id
+            for object_id in set(previous) | set(loaded)
+            if object_id not in previous
+            or object_id not in loaded
+            or previous[object_id].to_json(self.root) != loaded[object_id].to_json(self.root)
+        }
+        self._objects = loaded
+        for object_id in changed:
+            self._contexts.pop(object_id, None)
+        self._registry_stamp = self._file_stamp(path)
 
-    def save(self) -> None:
+    def _read_registry(self) -> None:
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            self._read_registry_unlocked()
+
+    def _refresh_registry(self) -> None:
+        if self._file_stamp(self.registry_path) == self._registry_stamp:
+            return
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            if self._file_stamp(self.registry_path) != self._registry_stamp:
+                self._read_registry_unlocked()
+
+    def _write_registry_unlocked(self) -> None:
         path = self.registry_path
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -385,12 +464,25 @@ class Workspace:
             "updated_at": iso(),
             "objects": [cfg.to_json(self.root) for cfg in self._objects.values()],
         }
-        tmp = path.with_name("objects.json.tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        tmp = path.with_name(
+            f".objects.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        self._registry_stamp = self._file_stamp(path)
+
+    def save(self) -> None:
+        """Persiste o snapshot apenas se nenhum outro processo o alterou."""
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            if self._file_stamp(self.registry_path) != self._registry_stamp:
+                raise RuntimeError("registro mudou em outro processo; recarregue antes de salvar")
+            self._write_registry_unlocked()
 
     def adopt_legacy(self) -> bool:
         """Registra as pastas da v1 como o objeto "boom", SEM mover nada.
@@ -401,7 +493,7 @@ class Workspace:
         <workspace>/<objeto>/{raw,dataset} é um passo separado e reversível
         (tools/migrate_to_workspace.py).
         """
-        if not settings.legacy or "boom" in self._objects:
+        if not settings.legacy:
             return False
         videos_root = settings.legacy.get("videos_root")
         output_root = settings.legacy.get("output_root")
@@ -414,37 +506,43 @@ class Workspace:
             self.root = Path(videos_root).parent
             settings.workspace_root = self.root
             self._read_registry()
+
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            self._read_registry_unlocked()
             if "boom" in self._objects:
                 return False
-
-        self._objects["boom"] = ObjectConfig(
-            object_id="boom",
-            display_name="Boom",
-            label="boom",
-            videos_root=Path(videos_root),
-            output_root=Path(output_root),
-            suggest_rules="boom",
-            created_at=iso(),
-        )
-        self.save()
+            self._objects["boom"] = ObjectConfig(
+                object_id="boom",
+                display_name="Boom",
+                label="boom",
+                videos_root=Path(videos_root),
+                output_root=Path(output_root),
+                suggest_rules="boom",
+                created_at=iso(),
+            )
+            self._write_registry_unlocked()
         settings.save()
         return True
 
     # -- consulta ----------------------------------------------------------
 
     def list(self, *, include_archived: bool = False) -> list[ObjectConfig]:
-        items = [
-            cfg
-            for cfg in self._objects.values()
-            if include_archived or not cfg.archived
-        ]
+        self._refresh_registry()
+        with self._lock:
+            items = [
+                cfg
+                for cfg in self._objects.values()
+                if include_archived or not cfg.archived
+            ]
         return sorted(items, key=lambda cfg: cfg.display_name.lower())
 
     def get(self, object_id: str) -> ObjectConfig:
-        cfg = self._objects.get(object_id)
-        if cfg is None:
-            raise ObjectNotFound(object_id)
-        return cfg
+        self._refresh_registry()
+        with self._lock:
+            cfg = self._objects.get(object_id)
+            if cfg is None:
+                raise ObjectNotFound(object_id)
+            return cfg
 
     def context(self, object_id: str) -> ObjectContext:
         validate_object_id(object_id)
@@ -466,34 +564,42 @@ class Workspace:
         validate_object_id(cfg.object_id)
         if self.root is None:
             raise RuntimeError("workspace_root nao configurado")
-        if cfg.object_id in self._objects:
-            raise ValueError(f"já existe um objeto com o id '{cfg.object_id}'")
-        registered_roots = [
-            (current.object_id, path)
-            for current in self._objects.values()
-            for path in (current.videos_root, current.output_root)
-        ]
-        cfg.videos_root, cfg.output_root = validate_new_object_roots(
-            self.root,
-            cfg.object_id,
-            cfg.videos_root,
-            cfg.output_root,
-            registered_roots=registered_roots,
-        )
-        cfg.created_at = cfg.created_at or iso()
-        self._objects[cfg.object_id] = cfg
-        self.save()
-        self.context(cfg.object_id).ensure_dirs()
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            self._read_registry_unlocked()
+            if cfg.object_id in self._objects:
+                raise ValueError(f"já existe um objeto com o id '{cfg.object_id}'")
+            registered_roots = [
+                (current.object_id, path)
+                for current in self._objects.values()
+                for path in (current.videos_root, current.output_root)
+            ]
+            cfg.videos_root, cfg.output_root = validate_new_object_roots(
+                self.root,
+                cfg.object_id,
+                cfg.videos_root,
+                cfg.output_root,
+                registered_roots=registered_roots,
+            )
+            cfg.created_at = cfg.created_at or iso()
+            context = ObjectContext(cfg)
+            context.initialize_dirs()
+            self._objects[cfg.object_id] = cfg
+            self._write_registry_unlocked()
+            self._contexts[cfg.object_id] = context
         return cfg
 
     def update(self, object_id: str, **changes) -> ObjectConfig:
-        cfg = self.get(object_id)
-        for key, value in changes.items():
-            if value is not None and hasattr(cfg, key):
-                setattr(cfg, key, value)
-        self.save()
-        self.invalidate(object_id)
-        return cfg
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            self._read_registry_unlocked()
+            cfg = self._objects.get(object_id)
+            if cfg is None:
+                raise ObjectNotFound(object_id)
+            for key, value in changes.items():
+                if value is not None and hasattr(cfg, key):
+                    setattr(cfg, key, value)
+            self._write_registry_unlocked()
+            self._contexts.pop(object_id, None)
+            return cfg
 
     def remove_registration(self, object_id: str) -> ObjectConfig:
         """Remove somente o registro, depois que o job de purge terminou.
@@ -501,11 +607,15 @@ class Workspace:
         A separação impede que uma falha no inventário/armazenamento faça o
         objeto sumir da UI enquanto seus dados ainda precisam de recuperação.
         """
-        cfg = self.get(object_id)
-        self._objects.pop(object_id)
-        self.invalidate(object_id)
-        self.save()
-        return cfg
+        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+            self._read_registry_unlocked()
+            cfg = self._objects.get(object_id)
+            if cfg is None:
+                raise ObjectNotFound(object_id)
+            self._objects.pop(object_id)
+            self._write_registry_unlocked()
+            self._contexts.pop(object_id, None)
+            return cfg
 
     def default_roots(self, object_id: str) -> tuple[Path, Path]:
         """Layout convencionado para objetos novos."""

@@ -9,6 +9,7 @@ from .workspace import (
     InvalidObjectId,
     ObjectContext,
     ObjectNotFound,
+    ObjectRootUnavailable,
     validate_object_id,
     workspace,
 )
@@ -35,7 +36,10 @@ def get_object(object_id: str = PathParam(...)) -> ObjectContext:
 
     if ctx.config.archived:
         raise HTTPException(409, f"objeto '{object_id}' está arquivado")
-    ctx.ensure_loaded()
+    try:
+        ctx.ensure_loaded()
+    except ObjectRootUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
     return ctx
 
 
