@@ -492,6 +492,113 @@ const SCENARIOS = {
     terminalJobs: { "repair-job-1": "done" },
     action: "triage-full-frame-fallback",
   },
+  "triage-window-covered-missing": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: { ...WINDOW_PROXY_STATUS, available_ranges: [[0, 95]] },
+    proxyStart: { mode: "window", job_id: null, total_frames: 96, already_complete: false },
+    windowStart: { job_id: "window-repair-1", start: 0, end: 95, already_available: false },
+    terminalJobs: { "window-repair-1": "done" },
+    action: "triage-frame-recovery-success",
+    expectedRepairKind: "window",
+  },
+  "triage-full-incomplete-missing": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: (() => {
+      let calls = 0;
+      return () => (++calls === 1
+        ? { ...PROXY_STATUS, complete: false, available_ranges: [], jobs: [] }
+        : PROXY_STATUS);
+    })(),
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: false },
+    repairStart: { mode: "full", job_id: "full-repair-1", total_frames: 96, already_complete: false },
+    terminalJobs: { "full-repair-1": "done" },
+    action: "triage-frame-recovery-success",
+    expectedRepairKind: "full",
+  },
+  "triage-repair-no-job": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    action: "triage-frame-recovery-failure",
+    expectedFailure: "reparo não iniciou",
+  },
+  "triage-repair-error": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: "repair-error-1", total_frames: 96, already_complete: false },
+    terminalJobs: { "repair-error-1": "error" },
+    terminalJobErrors: { "repair-error-1": "ffmpeg falhou" },
+    action: "triage-frame-recovery-failure",
+    expectedFailure: "ffmpeg falhou",
+  },
+  "triage-repair-cancelled": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: "repair-cancel-1", total_frames: 96, already_complete: false },
+    terminalJobs: { "repair-cancel-1": "cancelled" },
+    action: "triage-frame-recovery-failure",
+    expectedFailure: "cancelado",
+  },
+  "triage-sse-poll-failure": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: "repair-poll-fail", total_frames: 96, already_complete: false },
+    sseFailureJobs: ["repair-poll-fail"],
+    failJobPoll: ["repair-poll-fail"],
+    fastPoll: true,
+    action: "triage-frame-recovery-failure",
+    expectedFailure: "acompanhar",
+  },
+  "triage-sse-close": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: { mode: "full", job_id: "repair-poll-running", total_frames: 96, already_complete: false },
+    sseFailureJobs: ["repair-poll-running"],
+    pollingJobs: { "repair-poll-running": "running" },
+    fastPoll: true,
+    action: "triage-sse-close",
+  },
+  "triage-close-reopen-flight": {
+    url: "/objects/boom/videos/aaa/triage",
+    config: CONFIG,
+    videos: TRIAGE_VIDEOS,
+    videoMeta: { ...VIDEO_META, media: { ...VIDEO_MEDIA, browser_playable: false } },
+    proxyStatus: PROXY_STATUS,
+    proxyStart: { mode: "full", job_id: null, total_frames: 96, already_complete: true },
+    repairStart: (() => {
+      let calls = 0;
+      return () => ({ mode: "full", job_id: `repair-reopen-${++calls}`, total_frames: 96, already_complete: false });
+    })(),
+    holdFirstRepairStart: true,
+    terminalJobs: { "repair-reopen-1": "done", "repair-reopen-2": "done" },
+    action: "triage-close-reopen-flight",
+  },
   "triage-stale-open": {
     url: "/objects/boom/videos/aaa/triage",
     config: CONFIG,
@@ -690,19 +797,37 @@ const dom = new JSDOM(
 );
 
 const { window } = dom;
+const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const requests = [];
 const requestLog = [];
+const eventLog = [];
+const jobPolls = new Map();
+const eventSourceCloses = new Map();
 let frameStageMounts = 0;
 let maskFrameRequests = 0;
 let videosRequests = 0;
 let mutationAcked = false;
 let navigatedBeforeMutationAck = false;
+let recoveryOverlayBeforeLoad = false;
+let recoveryOverlayDuringFallback = false;
+let recoveryOverlayAfterLoad = false;
+let pollsWhenClosed = 0;
+let repairsWhileFirstPending = 0;
+let releaseFirstRepairStart = () => undefined;
+const firstRepairStartGate = new Promise((resolve) => {
+  releaseFirstRepairStart = resolve;
+});
 window.confirm = () => true;
+const originalPushState = window.history.pushState.bind(window.history);
+window.history.pushState = (...args) => {
+  eventLog.push(`navigate:${String(args[2] ?? "")}`);
+  return originalPushState(...args);
+};
 
 window.fetch = async (input, init = {}) => {
   const url = String(input);
   requests.push(url);
-  requestLog.push({ url, method: init.method ?? "GET" });
+  requestLog.push({ url, method: init.method ?? "GET", body: init.body });
   if (scenario.delayMetaVideo && url.includes(`/videos/${scenario.delayMetaVideo}/meta`)) {
     await new Promise((resolve) => setTimeout(resolve, 700));
   }
@@ -733,14 +858,60 @@ window.fetch = async (input, init = {}) => {
     };
   }
   if (init.method === "POST" && /\/proxy$/.test(url) && JSON.parse(init.body ?? "{}").force) {
-    const result = scenario.repairStart ?? scenario.proxyStart;
+    const repairNumber = requestLog.filter(
+      (request) => request.method === "POST" && /\/proxy$/.test(request.url),
+    ).length;
+    if (scenario.holdFirstRepairStart && repairNumber === 1) {
+      await firstRepairStartGate;
+    }
+    const configured = scenario.repairStart ?? scenario.proxyStart;
+    const result = typeof configured === "function" ? configured(url) : configured;
     return { ok: true, status: 200, statusText: "OK", json: async () => result };
+  }
+  const jobId = url.match(/\/api\/jobs\/([^/?]+)/)?.[1];
+  if (jobId && (init.method ?? "GET") === "GET") {
+    jobPolls.set(jobId, (jobPolls.get(jobId) ?? 0) + 1);
+    if (scenario.failJobPoll?.includes(jobId)) {
+      return {
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        json: async () => ({ detail: "falha ao acompanhar o job" }),
+      };
+    }
+    const state = scenario.pollingJobs?.[jobId] ?? scenario.terminalJobs?.[jobId] ?? "running";
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({
+        job_id: jobId,
+        kind: "proxy_full",
+        object_id: "boom",
+        video_id: "aaa",
+        state,
+        current: state === "running" ? 1 : 96,
+        total: 96,
+        progress: state === "running" ? 0.01 : 1,
+        message: "acompanhando",
+        error: state === "error" ? (scenario.terminalJobErrors?.[jobId] ?? "job falhou") : null,
+        result: {},
+        queue_pos: 0,
+        user: null,
+      }),
+    };
   }
   if (scenario.action === "review-walk-save" && /\/mask-review\/\d+$/.test(url)) {
     maskFrameRequests += 1;
     if (maskFrameRequests === 2) await new Promise((resolve) => setTimeout(resolve, 120));
   }
   const match = routes.find(([pattern]) => pattern.test(url));
+  if (match && ["PUT", "POST"].includes(init.method) && /\/annotations\/aaa$/.test(url)) {
+    eventLog.push("mutation:ack");
+  }
+  if (match && init.method === "POST" && /\/videos\/aaa\/export$/.test(url)) {
+    eventLog.push("export:ack");
+  }
   return {
     ok: Boolean(match),
     status: match ? 200 : 404,
@@ -752,7 +923,12 @@ window.fetch = async (input, init = {}) => {
 window.EventSource = class {
   constructor(url) {
     this.url = String(url);
-    const jobId = this.url.match(/\/api\/jobs\/([^/]+)\/events/)?.[1];
+    this.jobId = this.url.match(/\/api\/jobs\/([^/]+)\/events/)?.[1];
+    const jobId = this.jobId;
+    if (scenario.sseFailureJobs?.includes(jobId)) {
+      setTimeout(() => this.onerror?.(new window.Event("error")), 10);
+      return;
+    }
     const state = scenario.terminalJobs?.[jobId];
     if (state) {
       setTimeout(() => this.onmessage?.({ data: JSON.stringify({
@@ -763,14 +939,16 @@ window.EventSource = class {
         total: 96,
         progress: 1,
         message: "pronto",
-        error: null,
+        error: state === "error" ? (scenario.terminalJobErrors?.[jobId] ?? "job falhou") : null,
         result: {},
         queue_pos: 0,
         user: null,
       }) }), 25);
     }
   }
-  close() {}
+  close() {
+    eventSourceCloses.set(this.jobId, (eventSourceCloses.get(this.jobId) ?? 0) + 1);
+  }
 };
 window.ResizeObserver = class {
   observe() {}
@@ -835,6 +1013,12 @@ globalThis.document = window.document;
 globalThis.fetch = window.fetch;
 globalThis.EventSource = window.EventSource;
 globalThis.ResizeObserver = window.ResizeObserver;
+if (scenario.fastPoll) {
+  const fastSetInterval = (callback, delay, ...args) =>
+    nativeSetInterval(callback, Math.min(Number(delay) || 0, 20), ...args);
+  globalThis.setInterval = fastSetInterval;
+  window.setInterval = fastSetInterval;
+}
 
 const bundle = readdirSync(join(staticDir, "assets")).find(
   (file) => file.endsWith(".js"),
@@ -907,6 +1091,7 @@ if (scenario.action === "submit-triage") {
 if (scenario.action === "submit-triage-slow-refresh" || scenario.action === "submit-triage-failure") {
   requests.length = 0;
   requestLog.length = 0;
+  eventLog.length = 0;
   const action = [...window.document.querySelectorAll("button")].find(
     (element) => element.textContent?.includes("Salvar, enviar ao SAM3"),
   );
@@ -947,6 +1132,59 @@ if (scenario.action === "triage-full-frame-fallback") {
   fallback?.dispatchEvent(new window.Event("error"));
   fallback?.dispatchEvent(new window.Event("error"));
   await new Promise((resolve) => setTimeout(resolve, 150));
+}
+if (
+  scenario.action === "triage-frame-recovery-success" ||
+  scenario.action === "triage-frame-recovery-failure" ||
+  scenario.action === "triage-sse-close" ||
+  scenario.action === "triage-close-reopen-flight"
+) {
+  requests.length = 0;
+  requestLog.length = 0;
+  const failBothTiers = async () => {
+    const full = window.document.querySelector('img[alt^="frame "]');
+    full?.dispatchEvent(new window.Event("error"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const small = window.document.querySelector('img[alt^="frame "]');
+    small?.dispatchEvent(new window.Event("error"));
+  };
+  await failBothTiers();
+
+  if (scenario.action === "triage-frame-recovery-success") {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    recoveryOverlayBeforeLoad = (window.document.body.textContent ?? "").includes("extraindo os frames");
+    window.document.querySelector('img[alt^="frame "]')?.dispatchEvent(new window.Event("error"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    recoveryOverlayDuringFallback = (window.document.body.textContent ?? "").includes("extraindo os frames");
+    window.document.querySelector('img[alt^="frame "]')?.dispatchEvent(new window.Event("load"));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    recoveryOverlayAfterLoad = (window.document.body.textContent ?? "").includes("extraindo os frames");
+  } else if (scenario.action === "triage-frame-recovery-failure") {
+    await new Promise((resolve) => setTimeout(resolve, scenario.fastPoll ? 120 : 100));
+  } else if (scenario.action === "triage-sse-close") {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
+    next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    pollsWhenClosed = jobPolls.get("repair-poll-running") ?? 0;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } else {
+    const next = window.document.querySelector('button[title="próximo vídeo (PageDown)"]');
+    next?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const previous = window.document.querySelector('button[title="vídeo anterior (PageUp)"]');
+    previous?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await failBothTiers();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    repairsWhileFirstPending = requestLog.filter(
+      (request) => request.method === "POST" &&
+        /\/videos\/aaa\/proxy$/.test(request.url) &&
+        JSON.parse(request.body ?? "{}").force === true,
+    ).length;
+    releaseFirstRepairStart();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 if (scenario.action === "triage-stale-open") {
   requests.length = 0;
@@ -1025,10 +1263,51 @@ if (scenario.action === "triage-window-bootstrap") {
 }
 if (scenario.action === "triage-full-frame-fallback") {
   const repairs = requestLog.filter(
-    (request) => request.method === "POST" && /\/videos\/aaa\/proxy$/.test(request.url),
+    (request) => request.method === "POST" &&
+      /\/videos\/aaa\/proxy$/.test(request.url) &&
+      JSON.parse(request.body ?? "{}").force === true,
   );
   check(!errors.some((item) => item.includes("fallback para small")), "frame full cai para o tier small");
   check(repairs.length === 1, "falha dos dois tiers inicia um unico reparo", `${repairs.length} POSTs`);
+}
+if (scenario.action === "triage-frame-recovery-success") {
+  const expectedPattern = scenario.expectedRepairKind === "window" ? /\/window$/ : /\/proxy$/;
+  const repairRequests = requestLog.filter(
+    (request) => request.method === "POST" && expectedPattern.test(request.url),
+  );
+  check(repairRequests.length === 1, "frame ausente inicia exatamente um reparo", `${repairRequests.length} POSTs`);
+  if (scenario.expectedRepairKind === "window") {
+    const body = JSON.parse(repairRequests[0]?.body ?? "{}");
+    check(body.force === true, "janela anunciada mas ausente força reextração");
+  }
+  check(recoveryOverlayBeforeLoad, "reparo concluído mantém cobertura até o JPEG carregar");
+  check(recoveryOverlayDuringFallback, "fallback após reparo não revela um palco preto");
+  check(!recoveryOverlayAfterLoad, "onLoad remove a cobertura de recuperação");
+}
+if (scenario.action === "triage-frame-recovery-failure") {
+  const currentText = window.document.body.textContent ?? "";
+  check(currentText.includes(scenario.expectedFailure), "falha de recuperação é acionável", currentText.slice(-180));
+  check(
+    [...window.document.querySelectorAll("button")].some((button) => button.textContent?.includes("tentar novamente")),
+    "falha oferece tentativa manual",
+  );
+}
+if (scenario.action === "triage-sse-close") {
+  const finalPolls = jobPolls.get("repair-poll-running") ?? 0;
+  check(pollsWhenClosed > 0, "fallback por polling iniciou");
+  check(finalPolls === pollsWhenClosed, "fechar a tela encerra polling do reparo", `${pollsWhenClosed} -> ${finalPolls}`);
+}
+if (scenario.action === "triage-close-reopen-flight") {
+  const repairs = requestLog.filter(
+    (request) => request.method === "POST" &&
+      /\/videos\/aaa\/proxy$/.test(request.url) &&
+      JSON.parse(request.body ?? "{}").force === true,
+  );
+  check(
+    repairsWhileFirstPending === 2 && repairs.length === 2,
+    "reabrir o mesmo vídeo não reutiliza flight da sessão fechada",
+    `${repairsWhileFirstPending} pendentes; ${repairs.length} total`,
+  );
 }
 if (scenario.action === "submit-triage-slow-refresh") {
   const saveAt = requestLog.findIndex(
@@ -1038,6 +1317,13 @@ if (scenario.action === "submit-triage-slow-refresh") {
     (request) => request.method === "POST" && /\/videos\/aaa\/export$/.test(request.url),
   );
   check(saveAt >= 0 && exportAt > saveAt, "salvamento precede o enqueue da exportacao");
+  check(
+    eventLog[0] === "mutation:ack" &&
+      eventLog[1] === "export:ack" &&
+      eventLog[2]?.includes("/objects/boom/videos/eee/triage"),
+    "ordem exata é ACK da mutação -> ACK do export -> navegação",
+    eventLog.join(" | "),
+  );
   check(!navigatedBeforeMutationAck, "navegação espera o ACK da mutação");
   check(window.location.pathname.includes("/eee/"), "navegacao nao espera refresh lento", window.location.pathname);
 }

@@ -201,10 +201,13 @@ export const api = {
       body: JSON.stringify({ force }),
     }),
 
-  startWindow: (videoId: string, center: number, radius?: number) =>
+  startWindow: (videoId: string, center: number, radius?: number, force = false) =>
     request<{ job_id: string | null; start: number; end: number; already_available: boolean }>(
       `${O()}/videos/${videoId}/window`,
-      { method: "POST", body: JSON.stringify({ center, ...(radius ? { radius } : {}) }) },
+      {
+        method: "POST",
+        body: JSON.stringify({ center, ...(radius ? { radius } : {}), force }),
+      },
     ),
 
   proxyStatus: (videoId: string) =>
@@ -534,37 +537,70 @@ export const api = {
 export function watchJob(
   jobId: string,
   onUpdate: (job: JobInfo) => void,
+  onFailure?: (error: Error) => void,
 ): () => void {
   const source = new EventSource(`/api/jobs/${jobId}/events`);
-  let closed = false;
+  let stopped = false;
+  let polling = false;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    source.close();
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  const fail = (error: unknown) => {
+    if (stopped) return;
+    const reason = error instanceof Error ? error : new Error(String(error));
+    stop();
+    onFailure?.(reason);
+  };
+
+  const publish = (job: JobInfo) => {
+    if (stopped) return;
+    try {
+      onUpdate(job);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    if (job.state === "done" || job.state === "cancelled" || job.state === "error") {
+      stop();
+    }
+  };
+
+  const pollOnce = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      publish(await api.job(jobId));
+    } catch (error) {
+      fail(new Error(`Falha ao acompanhar o job ${jobId}: ${(error as Error).message}`));
+    } finally {
+      polling = false;
+    }
+  };
 
   source.onmessage = (event) => {
-    const job = JSON.parse(event.data) as JobInfo;
-    onUpdate(job);
-    if (job.state === "done" || job.state === "cancelled" || job.state === "error") {
-      closed = true;
-      source.close();
+    try {
+      publish(JSON.parse(event.data) as JobInfo);
+    } catch (error) {
+      fail(new Error(`Resposta inválida ao acompanhar o job ${jobId}: ${(error as Error).message}`));
     }
   };
 
   // Se o SSE cair (proxy de dev, sleep da máquina), o polling assume.
   source.onerror = () => {
-    if (closed) return;
+    if (stopped || pollTimer !== null) return;
     source.close();
-    closed = true;
-    const poll = setInterval(async () => {
-      try {
-        const job = await api.job(jobId);
-        onUpdate(job);
-        if (job.state !== "running" && job.state !== "queued") clearInterval(poll);
-      } catch {
-        clearInterval(poll);
-      }
-    }, 1000);
+    void pollOnce();
+    pollTimer = setInterval(() => void pollOnce(), 1000);
   };
 
-  return () => {
-    closed = true;
-    source.close();
-  };
+  return stop;
 }

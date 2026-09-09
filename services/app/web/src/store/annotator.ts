@@ -183,7 +183,12 @@ interface AnnotatorState {
   save: () => Promise<boolean>;
   queueExport: () => Promise<{ job_id: string; total: number } | null>;
   markNoBoom: () => Promise<boolean>;
-  ensureFrameAvailable: (frame: number) => Promise<void>;
+  ensureFrameAvailable: (frame: number) => Promise<FrameRecoveryOutcome>;
+}
+
+export interface FrameRecoveryOutcome {
+  proxy: ProxyStatus;
+  jobId: string | null;
 }
 
 function toPayload(intervals: DraftInterval[], label: string): IntervalPayload[] {
@@ -218,7 +223,24 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let beaconBound: string | null = null;
 let openGeneration = 0;
 let stopProxyWatcher: (() => void) | null = null;
-const frameAvailabilityFlights = new Map<string, Promise<void>>();
+
+class FrameRecoveryCancelled extends Error {
+  constructor() {
+    super("recuperação de frame cancelada");
+  }
+}
+
+interface FrameAvailabilityFlight {
+  promise: Promise<FrameRecoveryOutcome>;
+  cancel: () => void;
+}
+
+const frameAvailabilityFlights = new Map<string, FrameAvailabilityFlight>();
+
+function cancelFrameAvailabilityFlights(): void {
+  for (const flight of frameAvailabilityFlights.values()) flight.cancel();
+  frameAvailabilityFlights.clear();
+}
 
 function stopHeartbeat(): void {
   if (heartbeatTimer !== null) {
@@ -285,6 +307,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   open: async (videoId) => {
     const generation = ++openGeneration;
     const isActive = () => openGeneration === generation && get().videoId === videoId;
+    cancelFrameAvailabilityFlights();
     stopProxyWatcher?.();
     stopProxyWatcher = null;
     stopHeartbeat();
@@ -362,7 +385,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         status.mode === "window" &&
         !status.available_ranges.some(([start, end]) => start <= 0 && 0 <= end)
       ) {
-        void get().ensureFrameAvailable(0);
+        void get().ensureFrameAvailable(0).catch(() => undefined);
       }
 
       if (started.job_id) {
@@ -394,6 +417,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
 
   close: () => {
     openGeneration += 1;
+    cancelFrameAvailabilityFlights();
     stopProxyWatcher?.();
     stopProxyWatcher = null;
     const { videoId, readOnly } = get();
@@ -663,14 +687,30 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
 
   ensureFrameAvailable: async (frame) => {
     const { videoId, proxy } = get();
-    if (!videoId || !proxy) return;
+    if (!videoId || !proxy) throw new Error("vídeo ou proxy indisponível");
 
-    const key = `${videoId}:${frame}`;
+    const generation = openGeneration;
+    const key = `${generation}:${videoId}:${frame}`;
     const existing = frameAvailabilityFlights.get(key);
-    if (existing) return existing;
+    if (existing) return existing.promise;
 
-    const flight = (async () => {
-      const isActive = () => get().videoId === videoId;
+    let cancelled = false;
+    let stopWatcher: (() => void) | null = null;
+    let rejectCancellation: (error: Error) => void = () => undefined;
+    const cancellation = new Promise<never>((_, reject) => {
+      rejectCancellation = reject;
+    });
+    const isActive = () =>
+      !cancelled && openGeneration === generation && get().videoId === videoId;
+    const assertActive = () => {
+      if (!isActive()) throw new FrameRecoveryCancelled();
+    };
+    const hasFrame = (status: ProxyStatus) =>
+      status.complete || status.available_ranges.some(([start, end]) => start <= frame && frame <= end);
+    const fingerprint = (status: ProxyStatus) =>
+      JSON.stringify([status.mode, status.complete, status.frame_count, status.available_ranges]);
+
+    const run = async (): Promise<FrameRecoveryOutcome> => {
       let jobId: string | null = null;
 
       if (proxy.complete) {
@@ -681,44 +721,84 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         const covered = proxy.available_ranges.some(
           ([start, end]) => start <= frame && frame <= end,
         );
-        if (covered) return;
-        jobId = (await api.startWindow(videoId, frame)).job_id;
+        jobId = (await api.startWindow(videoId, frame, undefined, covered)).job_id;
       } else {
-        // O proxy completo já possui watcher próprio. Não crie um FFmpeg rival.
-        return;
+        const active = proxy.jobs.find(
+          (job) => job.kind === "proxy_full" && ["queued", "running"].includes(job.state),
+        );
+        jobId = active?.job_id ?? (await api.startProxy(videoId, true)).job_id;
       }
+      assertActive();
 
       if (jobId) {
-        await new Promise<void>((resolve) => {
-          let stop: () => void = () => undefined;
-          stop = watchJob(jobId!, (job) => {
-            if (!isActive() || !["running", "queued"].includes(job.state)) {
-              stop();
-              resolve();
-              return;
-            }
-            set({ job });
-          });
+        await new Promise<void>((resolve, reject) => {
+          stopWatcher = watchJob(
+            jobId!,
+            (job) => {
+              if (!isActive()) {
+                stopWatcher?.();
+                reject(new FrameRecoveryCancelled());
+                return;
+              }
+              if (["running", "queued"].includes(job.state)) {
+                set({ job });
+                return;
+              }
+              stopWatcher?.();
+              if (job.state === "done") {
+                resolve();
+                return;
+              }
+              reject(
+                new Error(
+                  job.state === "cancelled"
+                    ? "Reparo de frame cancelado. Tente novamente."
+                    : job.error || "Falha ao extrair o frame.",
+                ),
+              );
+            },
+            reject,
+          );
         });
       }
 
-      if (!isActive()) return;
+      assertActive();
       const nextStatus = await api.proxyStatus(videoId);
-      if (isActive()) set({ proxy: nextStatus, job: null });
-    })()
+      assertActive();
+      if (!jobId && fingerprint(nextStatus) === fingerprint(proxy)) {
+        throw new Error("O reparo não iniciou. Tente novamente.");
+      }
+      if (!hasFrame(nextStatus)) {
+        throw new Error("O reparo terminou sem disponibilizar este frame. Tente novamente.");
+      }
+      set({ proxy: nextStatus, job: null });
+      return { proxy: nextStatus, jobId };
+    };
+
+    const record: FrameAvailabilityFlight = {
+      promise: Promise.resolve({ proxy, jobId: null }),
+      cancel: () => {
+        if (cancelled) return;
+        cancelled = true;
+        stopWatcher?.();
+        rejectCancellation(new FrameRecoveryCancelled());
+      },
+    };
+    const promise = Promise.race([run(), cancellation])
       .catch((error) => {
-        if (get().videoId === videoId) {
+        if (!(error instanceof FrameRecoveryCancelled) && isActive()) {
           set({ error: (error as Error).message, job: null });
         }
         throw error;
       })
       .finally(() => {
-        if (frameAvailabilityFlights.get(key) === flight) {
+        stopWatcher?.();
+        if (frameAvailabilityFlights.get(key) === record) {
           frameAvailabilityFlights.delete(key);
         }
       });
-
-    frameAvailabilityFlights.set(key, flight);
-    return flight;
+    record.promise = promise;
+    frameAvailabilityFlights.set(key, record);
+    return promise;
   },
 }));

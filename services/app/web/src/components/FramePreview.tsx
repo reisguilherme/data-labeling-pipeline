@@ -48,6 +48,7 @@ export function FramePreview({ videoId }: { videoId: string }) {
   const [panning, setPanning] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const recoveryAttemptRef = useRef<string | null>(null);
+  const recoverySucceededRef = useRef<string | null>(null);
   const previousAvailabilityRef = useRef<string | null>(null);
 
   const interval = selected >= 0 ? intervals[selected] : null;
@@ -93,36 +94,23 @@ export function FramePreview({ videoId }: { videoId: string }) {
 
   useEffect(() => {
     recoveryAttemptRef.current = null;
+    recoverySucceededRef.current = null;
     setRequestedTier(preferredTier);
     setMissing(false);
     setRecoveryError(null);
     setLoading(true);
-  }, [videoId, frame, preferredTier, availabilityKey]);
+  }, [videoId, frame, preferredTier]);
 
   useEffect(() => {
     if (
       previousAvailabilityRef.current !== null &&
       previousAvailabilityRef.current !== availabilityKey
     ) {
+      setLoading(true);
       setReloadKey((value) => value + 1);
     }
     previousAvailabilityRef.current = availabilityKey;
   }, [availabilityKey]);
-
-  // O frame pode não existir ainda porque a extração está em andamento. Quando o
-  // progresso alcança este índice, recarrega — um <img> com o mesmo src não
-  // refaz o request sozinho, daí a chave de reload.
-  const covered =
-    proxy?.complete ||
-    (proxy?.available_ranges.some(([start, end]) => start <= frame && frame <= end) ?? false);
-
-  useEffect(() => {
-    if (missing && covered) {
-      setMissing(false);
-      setLoading(true);
-      setReloadKey((value) => value + 1);
-    }
-  }, [missing, covered]);
 
   useEffect(() => {
     const image = imgRef.current;
@@ -151,8 +139,16 @@ export function FramePreview({ videoId }: { videoId: string }) {
 
   const recoverFrame = useCallback(() => {
     const recoveryKey = `${videoId}:${frame}:${availabilityKey}`;
-    if (recoveryAttemptRef.current === recoveryKey) return;
+    if (recoveryAttemptRef.current === recoveryKey) {
+      if (recoverySucceededRef.current === recoveryKey) {
+        setMissing(true);
+        setLoading(false);
+        setRecoveryError("O frame continuou indisponível após o reparo. Tente novamente.");
+      }
+      return;
+    }
     recoveryAttemptRef.current = recoveryKey;
+    recoverySucceededRef.current = null;
     setMissing(true);
     setLoading(true);
     setRecoveryError(null);
@@ -161,8 +157,8 @@ export function FramePreview({ videoId }: { videoId: string }) {
       .ensureFrameAvailable(frame)
       .then(() => {
         if (recoveryAttemptRef.current !== recoveryKey) return;
+        recoverySucceededRef.current = recoveryKey;
         setRequestedTier(preferredTier);
-        setMissing(false);
         setLoading(true);
         setReloadKey((value) => value + 1);
       })
@@ -270,13 +266,14 @@ export function FramePreview({ videoId }: { videoId: string }) {
           draggable={false}
           onLoad={() => {
             setLoading(false);
+            setMissing(false);
+            setRecoveryError(null);
             measure();
           }}
           onError={() => {
             setLoading(false);
             if (requestedTier === "full") {
               setRequestedTier("small");
-              setMissing(false);
               setRecoveryError(null);
               setLoading(true);
               return;
@@ -355,6 +352,7 @@ export function FramePreview({ videoId }: { videoId: string }) {
                   className="rounded border border-zinc-700 px-3 py-1 text-zinc-200 hover:bg-zinc-800"
                   onClick={() => {
                     recoveryAttemptRef.current = null;
+                    recoverySucceededRef.current = null;
                     recoverFrame();
                   }}
                 >

@@ -141,6 +141,7 @@ async def start_proxy(
 class WindowPayload(BaseModel):
     center: int
     radius: int = WINDOW_RADIUS
+    force: bool = False
 
 
 @router.post("/{video_id}/window")
@@ -158,14 +159,15 @@ async def start_window(
     if frame_count:
         end = min(end, frame_count - 1)
     end = max(end, start)
-    for existing_start, existing_end in proxy.available_ranges(ctx, video_id):
-        if existing_start <= start and end <= existing_end:
-            return {
-                "job_id": None,
-                "start": existing_start,
-                "end": existing_end,
-                "already_available": True,
-            }
+    if not payload.force:
+        for existing_start, existing_end in proxy.available_ranges(ctx, video_id):
+            if existing_start <= start and end <= existing_end:
+                return {
+                    "job_id": None,
+                    "start": existing_start,
+                    "end": existing_end,
+                    "already_available": True,
+                }
     if durable_jobs.enabled():
         job_id = durable_jobs.create(
             kind="proxy_window",
@@ -187,7 +189,13 @@ async def start_window(
             "already_available": False,
         }
     job, start, end = await proxy.start_window(
-        ctx, video_id, payload.center, payload.radius, frame_count, client_id=client_id
+        ctx,
+        video_id,
+        payload.center,
+        payload.radius,
+        frame_count,
+        client_id=client_id,
+        force=payload.force,
     )
     return {
         "job_id": job.job_id if job else None,

@@ -277,6 +277,7 @@ async def start_window(
     radius: int = WINDOW_RADIUS,
     frame_count: int | None = None,
     client_id: str | None = None,
+    force: bool = False,
 ) -> tuple[Job | None, int, int]:
     """Extrai uma janela em torno de `center`. Devolve (job|None, start, end)."""
     start = max(center - radius, 0)
@@ -286,9 +287,10 @@ async def start_window(
     if end < start:
         end = start
 
-    for existing_start, existing_end in _windows_for(ctx, video_id):
-        if existing_start <= start and end <= existing_end:
-            return None, existing_start, existing_end
+    if not force:
+        for existing_start, existing_end in _windows_for(ctx, video_id):
+            if existing_start <= start and end <= existing_end:
+                return None, existing_start, existing_end
 
     for job in jobs.active_for_video(ctx.object_id, video_id):
         if job.kind == "proxy_window" and job.result.get("start") == start:
