@@ -203,7 +203,15 @@ async def cache_info(ctx: ObjectContext = Depends(get_object)) -> dict:
 
 @scoped.delete("/cache")
 async def clear_cache(
-    video_id: str | None = None, ctx: ObjectContext = Depends(get_object)
+    video_id: str | None = None,
+    ctx: ObjectContext = Depends(get_object),
+    user: User = Depends(current_user),
 ) -> dict:
-    proxy.clear_cache(ctx, video_id)
+    del user
+    try:
+        proxy.clear_cache(ctx, video_id)
+    except KeyError as exc:
+        raise HTTPException(404, "video nao encontrado") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return await cache_info(ctx=ctx)

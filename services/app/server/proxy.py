@@ -1624,11 +1624,33 @@ def _evict_if_needed(ctx) -> None:
         log.warning("falha na manutenção LRU do cache", exc_info=True)
 
 
+def _clear_cache_target(ctx, category: str, video_id: str | None) -> Path:
+    cache_root = ctx.cache_dir
+    category_root = cache_root / category
+    _require_cache_child(category_root, cache_root)
+    if category_root.is_symlink():
+        raise ValueError("raiz de cache nao pode ser symlink")
+
+    if video_id is None:
+        return category_root
+
+    video = ctx.index.get(video_id)
+    if video is None or video.video_id != video_id:
+        raise KeyError(video_id)
+    target = category_root / video.video_id
+    _require_cache_child(target, category_root)
+    _require_cache_child(target, cache_root)
+    if target.is_symlink():
+        raise ValueError("cache do video nao pode ser symlink")
+    return target
+
+
 def clear_cache(ctx, video_id: str | None = None) -> None:
-    if video_id:
-        shutil.rmtree(proxy_dir(ctx, video_id), ignore_errors=True)
-        shutil.rmtree(ctx.cache_dir / "windows" / video_id, ignore_errors=True)
-        return
-    for sub in ("proxy", "windows"):
-        shutil.rmtree(ctx.cache_dir / sub, ignore_errors=True)
-        (ctx.cache_dir / sub).mkdir(parents=True, exist_ok=True)
+    targets = tuple(
+        _clear_cache_target(ctx, category, video_id)
+        for category in ("proxy", "windows")
+    )
+    for target in targets:
+        shutil.rmtree(target, ignore_errors=True)
+        if video_id is None:
+            target.mkdir(parents=True, exist_ok=True)
