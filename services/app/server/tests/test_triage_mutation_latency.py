@@ -53,6 +53,11 @@ class _Index:
     def cached_probe(self, _video_id: str):
         return dict(self.media) if self.media is not None else None
 
+    def resolve_path(self, video_id: str) -> Path:
+        if video_id != self.video.video_id:
+            raise KeyError(video_id)
+        return self.video.abspath
+
     async def probe(self, _video_id: str, *, count_packets: bool = False):
         self.probe_calls.append(count_packets)
         return {
@@ -118,6 +123,71 @@ async def _no_lock(*_args, **_kwargs):
 
 
 class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
+    async def _assert_local_export_failure_preserves_previous(
+        self, *, child_state: str
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ctx = _context(Path(temporary))
+            entry = {
+                "status": "in_progress",
+                "annotation_revision": 5,
+                "media": {"width": 640, "height": 360},
+                "intervals": [
+                    {
+                        "segment": "seg_00",
+                        "index": 0,
+                        "frame_count": 1,
+                        "start_frame": 0,
+                        "end_frame": 0,
+                        "prompt_frame": 0,
+                        "bboxes": [],
+                        "flags": {},
+                    }
+                ],
+            }
+            await ctx.store.put_entry("clip.mp4", entry)
+            root = export_module.export_root_for(ctx, ctx.index.video)
+            old_frame = root / "seg_00" / "old.jpg"
+            old_frame.parent.mkdir(parents=True)
+            old_frame.write_bytes(b"previous-generation")
+            old_owner = export_module.export_owner(ctx, ctx.index.video, 4)
+            export_module.write_export_owner(root, old_owner)
+
+            async def finish_child(child, _argv):
+                child.state = child_state
+                child.error = "ffmpeg falhou" if child_state == "error" else None
+                return child
+
+            with (
+                patch(
+                    "server.export.ffmpeg.resolve",
+                    return_value=SimpleNamespace(version="test"),
+                ),
+                patch(
+                    "server.export.ffmpeg.export_segment_argv",
+                    return_value=["fake-ffmpeg"],
+                ),
+                patch("server.export.jobs.run", side_effect=finish_child),
+            ):
+                job = await export_module.export_video(ctx, "video-1", entry)
+                for _ in range(100):
+                    if job.terminal:
+                        break
+                    await asyncio.sleep(0)
+
+            self.assertTrue(job.terminal, "job local nao finalizou")
+            self.assertEqual(job.state, "error")
+            self.assertEqual(old_frame.read_bytes(), b"previous-generation")
+            self.assertEqual(export_module.read_export_owner(root), old_owner)
+            self.assertFalse(any(ctx.output_root.glob(f".{root.name}.export-*.part")))
+
+    async def test_local_export_ffmpeg_failure_preserves_previous_export(self) -> None:
+        await self._assert_local_export_failure_preserves_previous(child_state="error")
+
+    async def test_local_export_count_failure_preserves_previous_export(self) -> None:
+        # O filho termina com exit 0, mas nenhum JPEG foi gerado.
+        await self._assert_local_export_failure_preserves_previous(child_state="done")
+
     async def test_export_roots_are_stable_and_distinct_for_equal_stems(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             ctx = _context(Path(temporary))

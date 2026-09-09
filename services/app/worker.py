@@ -414,60 +414,13 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
             selected_root = video_export.export_root_for(ctx, video)
             if selected_root.resolve() != root.resolve():
                 raise ValueError("raiz do export mudou antes da publicacao")
-            root_created = False
-            if root.exists():
-                if not video_export.same_export_identity(
-                    video_export.read_export_owner(root), expected_owner
-                ):
-                    raise ValueError(
-                        "raiz de export existente sem ownership verificavel"
-                    )
-            else:
-                root.mkdir(parents=True)
-                root_created = True
-            publish_trash.mkdir()
-            moved_old: list[str] = []
-            published: list[str] = []
-            try:
-                for child in sorted(root.iterdir(), key=lambda path: path.name):
-                    if not child.name.startswith("seg_"):
-                        continue
-                    if child.is_symlink():
-                        raise ValueError("segmento publicado nao pode ser link simbolico")
-                    if not child.is_dir():
-                        if child.name in keep:
-                            raise ValueError("destino de segmento nao e diretorio")
-                        continue
-                    child.replace(publish_trash / child.name)
-                    moved_old.append(child.name)
-                for segment in segments:
-                    (staging / segment).replace(root / segment)
-                    published.append(segment)
-                video_export.write_export_owner(root, expected_owner)
-            except Exception:
-                # Falhas normais de publicação restauram a geração anterior.
-                # Em uma queda abrupta a lixeira permanece para recuperação,
-                # em vez de ser apagada no próximo retry.
-                for segment in reversed(published):
-                    current = root / segment
-                    original_staging = staging / segment
-                    if current.exists() and not original_staging.exists():
-                        current.replace(original_staging)
-                for segment in moved_old:
-                    previous = publish_trash / segment
-                    destination = root / segment
-                    if previous.exists() and not destination.exists():
-                        previous.replace(destination)
-                try:
-                    publish_trash.rmdir()
-                except OSError:
-                    pass
-                if root_created:
-                    try:
-                        root.rmdir()
-                    except OSError:
-                        pass
-                raise
+            video_export.publish_staged_export(
+                root,
+                staging,
+                segments,
+                expected_owner,
+                publish_trash,
+            )
 
         if publish_trash.exists():
             try:
@@ -559,6 +512,7 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
                 return deferred("owner_marker_missing")
             if actual_owner != expected_owner:
                 return deferred("owner_mismatch")
+            candidates: list[Path] = []
             for child in sorted(root.iterdir(), key=lambda path: path.name):
                 if not child.name.startswith("seg_"):
                     continue
@@ -566,6 +520,17 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
                     raise ValueError("segmento de export nao pode ser link simbolico")
                 if not child.is_dir():
                     continue
+                candidates.append(child)
+
+            # A estrutura inteira e a lease são validadas antes do primeiro
+            # rename. Depois que o commit começa não há mais cancelamento capaz
+            # de deixar metade dos segmentos no root e metade na lixeira.
+            if trash.exists() and not trash.is_dir():
+                raise ValueError("lixeira de cleanup invalida")
+            for child in candidates:
+                destination = trash / child.name
+                if destination.exists() or destination.is_symlink():
+                    raise ValueError("lixeira de cleanup contem segmento conflitante")
                 if not queue.update_progress(
                     str(job["id"]),
                     token,
@@ -576,9 +541,38 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
                     },
                 ):
                     raise Cancelled("cancelamento solicitado")
-                trash.mkdir(exist_ok=True)
-                child.replace(trash / child.name)
-                removed.append(child.name)
+
+            trash_created = False
+            moved: list[Path] = []
+            try:
+                if candidates and not trash.exists():
+                    trash.mkdir()
+                    trash_created = True
+                for child in candidates:
+                    child.replace(trash / child.name)
+                    moved.append(child)
+                    removed.append(child.name)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                for child in reversed(moved):
+                    previous = trash / child.name
+                    try:
+                        if (previous.exists() or previous.is_symlink()) and not (
+                            child.exists() or child.is_symlink()
+                        ):
+                            previous.replace(child)
+                    except Exception as rollback_exc:  # noqa: BLE001
+                        rollback_errors.append(rollback_exc)
+                if trash_created:
+                    try:
+                        trash.rmdir()
+                    except OSError as rollback_exc:
+                        rollback_errors.append(rollback_exc)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"cleanup falhou e rollback ficou incompleto: {rollback_errors[0]}"
+                    ) from exc
+                raise
 
     # O lock protege apenas o fence e os renames atômicos. A exclusão de
     # milhares de JPEGs acontece depois, para não bloquear ações da interface.
