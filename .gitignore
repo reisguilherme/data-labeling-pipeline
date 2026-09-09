@@ -49,6 +49,7 @@ model-cache/**
 htmlcov/
 *.tsbuildinfo
 services/app/static/
+graphify-out/
 .superpowers/
 .worktrees/
 
