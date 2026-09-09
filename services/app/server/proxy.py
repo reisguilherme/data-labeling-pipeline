@@ -8,6 +8,7 @@ torno do ponto marcado, com evicção LRU.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import math
@@ -44,15 +45,20 @@ RETIRE_MARKER = ".retired"
 CURRENT_POINTER = "CURRENT"
 GENERATIONS_DIR = "generations"
 WINDOWS_INDEX = "INDEX.json"
+WINDOW_SEQUENCE = ".sequence"
+SWEEP_CURSOR = ".proxy-sweep-cursor"
 MARKER_SCHEMA_VERSION = 2
-WINDOWS_INDEX_SCHEMA_VERSION = 2
+WINDOWS_INDEX_SCHEMA_VERSION = 3
 _MAX_POINTER_BYTES = 128
 _MAX_MARKER_BYTES = 16 * 1024
 _MAX_WINDOWS_INDEX_BYTES = 4 * 1024 * 1024
+_MAX_SWEEP_CURSOR_BYTES = 4 * 1024
 _DEFAULT_GC_DELETE_LIMIT = 8
 GENERATION_RETIRE_GRACE_SECONDS = 120.0
 STAGING_ORPHAN_GRACE_SECONDS = 24 * 60 * 60.0
 _GENERATION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+_GC_TRASH = re.compile(r"^\.gc-[0-9a-f]{32}$")
+_WINDOW_ROOT = re.compile(r"^([0-9]{8,12})_([0-9]{8,12})$")
 
 # "small" alimenta filmstrip e reprodução; "full" é a imagem grande do palco.
 Tier = str
@@ -76,12 +82,15 @@ class ProxyGeneration:
     kind: str | None = None
     start: int | None = None
     end: int | None = None
+    sequence: int | None = None
 
 
 @dataclass(frozen=True)
 class WindowIndexSnapshot:
-    entries: tuple[tuple[int, int, str, int], ...]
-    spans: tuple[tuple[int, int, tuple[tuple[int, int, str], ...]], ...]
+    entries: tuple[tuple[int, int, str, int, str | None], ...]
+    spans: tuple[
+        tuple[int, int, tuple[tuple[int, int, str, str | None], ...]], ...
+    ]
     span_starts: tuple[int, ...]
 
 
@@ -290,7 +299,7 @@ def publish_generation(
     if kind == "window" and generation.frames != end - start + 1:
         raise ValueError("janela não contém todos os frames esperados")
 
-    marker = {
+    marker: dict[str, object] = {
         "schema_version": MARKER_SCHEMA_VERSION,
         "generation": generation.token,
         "job_id": str(job_id),
@@ -305,33 +314,26 @@ def publish_generation(
         "tiers": list(TIERS),
         "created_at": datetime.now(UTC).isoformat(),
     }
-    _fsync_file(staging / COMPLETE_MARKER, json.dumps(marker, sort_keys=True))
 
     final = generations / generation.token
     generations.mkdir(parents=True, exist_ok=True)
     pointer = root / CURRENT_POINTER
     pointer_part = root / f".{generation.token}.CURRENT.part"
     previous_token: str | None = None
-    with _exclusive_file_lock(root / ".publish.lock"):
-        if final.exists():
-            raise FileExistsError(f"geração já existe: {generation.token}")
+    sequence: int | None = None
+
+    def commit_current() -> None:
+        nonlocal previous_token
+        _fsync_file(staging / COMPLETE_MARKER, json.dumps(marker, sort_keys=True))
         staging.replace(final)
         _fsync_directory(generations)
-
-        # O índice vem antes do CURRENT. Se houver falha, o leitor apenas ignora
-        # a entrada sem uma geração atual válida. O inverso deixaria uma janela
-        # já publicada invisível até uma nova atualização do índice.
-        if kind == "window":
-            assert start is not None and end is not None
-            _publish_window_index(root, start, end, cache_root)
-
         try:
             _fsync_file(pointer_part, generation.token + "\n")
-            if publish_guard is not None and not publish_guard():
-                raise RuntimeError("publicação cancelada")
             raw_previous = _bounded_text(pointer, _MAX_POINTER_BYTES)
             if raw_previous is not None and _GENERATION_TOKEN.fullmatch(raw_previous):
                 previous_token = raw_previous
+            if publish_guard is not None and not publish_guard():
+                raise RuntimeError("publicação cancelada")
             os.replace(pointer_part, pointer)
             _fsync_directory(root)
             if previous_token is not None and previous_token != generation.token:
@@ -340,9 +342,33 @@ def publish_generation(
                     if _regular_directory(previous):
                         _fsync_file(previous / RETIRE_MARKER, str(time.time()))
                 except OSError:
-                    log.warning("não foi possível aposentar geração %s", previous_token)
+                    log.warning(
+                        "não foi possível aposentar geração %s", previous_token
+                    )
         finally:
             pointer_part.unlink(missing_ok=True)
+
+    with _exclusive_file_lock(root / ".publish.lock"):
+        if final.exists():
+            raise FileExistsError(f"geração já existe: {generation.token}")
+        if kind == "window":
+            assert start is not None and end is not None
+            base = root.parent
+            _validate_window_root(root, start, end, cache_root)
+            with _exclusive_file_lock(base / ".index.lock"):
+                sequence = _allocate_window_sequence_locked(base)
+                marker["sequence"] = sequence
+                commit_current()
+                _publish_window_index_locked(
+                    root,
+                    start,
+                    end,
+                    generation.token,
+                    sequence,
+                    cache_root,
+                )
+        else:
+            commit_current()
 
     if previous_token is not None and previous_token != generation.token:
         try:
@@ -351,7 +377,14 @@ def publish_generation(
             log.warning("não foi possível agendar GC de %s", root, exc_info=True)
 
     return ProxyGeneration(
-        final, generation.token, generation.frames, generation.tier_counts, kind, start, end
+        final,
+        generation.token,
+        generation.frames,
+        generation.tier_counts,
+        kind,
+        start,
+        end,
+        sequence,
     )
 
 
@@ -370,31 +403,41 @@ def _empty_window_index() -> WindowIndexSnapshot:
 
 
 def _compile_window_spans(
-    entries: tuple[tuple[int, int, str, int], ...],
-) -> tuple[tuple[int, int, tuple[tuple[int, int, str], ...]], ...]:
-    events: dict[int, list[tuple[bool, tuple[int, int, str, int]]]] = {}
+    entries: tuple[tuple[int, int, str, int, str | None], ...],
+) -> tuple[
+    tuple[int, int, tuple[tuple[int, int, str, str | None], ...]], ...
+]:
+    events: dict[
+        int, list[tuple[bool, tuple[int, int, str, int, str | None]]]
+    ] = {}
     for entry in entries:
-        start, end, _, _ = entry
+        start, end, _, _, _ = entry
         events.setdefault(start, []).append((True, entry))
         events.setdefault(end + 1, []).append((False, entry))
 
-    active: dict[int, tuple[int, int, str, int]] = {}
-    spans: list[tuple[int, int, tuple[tuple[int, int, str], ...]]] = []
+    active: set[int] = set()
+    winners: list[tuple[int, int, int, str, str | None]] = []
+    spans: list[
+        tuple[int, int, tuple[tuple[int, int, str, str | None], ...]]
+    ] = []
     points = sorted(events)
     for offset, point in enumerate(points[:-1]):
         for add, entry in events[point]:
+            start, end, name, sequence, generation = entry
             if add:
-                active[entry[3]] = entry
+                active.add(sequence)
+                heapq.heappush(
+                    winners, (-sequence, start, end, name, generation)
+                )
             else:
-                active.pop(entry[3], None)
+                active.discard(sequence)
+        while winners and -winners[0][0] not in active:
+            heapq.heappop(winners)
         next_point = points[offset + 1]
-        if not active or next_point <= point:
+        if not winners or next_point <= point:
             continue
-        candidates = tuple(
-            (entry[0], entry[1], entry[2])
-            for entry in sorted(active.values(), key=lambda item: item[3], reverse=True)
-        )
-        span = (point, next_point - 1, candidates)
+        _, start, end, name, generation = winners[0]
+        span = (point, next_point - 1, ((start, end, name, generation),))
         if spans and spans[-1][1] + 1 == span[0] and spans[-1][2] == span[2]:
             previous = spans[-1]
             spans[-1] = (previous[0], span[1], previous[2])
@@ -406,7 +449,7 @@ def _compile_window_spans(
 @lru_cache(maxsize=256)
 def _parse_windows_index_snapshot(
     path_text: str,
-    identity: tuple[int, int, int, int],
+    identity: tuple[int, int, int, int, int],
 ) -> WindowIndexSnapshot:
     del identity  # compõe a chave; o conteúdo vem do path atômico.
     raw = _bounded_text(Path(path_text), _MAX_WINDOWS_INDEX_BYTES)
@@ -416,13 +459,13 @@ def _parse_windows_index_snapshot(
         data = json.loads(raw)
     except (TypeError, ValueError, RecursionError, OverflowError):
         return _empty_window_index()
-    if not isinstance(data, dict) or data.get("schema_version") not in {1, 2}:
+    if not isinstance(data, dict) or data.get("schema_version") not in {1, 2, 3}:
         return _empty_window_index()
     windows = data.get("windows")
     if type(windows) is not list:
         return _empty_window_index()
 
-    parsed: dict[tuple[int, int], tuple[str, int]] = {}
+    parsed: dict[tuple[int, int], tuple[str, int, str | None]] = {}
     used_sequences: set[int] = set()
     schema_version = data["schema_version"]
     for position, item in enumerate(windows, start=1):
@@ -434,12 +477,29 @@ def _parse_windows_index_snapshot(
         if type(name) is not str or name != f"{start:08d}_{end:08d}":
             return _empty_window_index()
         sequence = item.get("seq", position) if schema_version == 2 else position
+        if schema_version == 3:
+            sequence = item.get("seq")
         if type(sequence) is not int or sequence <= 0 or sequence in used_sequences:
             return _empty_window_index()
+        generation = item.get("generation") if schema_version == 3 else None
+        if generation is not None and (
+            type(generation) is not str or not _GENERATION_TOKEN.fullmatch(generation)
+        ):
+            return _empty_window_index()
+        if schema_version == 3 and generation is None:
+            return _empty_window_index()
+        if (start, end) in parsed:
+            return _empty_window_index()
         used_sequences.add(sequence)
-        parsed[(start, end)] = (name, sequence)
+        parsed[(start, end)] = (name, sequence, generation)
     entries = tuple(
-        (start, end, parsed[(start, end)][0], parsed[(start, end)][1])
+        (
+            start,
+            end,
+            parsed[(start, end)][0],
+            parsed[(start, end)][1],
+            parsed[(start, end)][2],
+        )
         for start, end in sorted(parsed)
     )
     spans = _compile_window_spans(entries)
@@ -454,11 +514,19 @@ def _windows_index(base: Path) -> WindowIndexSnapshot:
         return _empty_window_index()
     if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size > _MAX_WINDOWS_INDEX_BYTES:
         return _empty_window_index()
-    identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+    identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_size,
+    )
     return _parse_windows_index_snapshot(str(path), identity)
 
 
-def _window_candidates(base: Path, frame: int) -> Iterator[tuple[int, int, str]]:
+def _window_candidates(
+    base: Path, frame: int
+) -> Iterator[tuple[int, int, str, str | None]]:
     snapshot = _windows_index(base)
     position = bisect_right(snapshot.span_starts, frame) - 1
     if position < 0:
@@ -468,29 +536,69 @@ def _window_candidates(base: Path, frame: int) -> Iterator[tuple[int, int, str]]
         yield from candidates
 
 
-def _publish_window_index(root: Path, start: int, end: int, cache_root: Path) -> None:
+def _validate_window_root(
+    root: Path, start: int, end: int, cache_root: Path
+) -> Path:
     base = root.parent
     _require_cache_child(base, cache_root)
     expected_name = f"{start:08d}_{end:08d}"
     if root.name != expected_name or root.parent.is_symlink():
         raise ValueError("raiz de janela inválida")
+    return base
 
-    index_path = base / WINDOWS_INDEX
-    lock_path = base / ".index.lock"
-    with _exclusive_file_lock(lock_path):
-        entries = {
-            (item_start, item_end): (name, sequence)
-            for item_start, item_end, name, sequence in _windows_index(base).entries
-        }
-        sequence = max((item[1] for item in entries.values()), default=0) + 1
-        entries[(start, end)] = (expected_name, sequence)
-        _replace_windows_index(base, index_path, entries)
+
+def _allocate_window_sequence_locked(base: Path) -> int:
+    raw = _bounded_text(base / WINDOW_SEQUENCE, 64)
+    try:
+        persisted = int(raw) if raw is not None else 0
+    except (TypeError, ValueError, OverflowError):
+        persisted = 0
+    indexed = max((entry[3] for entry in _windows_index(base).entries), default=0)
+    sequence = max(persisted, indexed) + 1
+    part = base / f".{uuid.uuid4().hex}.{WINDOW_SEQUENCE}.part"
+    try:
+        _fsync_file(part, str(sequence))
+        os.replace(part, base / WINDOW_SEQUENCE)
+        _fsync_directory(base)
+    finally:
+        part.unlink(missing_ok=True)
+    return sequence
+
+
+def _entries_for_index_write(
+    base: Path, cache_root: Path
+) -> dict[tuple[int, int], tuple[str, int, str]]:
+    entries: dict[tuple[int, int], tuple[str, int, str]] = {}
+    for start, end, name, sequence, generation in _windows_index(base).entries:
+        if generation is None:
+            current = current_generation(
+                base / name, expected_kind="window", cache_root=cache_root
+            )
+            if current is None:
+                continue
+            generation = current.token
+        entries[(start, end)] = (name, sequence, generation)
+    return entries
+
+
+def _publish_window_index_locked(
+    root: Path,
+    start: int,
+    end: int,
+    generation: str,
+    sequence: int,
+    cache_root: Path,
+) -> None:
+    base = _validate_window_root(root, start, end, cache_root)
+    entries = _entries_for_index_write(base, cache_root)
+    entries[(start, end)] = (root.name, sequence, generation)
+    _replace_windows_index(base, base / WINDOWS_INDEX, entries)
 
 
 def _replace_windows_index(
     base: Path,
     index_path: Path,
-    entries: dict[tuple[int, int], tuple[str, int]],
+    entries: dict[tuple[int, int], tuple[str, int, str]],
 ) -> None:
     payload = {
         "schema_version": WINDOWS_INDEX_SCHEMA_VERSION,
@@ -500,6 +608,7 @@ def _replace_windows_index(
                 "end": item_end,
                 "root": entries[(item_start, item_end)][0],
                 "seq": entries[(item_start, item_end)][1],
+                "generation": entries[(item_start, item_end)][2],
             }
             for item_start, item_end in sorted(entries)
         ],
@@ -519,10 +628,7 @@ def _remove_window_index(root: Path, start: int, end: int, cache_root: Path) -> 
     _require_cache_child(base, cache_root)
     index_path = base / WINDOWS_INDEX
     with _exclusive_file_lock(base / ".index.lock"):
-        entries = {
-            (item_start, item_end): (name, sequence)
-            for item_start, item_end, name, sequence in _windows_index(base).entries
-        }
+        entries = _entries_for_index_write(base, cache_root)
         current = entries.get((start, end))
         if current is None:
             return True
@@ -540,6 +646,7 @@ def collect_stale_generations(
     max_delete: int = _DEFAULT_GC_DELETE_LIMIT,
     retire_grace_seconds: float = GENERATION_RETIRE_GRACE_SECONDS,
     staging_grace_seconds: float = STAGING_ORPHAN_GRACE_SECONDS,
+    blocking: bool = True,
 ) -> int:
     """Remove gerações imutáveis antigas sem tocar CURRENT ou stagings ativos."""
     _require_cache_child(root, cache_root)
@@ -557,7 +664,9 @@ def collect_stale_generations(
 
     victims: list[Path] = []
     trash: Path | None = None
-    with _exclusive_file_lock(root / ".publish.lock"):
+    with _exclusive_file_lock(root / ".publish.lock", blocking=blocking) as acquired:
+        if not acquired:
+            return 0
         now = time.time()
         current = _bounded_text(root / CURRENT_POINTER, _MAX_POINTER_BYTES)
         protected = current if current is not None and _GENERATION_TOKEN.fullmatch(current) else None
@@ -715,14 +824,267 @@ def current_generation(
         if not _safe_frame(frame_file(tier_dir, frames - 1), path, cache_root):
             return None
     start, end = data.get("start"), data.get("end")
+    sequence = data.get("sequence")
     if kind == "window":
         if type(start) is not int or type(end) is not int or end < start:
             return None
         if frames != end - start + 1:
             return None
+        if sequence is not None and (type(sequence) is not int or sequence <= 0):
+            return None
+    elif sequence is not None:
+        return None
     return ProxyGeneration(
-        path, token, frames, {tier: frames for tier in TIERS}, kind, start, end
+        path,
+        token,
+        frames,
+        {tier: frames for tier in TIERS},
+        kind,
+        start,
+        end,
+        sequence,
     )
+
+
+def _sweep_roots(cache_root: Path) -> list[tuple[str, Path, tuple[int, int] | None]]:
+    """Descobre roots de manutencao; nunca e chamada no caminho de request."""
+    roots: list[tuple[str, Path, tuple[int, int] | None]] = []
+    proxy_base = cache_root / "proxy"
+    if _regular_directory(proxy_base) and _resolved_child(proxy_base, cache_root):
+        try:
+            for root in proxy_base.iterdir():
+                if _regular_directory(root) and _resolved_child(
+                    root, proxy_base, cache_root
+                ):
+                    roots.append(
+                        (root.relative_to(cache_root).as_posix(), root, None)
+                    )
+        except OSError:
+            log.warning(
+                "falha ao enumerar roots de proxy em %s", proxy_base, exc_info=True
+            )
+
+    windows_base = cache_root / "windows"
+    if _regular_directory(windows_base) and _resolved_child(windows_base, cache_root):
+        try:
+            videos = list(windows_base.iterdir())
+        except OSError:
+            videos = []
+            log.warning(
+                "falha ao enumerar videos com janelas em %s",
+                windows_base,
+                exc_info=True,
+            )
+        for video in videos:
+            if not _regular_directory(video) or not _resolved_child(
+                video, windows_base, cache_root
+            ):
+                continue
+            try:
+                for root in video.iterdir():
+                    match = _WINDOW_ROOT.fullmatch(root.name)
+                    if (
+                        match is None
+                        or not _regular_directory(root)
+                        or not _resolved_child(root, video, windows_base, cache_root)
+                    ):
+                        continue
+                    start, end = int(match.group(1)), int(match.group(2))
+                    if end < start or root.name != f"{start:08d}_{end:08d}":
+                        continue
+                    roots.append(
+                        (root.relative_to(cache_root).as_posix(), root, (start, end))
+                    )
+            except OSError:
+                log.warning(
+                    "falha ao enumerar janelas de %s", video, exc_info=True
+                )
+    return sorted(roots, key=lambda item: item[0])
+
+
+def _select_sweep_roots(
+    cache_root: Path,
+    roots: list[tuple[str, Path, tuple[int, int] | None]],
+    max_roots: int,
+) -> list[tuple[str, Path, tuple[int, int] | None]]:
+    if not roots or max_roots == 0:
+        return []
+    cursor = _bounded_text(cache_root / SWEEP_CURSOR, _MAX_SWEEP_CURSOR_BYTES)
+    keys = [item[0] for item in roots]
+    position = bisect_right(keys, cursor) if cursor is not None else 0
+    if position >= len(roots):
+        position = 0
+    count = min(max_roots, len(roots))
+    return [roots[(position + offset) % len(roots)] for offset in range(count)]
+
+
+def _store_sweep_cursor(cache_root: Path, key: str) -> None:
+    if len(key.encode("utf-8")) > _MAX_SWEEP_CURSOR_BYTES:
+        raise ValueError("cursor de sweep excede o limite")
+    part = cache_root / f".{uuid.uuid4().hex}.{SWEEP_CURSOR}.part"
+    try:
+        _fsync_file(part, key)
+        os.replace(part, cache_root / SWEEP_CURSOR)
+        _fsync_directory(cache_root)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _cleanup_gc_trash(
+    root: Path, cache_root: Path, *, max_delete: int
+) -> tuple[int, int]:
+    """Retenta tombstones de GC; rmtree potencialmente lento fica fora da trava."""
+    if max_delete <= 0:
+        return 0, 0
+    victims: list[Path] = []
+    with _exclusive_file_lock(root / ".publish.lock", blocking=False) as acquired:
+        if not acquired:
+            return 0, 0
+        try:
+            for entry in root.iterdir():
+                if len(victims) >= max_delete:
+                    break
+                if (
+                    _GC_TRASH.fullmatch(entry.name)
+                    and _regular_directory(entry)
+                    and _resolved_child(entry, root, cache_root)
+                ):
+                    victims.append(entry)
+        except OSError:
+            return 0, 1
+
+    removed = 0
+    errors = 0
+    for victim in victims:
+        try:
+            shutil.rmtree(victim)
+            removed += 1
+        except FileNotFoundError:
+            # Outro coletor concluiu o mesmo tombstone: estado desejado atingido.
+            removed += 1
+        except OSError:
+            errors += 1
+            log.warning(
+                "falha ao remover tombstone de proxy %s", victim, exc_info=True
+            )
+    return removed, errors
+
+
+def _reconcile_window_index(
+    root: Path,
+    cache_root: Path,
+    start: int,
+    end: int,
+) -> bool:
+    """Reconcilia CURRENT -> INDEX apos crash/publicacao ou eviccao parcial."""
+    base = _validate_window_root(root, start, end, cache_root)
+    with _exclusive_file_lock(root / ".publish.lock", blocking=False) as acquired:
+        if not acquired:
+            return False
+        generation = current_generation(
+            root, expected_kind="window", cache_root=cache_root
+        )
+        if generation is not None and (
+            generation.start != start or generation.end != end
+        ):
+            generation = None
+
+        with _exclusive_file_lock(base / ".index.lock"):
+            snapshot = _windows_index(base)
+            had_legacy_entries = any(entry[4] is None for entry in snapshot.entries)
+            entries = _entries_for_index_write(base, cache_root)
+            key = (start, end)
+            current = entries.get(key)
+            if generation is None:
+                if current is None and not had_legacy_entries:
+                    return False
+                entries.pop(key, None)
+                _replace_windows_index(base, base / WINDOWS_INDEX, entries)
+                return True
+
+            sequence = generation.sequence
+            if sequence is None:
+                sequence = current[1] if current is not None else None
+            if sequence is None:
+                sequence = _allocate_window_sequence_locked(base)
+            wanted = (root.name, sequence, generation.token)
+            if current == wanted and not had_legacy_entries:
+                return False
+            entries[key] = wanted
+            _replace_windows_index(base, base / WINDOWS_INDEX, entries)
+            return True
+
+
+def sweep_cache(
+    ctx,
+    *,
+    max_roots: int = 16,
+    max_delete_per_root: int = _DEFAULT_GC_DELETE_LIMIT,
+    retire_grace_seconds: float = GENERATION_RETIRE_GRACE_SECONDS,
+    staging_grace_seconds: float = STAGING_ORPHAN_GRACE_SECONDS,
+) -> dict[str, int]:
+    """Manutencao limitada e retomavel de artefatos deixados por crashes.
+
+    O cursor e apenas de progresso; toda operacao e idempotente e revalida o
+    root sob a trava de publicacao. Falhas sao contabilizadas e nunca propagadas
+    para o loop de jobs.
+    """
+    if type(max_roots) is not int or max_roots < 0:
+        raise ValueError("limite de roots do sweep invalido")
+    if type(max_delete_per_root) is not int or max_delete_per_root < 0:
+        raise ValueError("limite de remocao do sweep invalido")
+    cache_root = Path(ctx.cache_dir)
+    result = {
+        "roots_scanned": 0,
+        "artifacts_removed": 0,
+        "trash_removed": 0,
+        "index_repairs": 0,
+        "errors": 0,
+    }
+    if not _regular_directory(cache_root) or cache_root.is_symlink():
+        return result
+
+    roots = _select_sweep_roots(cache_root, _sweep_roots(cache_root), max_roots)
+    for key, root, window_range in roots:
+        result["roots_scanned"] += 1
+        try:
+            removed, errors = _cleanup_gc_trash(
+                root, cache_root, max_delete=max_delete_per_root
+            )
+        except Exception:
+            removed, errors = 0, 1
+            log.warning("falha ao recuperar tombstones de %s", root, exc_info=True)
+        result["trash_removed"] += removed
+        result["errors"] += errors
+        remaining = max(max_delete_per_root - removed, 0)
+        if remaining:
+            try:
+                result["artifacts_removed"] += collect_stale_generations(
+                    root,
+                    cache_root,
+                    max_delete=remaining,
+                    retire_grace_seconds=retire_grace_seconds,
+                    staging_grace_seconds=staging_grace_seconds,
+                    blocking=False,
+                )
+            except Exception:
+                result["errors"] += 1
+                log.warning("falha ao coletar artefatos de %s", root, exc_info=True)
+        if window_range is not None:
+            try:
+                if _reconcile_window_index(
+                    root, cache_root, window_range[0], window_range[1]
+                ):
+                    result["index_repairs"] += 1
+            except Exception:
+                result["errors"] += 1
+                log.warning("falha ao reconciliar indice de %s", root, exc_info=True)
+        try:
+            _store_sweep_cursor(cache_root, key)
+        except Exception:
+            result["errors"] += 1
+            log.warning("falha ao persistir cursor do sweep", exc_info=True)
+    return result
 
 
 def is_complete(ctx, video_id: str) -> int | None:
@@ -759,14 +1121,19 @@ def _windows_for(ctx, video_id: str) -> list[tuple[int, int]]:
     except ValueError:
         return []
     ranges: list[tuple[int, int]] = []
-    for start, end, name, _ in _windows_index(base).entries:
+    for cover_start, cover_end, winners in _windows_index(base).spans:
+        if not winners:
+            continue
+        start, end, name, indexed_generation = winners[0]
         entry = base / name
         generation = current_generation(
             entry, expected_kind="window", cache_root=ctx.cache_dir
         )
         if generation is None or generation.start != start or generation.end != end:
             continue
-        ranges.append((start, end))
+        if indexed_generation is not None and generation.token != indexed_generation:
+            continue
+        ranges.append((cover_start, cover_end))
     return sorted(ranges)
 
 
@@ -805,12 +1172,14 @@ def locate_frame(ctx, video_id: str, frame: int, tier: Tier = SMALL) -> Path | N
         _require_cache_child(base, ctx.cache_dir)
     except ValueError:
         return None
-    for start, end, name in _window_candidates(base, frame):
+    for start, end, name, indexed_generation in _window_candidates(base, frame):
         root = base / name
         generation = current_generation(
             root, expected_kind="window", cache_root=ctx.cache_dir
         )
         if generation is None or generation.start != start or generation.end != end:
+            continue
+        if indexed_generation is not None and generation.token != indexed_generation:
             continue
         candidate = frame_file(generation.path / tier, frame - start)
         if _safe_frame(candidate, generation.path, ctx.cache_dir):

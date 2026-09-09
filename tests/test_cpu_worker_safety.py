@@ -219,6 +219,26 @@ class CpuWorkerSafetyTests(unittest.TestCase):
         queue.retry_or_fail.assert_called_once()
         self.assertEqual(queue.claim.call_count, 3)
 
+    def test_worker_runs_proxy_sweep_at_startup_and_periodically_while_idle(self) -> None:
+        class StopWorker(RuntimeError):
+            pass
+
+        queue = MagicMock()
+        queue.claim.side_effect = [None, StopWorker("stop test loop")]
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://unused"}), patch(
+            "services.app.worker.PostgresJobQueue", return_value=queue
+        ), patch(
+            "services.app.worker._run_proxy_maintenance", create=True
+        ) as maintenance, patch(
+            "services.app.worker.time.monotonic", side_effect=[0.0, 301.0]
+        ), patch(
+            "services.app.worker.time.sleep"
+        ):
+            with self.assertRaisesRegex(StopWorker, "stop test loop"):
+                worker_main()
+
+        self.assertEqual(maintenance.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

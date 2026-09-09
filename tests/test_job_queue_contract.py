@@ -73,6 +73,30 @@ class DurableJobContractTests(unittest.TestCase):
                 sql = " ".join(cursor.execute.call_args.args[0].upper().split())
                 self.assertIn("LEASE_EXPIRES_AT > NOW()", sql)
 
+    def test_retry_finishes_cancelled_when_cancellation_won_the_interleaving(self) -> None:
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        emitted: dict[str, str] = {}
+
+        def execute(sql: str, _params: dict) -> None:
+            emitted["sql"] = " ".join(sql.lower().split())
+
+        def fetchone():
+            if "cancel_requested" in emitted["sql"] and "'cancelled'" in emitted["sql"]:
+                return ("cancelled",)
+            return ("queued",)
+
+        cursor.execute.side_effect = execute
+        cursor.fetchone.side_effect = fetchone
+        queue = PostgresJobQueue(lambda: connection)
+
+        state = queue.retry_or_fail(
+            "job", "00000000-0000-0000-0000-000000000001", "worker failed"
+        )
+
+        self.assertEqual(state, "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

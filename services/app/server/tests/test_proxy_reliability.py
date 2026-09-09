@@ -42,6 +42,17 @@ class ProxyReliabilityTests(unittest.TestCase):
             job_id="job-1",
         )
 
+    def _window_staging(
+        self, start: int, end: int, payload: bytes = b"jpeg"
+    ) -> tuple[Path, Path]:
+        root = proxy.window_dir(self.ctx, "video-1", start, end)
+        staging = proxy.new_staging_generation(root)
+        for tier in proxy.TIERS:
+            (staging / tier).mkdir(parents=True)
+            for frame in range(end - start + 1):
+                (staging / tier / f"{frame:06d}.jpg").write_bytes(payload)
+        return root, staging
+
     def test_complete_requires_v2_marker_equal_tiers_and_nonempty_boundaries(self) -> None:
         generation = self._publish(frames=2)
         self.assertEqual(proxy.is_complete(self.ctx, "video-1"), 2)
@@ -168,6 +179,7 @@ class ProxyReliabilityTests(unittest.TestCase):
         events: list[str] = []
         real_fsync = proxy._fsync_file
         real_replace = os.replace
+        real_bounded_text = proxy._bounded_text
 
         def observed_fsync(path: Path, data: str) -> None:
             real_fsync(path, data)
@@ -178,14 +190,19 @@ class ProxyReliabilityTests(unittest.TestCase):
             events.append("guard")
             return True
 
+        def observed_bounded_text(path: Path, limit: int) -> str | None:
+            if path == self.root / proxy.CURRENT_POINTER:
+                events.append("previous-token-read")
+            return real_bounded_text(path, limit)
+
         def observed_replace(source, destination) -> None:
             if Path(destination) == self.root / proxy.CURRENT_POINTER:
                 events.append("commit")
             real_replace(source, destination)
 
         with patch("server.proxy._fsync_file", side_effect=observed_fsync), patch(
-            "server.proxy.os.replace", side_effect=observed_replace
-        ):
+            "server.proxy._bounded_text", side_effect=observed_bounded_text
+        ), patch("server.proxy.os.replace", side_effect=observed_replace):
             proxy.publish_generation(
                 staging,
                 self.root,
@@ -195,7 +212,10 @@ class ProxyReliabilityTests(unittest.TestCase):
                 publish_guard=observed_guard,
             )
 
-        self.assertEqual(events[-3:], ["pointer-durable", "guard", "commit"])
+        self.assertEqual(
+            events[-4:],
+            ["pointer-durable", "previous-token-read", "guard", "commit"],
+        )
 
     def test_guard_can_cancel_after_pointer_build_without_replacing_current(self) -> None:
         old = self._publish(frames=1)
@@ -223,6 +243,127 @@ class ProxyReliabilityTests(unittest.TestCase):
 
         self.assertEqual(pointer.read_bytes(), pointer_before)
         self.assertEqual(proxy.current_generation(self.root).token, old.token)
+
+    def test_failed_overlapping_republish_preserves_index_current_and_winners(self) -> None:
+        broad_root, broad_staging = self._window_staging(0, 4, b"broad-old")
+        broad = proxy.publish_generation(
+            broad_staging,
+            broad_root,
+            self.cache,
+            kind="window",
+            job_id="broad-old",
+            start=0,
+            end=4,
+        )
+        narrow_root, narrow_staging = self._window_staging(2, 2, b"narrow")
+        narrow = proxy.publish_generation(
+            narrow_staging,
+            narrow_root,
+            self.cache,
+            kind="window",
+            job_id="narrow",
+            start=2,
+            end=2,
+        )
+        index_path = broad_root.parent / proxy.WINDOWS_INDEX
+        expected_index = index_path.read_bytes()
+        expected_frames = [
+            proxy.locate_frame(self.ctx, "video-1", frame, proxy.FULL).read_bytes()
+            for frame in (1, 2, 3)
+        ]
+
+        def assert_original_publication() -> None:
+            self.assertEqual(index_path.read_bytes(), expected_index)
+            self.assertEqual(proxy.current_generation(broad_root).token, broad.token)
+            self.assertEqual(proxy.current_generation(narrow_root).token, narrow.token)
+            self.assertEqual(
+                [
+                    proxy.locate_frame(
+                        self.ctx, "video-1", frame, proxy.FULL
+                    ).read_bytes()
+                    for frame in (1, 2, 3)
+                ],
+                expected_frames,
+            )
+
+        _, rejected = self._window_staging(0, 4, b"guard-rejected")
+        with self.assertRaisesRegex(RuntimeError, "cancelada"):
+            proxy.publish_generation(
+                rejected,
+                broad_root,
+                self.cache,
+                kind="window",
+                job_id="guard-rejected",
+                start=0,
+                end=4,
+                publish_guard=lambda: False,
+            )
+        assert_original_publication()
+
+        _, crashed = self._window_staging(0, 4, b"replace-failed")
+        real_replace = os.replace
+
+        def fail_current(source, destination):
+            if Path(destination) == broad_root / proxy.CURRENT_POINTER:
+                raise OSError("CURRENT replace failed")
+            return real_replace(source, destination)
+
+        with patch("server.proxy.os.replace", side_effect=fail_current):
+            with self.assertRaisesRegex(OSError, "CURRENT replace failed"):
+                proxy.publish_generation(
+                    crashed,
+                    broad_root,
+                    self.cache,
+                    kind="window",
+                    job_id="replace-failed",
+                    start=0,
+                    end=4,
+                )
+        assert_original_publication()
+
+    def test_successful_overlapping_republish_indexes_exact_generation_identity(self) -> None:
+        broad_root, broad_staging = self._window_staging(0, 4, b"broad-old")
+        proxy.publish_generation(
+            broad_staging,
+            broad_root,
+            self.cache,
+            kind="window",
+            job_id="broad-old",
+            start=0,
+            end=4,
+        )
+        narrow_root, narrow_staging = self._window_staging(2, 2, b"narrow")
+        proxy.publish_generation(
+            narrow_staging,
+            narrow_root,
+            self.cache,
+            kind="window",
+            job_id="narrow",
+            start=2,
+            end=2,
+        )
+        _, replacement_staging = self._window_staging(0, 4, b"broad-new")
+        replacement = proxy.publish_generation(
+            replacement_staging,
+            broad_root,
+            self.cache,
+            kind="window",
+            job_id="broad-new",
+            start=0,
+            end=4,
+        )
+
+        overlap = proxy.locate_frame(self.ctx, "video-1", 2, proxy.FULL)
+        self.assertIsNotNone(overlap)
+        self.assertEqual(overlap.read_bytes(), b"broad-new")
+        index = json.loads(
+            (broad_root.parent / proxy.WINDOWS_INDEX).read_text(encoding="utf-8")
+        )
+        broad_entry = next(item for item in index["windows"] if item["start"] == 0)
+        narrow_entry = next(item for item in index["windows"] if item["start"] == 2)
+        self.assertEqual(index["schema_version"], 3)
+        self.assertEqual(broad_entry["generation"], replacement.token)
+        self.assertGreater(broad_entry["seq"], narrow_entry["seq"])
 
     @unittest.skipUnless(hasattr(os, "symlink"), "sistema sem suporte a symlink")
     def test_symlinked_tier_is_never_a_valid_generation_or_frame_source(self) -> None:
@@ -389,6 +530,51 @@ class ProxyReliabilityTests(unittest.TestCase):
         self.assertEqual(overlap.read_bytes(), b"new")
         self.assertEqual(right.read_bytes(), b"old")
 
+    def test_many_stale_overlaps_materialize_and_validate_only_one_winner(self) -> None:
+        count = 24
+        target = count
+        for offset in range(count):
+            start, end = offset, (2 * count) - offset
+            root, staging = self._window_staging(start, end, bytes([offset]))
+            proxy.publish_generation(
+                staging,
+                root,
+                self.cache,
+                kind="window",
+                job_id=f"overlap-{offset}",
+                start=start,
+                end=end,
+            )
+
+        base = self.cache / "windows" / "video-1"
+        snapshot = proxy._windows_index(base)
+        self.assertEqual(
+            sum(len(winners) for _, _, winners in snapshot.spans),
+            len(snapshot.spans),
+            "cada span deve materializar somente seu vencedor",
+        )
+        for start, end, name, _sequence, _generation in snapshot.entries:
+            generation = proxy.current_generation(
+                base / name, expected_kind="window", cache_root=self.cache
+            )
+            self.assertIsNotNone(generation)
+            (generation.path / proxy.COMPLETE_MARKER).write_text("{}", encoding="utf-8")
+
+        marker_reads = 0
+        real_bounded_text = proxy._bounded_text
+
+        def count_marker_reads(path: Path, limit: int) -> str | None:
+            nonlocal marker_reads
+            if path.name == proxy.COMPLETE_MARKER:
+                marker_reads += 1
+            return real_bounded_text(path, limit)
+
+        with patch("server.proxy._bounded_text", side_effect=count_marker_reads):
+            self.assertIsNone(
+                proxy.locate_frame(self.ctx, "video-1", target, proxy.FULL)
+            )
+        self.assertLessEqual(marker_reads, 1)
+
     def test_failed_window_index_swap_preserves_previous_manifest(self) -> None:
         first_root = proxy.window_dir(self.ctx, "video-1", 0, 0)
         first_staging = proxy.new_staging_generation(first_root)
@@ -433,6 +619,19 @@ class ProxyReliabilityTests(unittest.TestCase):
 
         self.assertEqual(index_path.read_bytes(), index_before)
         self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [[0, 0]])
+        self.assertIsNotNone(
+            proxy.current_generation(
+                second_root, expected_kind="window", cache_root=self.cache
+            ),
+            "CURRENT pode ter sido publicado antes da falha de INDEX",
+        )
+        self.assertIsNone(proxy.locate_frame(self.ctx, "video-1", 4, proxy.FULL))
+
+        sweep = getattr(proxy, "sweep_cache", None)
+        self.assertTrue(callable(sweep), "sweep operacional ausente")
+        sweep(self.ctx, max_roots=8)
+        self.assertEqual(proxy.available_ranges(self.ctx, "video-1"), [[0, 0], [4, 4]])
+        self.assertIsNotNone(proxy.locate_frame(self.ctx, "video-1", 4, proxy.FULL))
 
     def test_stale_generation_gc_keeps_current_and_concurrent_staging(self) -> None:
         old = self._publish(frames=1)
@@ -621,6 +820,97 @@ class ProxyReliabilityTests(unittest.TestCase):
         )
         self.assertFalse(abandoned.exists())
         self.assertIsNone(proxy.current_generation(window_root))
+
+    def test_operational_sweep_resumes_across_crashed_first_extractions(self) -> None:
+        sweep = getattr(proxy, "sweep_cache", None)
+        self.assertTrue(callable(sweep), "sweep operacional ausente")
+        abandoned: list[Path] = []
+        for index in range(3):
+            root = proxy.proxy_dir(self.ctx, f"orphan-{index}")
+            staging = proxy.new_staging_generation(root)
+            (staging / "partial").mkdir()
+            (staging / "partial" / "000000.jpg").write_bytes(b"partial")
+            old = time.time() - proxy.STAGING_ORPHAN_GRACE_SECONDS - 10
+            for entry in sorted(staging.rglob("*"), reverse=True):
+                os.utime(entry, (old, old))
+            os.utime(staging, (old, old))
+            abandoned.append(staging)
+
+        remaining = 3
+        for _ in range(3):
+            result = sweep(
+                self.ctx,
+                max_roots=1,
+                max_delete_per_root=4,
+                retire_grace_seconds=0,
+                staging_grace_seconds=0,
+            )
+            remaining -= 1
+            self.assertEqual(result["roots_scanned"], 1)
+            self.assertEqual(sum(path.exists() for path in abandoned), remaining)
+
+    def test_operational_sweep_retries_gc_trash_after_delete_failure(self) -> None:
+        sweep = getattr(proxy, "sweep_cache", None)
+        self.assertTrue(callable(sweep), "sweep operacional ausente")
+        root = proxy.proxy_dir(self.ctx, "trash-retry")
+        trash = root / (".gc-" + ("a" * 32))
+        trash.mkdir(parents=True)
+        (trash / "payload").write_bytes(b"garbage")
+
+        with patch("server.proxy.shutil.rmtree", side_effect=OSError("busy")):
+            result = sweep(self.ctx, max_roots=1)
+
+        self.assertEqual(result["errors"], 1)
+        self.assertTrue(trash.exists())
+        recovered = sweep(self.ctx, max_roots=1)
+        self.assertEqual(recovered["trash_removed"], 1)
+        self.assertFalse(trash.exists())
+
+    def test_operational_sweep_repairs_index_after_partial_eviction(self) -> None:
+        sweep = getattr(proxy, "sweep_cache", None)
+        self.assertTrue(callable(sweep), "sweep operacional ausente")
+        broad_root, broad_staging = self._window_staging(0, 4, b"broad")
+        proxy.publish_generation(
+            broad_staging,
+            broad_root,
+            self.cache,
+            kind="window",
+            job_id="broad",
+            start=0,
+            end=4,
+        )
+        narrow_root, narrow_staging = self._window_staging(2, 2, b"narrow")
+        proxy.publish_generation(
+            narrow_staging,
+            narrow_root,
+            self.cache,
+            kind="window",
+            job_id="narrow",
+            start=2,
+            end=2,
+        )
+
+        with self.assertLogs("movies-screening-tool.proxy", level="WARNING"):
+            with patch(
+                "server.proxy._remove_window_index",
+                side_effect=OSError("index busy"),
+            ):
+                self.assertTrue(proxy._retire_proxy_root(narrow_root, self.cache))
+
+        self.assertIsNone(
+            proxy.locate_frame(self.ctx, "video-1", 2, proxy.FULL),
+            "índice stale deve virar miss, nunca fallback silencioso",
+        )
+        sweep(
+            self.ctx,
+            max_roots=8,
+            max_delete_per_root=4,
+            retire_grace_seconds=0,
+            staging_grace_seconds=0,
+        )
+        repaired = proxy.locate_frame(self.ctx, "video-1", 2, proxy.FULL)
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.read_bytes(), b"broad")
 
     def test_lru_skips_busy_publication_lock_without_waiting(self) -> None:
         published = self._publish(frames=1)

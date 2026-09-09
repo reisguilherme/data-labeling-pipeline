@@ -548,6 +548,34 @@ def run_object_purge(job: dict, queue: PostgresJobQueue, token: str) -> dict:
 
 
 log = logging.getLogger("pipeline.cpu-worker")
+_PROXY_SWEEP_INTERVAL_SECONDS = 300.0
+
+
+def _run_proxy_maintenance() -> None:
+    """Executa um lote curto de recuperacao sem carregar indices de videos."""
+    workspace_root = os.environ.get("MST_WORKSPACE")
+    if not workspace_root:
+        return
+    from server import proxy
+    from server.config import settings
+    from server.workspace import workspace
+
+    settings.workspace_root = Path(workspace_root)
+    workspace.load()
+    for config in workspace.list(include_archived=True):
+        try:
+            workspace.invalidate(config.object_id)
+            result = proxy.sweep_cache(workspace.context(config.object_id))
+            if result["errors"]:
+                log.warning(
+                    "sweep de proxy de %s terminou com %s erro(s)",
+                    config.object_id,
+                    result["errors"],
+                )
+        except Exception:  # noqa: BLE001 - manutencao nunca derruba consumidor
+            log.warning(
+                "falha no sweep de proxy de %s", config.object_id, exc_info=True
+            )
 
 
 def _settle_job_best_effort(job_id: str, action) -> None:
@@ -569,7 +597,15 @@ def main() -> int:
     url = os.environ["DATABASE_URL"]
     queue = PostgresJobQueue(lambda: psycopg.connect(url))
     worker_id = os.environ.get("CPU_WORKER_ID", f"cpu-{socket.gethostname()}")
+    next_proxy_maintenance = 0.0
     while True:
+        now = time.monotonic()
+        if now >= next_proxy_maintenance:
+            try:
+                _run_proxy_maintenance()
+            except Exception:  # pragma: no cover - defesa contra regressao futura
+                log.warning("falha na manutencao periodica de proxy", exc_info=True)
+            next_proxy_maintenance = now + _PROXY_SWEEP_INTERVAL_SECONDS
         job = queue.claim(worker_id=worker_id, worker_kind="cpu", lease_seconds=180)
         if job is None:
             time.sleep(2)

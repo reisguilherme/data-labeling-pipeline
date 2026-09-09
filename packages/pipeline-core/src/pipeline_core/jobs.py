@@ -210,10 +210,17 @@ class PostgresJobQueue:
                 cursor.execute(
                     """
                     UPDATE jobs SET
-                        state = CASE WHEN attempts < max_attempts THEN 'queued'::job_state ELSE 'error'::job_state END,
+                        state = CASE
+                            WHEN cancel_requested THEN 'cancelled'::job_state
+                            WHEN attempts < max_attempts THEN 'queued'::job_state
+                            ELSE 'error'::job_state
+                        END,
                         error=%(error)s, worker_id=NULL, lease_token=NULL,
                         lease_expires_at=NULL,
-                        finished_at=CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
+                        finished_at=CASE
+                            WHEN cancel_requested OR attempts >= max_attempts THEN now()
+                            ELSE NULL
+                        END,
                         updated_at=now()
                      WHERE id=%(job_id)s AND lease_token=%(lease_token)s::uuid
                        AND state IN ('leased','running')
