@@ -47,6 +47,8 @@ existem apenas na rede interna. Para mover a instalacao e os dados para uma
 maquina remota que atende em `0.0.0.0:3000`, siga
 [`docs/REMOTE-MOVE.md`](docs/REMOTE-MOVE.md). Essa modalidade exige rede
 confiavel e firewall, pois a aplicacao ainda nao tem autenticacao de acesso.
+O mesmo guia inclui a atualizacao incremental do codigo sem substituir
+`data/`, modelos, secrets ou os volumes persistentes.
 
 ## Servicos
 
@@ -63,6 +65,9 @@ container, GCS, FFmpeg, a fila SAM3 e as exportacoes usam PostgreSQL quando
 `DATABASE_URL` esta presente. Claims usam `FOR UPDATE SKIP LOCKED`; heartbeat,
 expiracao, tentativas, cancelamento e retomada sobrevivem ao restart. Cada run
 SAM3 concluido tambem normaliza modelo, prompt, mascaras, bbox e area no banco.
+Ao terminar a extracao de frames, o worker CPU confirma o resultado diretamente
+na API interna antes de concluir o job. A navegacao ou o fechamento da tela nao
+interrompem a promocao do video nem o enfileiramento do SAM3.
 
 ## Operacao da interface
 

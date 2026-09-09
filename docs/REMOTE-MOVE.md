@@ -85,3 +85,45 @@ docker compose ps
 Abra `http://IP-DO-SERVIDOR:3000`. Confirme objetos, contagens, uma imagem de
 frame e um artefato SAM3 antes de desligar a maquina antiga. Mantenha a copia
 antiga intacta ate concluir essa validacao.
+
+## 4. Atualizar somente o codigo depois da migracao
+
+O trabalho operacional nao fica no Git. Os videos, frames, anotacoes e
+revisoes continuam em `WORKSPACE_DIR`; PostgreSQL e MinIO continuam nos volumes
+nomeados do Docker; modelos, backups, configuracao local e secrets permanecem
+nas pastas ignoradas pelo repositorio. Portanto uma atualizacao de codigo nao
+exige copiar o acervo novamente.
+
+Antes de atualizar, confirme que o servidor esta no diretorio correto e crie
+um backup consistente:
+
+```bash
+cd /srv/boom-pipeline
+docker compose ps
+docker compose stop app worker sam3-worker
+docker compose run --rm --no-deps app backup
+```
+
+Atualize apenas os arquivos versionados com `git pull --ff-only` (depois que a
+branch aprovada tiver sido enviada ao remoto). Nao substitua nem apague `.env`,
+`config/models.local.yaml`, `secrets/`, `data/`, `models/` ou `backups/`.
+
+Para a versao que torna a conclusao da exportacao independente do navegador,
+reconstrua e recrie apenas a API e o worker CPU:
+
+```bash
+git pull --ff-only
+docker compose build app worker
+docker compose up -d --no-deps --force-recreate app worker
+docker compose ps
+docker compose logs --since 10m app worker
+```
+
+Nao use `docker compose down -v`: a opcao `-v` remove os volumes nomeados do
+PostgreSQL e do MinIO. Recriar os containers com `up --force-recreate` preserva
+esses volumes e o bind mount de `WORKSPACE_DIR`, incluindo todo o trabalho
+manual ja realizado.
+
+Depois da atualizacao, salve um video com intervalo, navegue imediatamente para
+o proximo e confirme nos cards que o worker conclui a exportacao e enfileira o
+SAM3 mesmo com a tela de triagem fechada.
