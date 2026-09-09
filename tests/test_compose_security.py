@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -19,7 +20,13 @@ class ComposeSecurityTests(unittest.TestCase):
             set(self.services),
             {"app", "worker", "sam3-worker", "postgres", "minio-init", "minio"},
         )
-        self.assertEqual(self.services["app"]["ports"], ["127.0.0.1:8000:8000"])
+        published_port = self.services["app"]["ports"]
+        self.assertEqual(
+            published_port,
+            ["${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"],
+        )
+        defaults = re.sub(r"\$\{[A-Z_]+:-([^}]+)\}", r"\1", published_port[0])
+        self.assertEqual(defaults, "127.0.0.1:8000:8000")
         for name in set(self.services) - {"app"}:
             self.assertNotIn("ports", self.services[name])
 
