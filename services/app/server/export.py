@@ -200,6 +200,7 @@ async def export_video(
             "jpeg_qscale": EXPORT_QSCALE,
             "frame_naming": _NAMING_RATIONALE,
             "ffmpeg_version": binaries.version,
+            "annotation_revision": int(entry.get("annotation_revision") or 0),
         }
         job.finished_at = iso()
         jobs._publish(job)

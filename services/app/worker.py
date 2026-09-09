@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +45,63 @@ def _remove_tree(path: Path, root: Path) -> None:
         raise ValueError(f"recusa remover caminho fora do cache/export: {resolved}")
     if resolved.exists():
         shutil.rmtree(resolved)
+
+
+def _export_root_from_basename(ctx, basename: str) -> Path:
+    """Resolve exactly one non-symlink child below an object's output root."""
+    if (
+        not isinstance(basename, str)
+        or not basename
+        or basename in {".", ".."}
+        or "/" in basename
+        or "\\" in basename
+        or Path(basename).is_absolute()
+        or Path(basename).name != basename
+    ):
+        raise ValueError("raiz de export invalida")
+    output_root = ctx.output_root.resolve()
+    target = ctx.output_root / basename
+    if target.is_symlink():
+        raise ValueError("raiz de export nao pode ser link simbolico")
+    resolved = target.resolve()
+    if resolved.parent != output_root or resolved == output_root:
+        raise ValueError("raiz de export fora do objeto")
+    if target.exists() and not target.is_dir():
+        raise ValueError("raiz de export existente nao e diretorio")
+    return target
+
+
+def _payload_revision(payload: dict) -> int:
+    revision = payload.get("annotation_revision", 0)
+    if type(revision) is not int or revision < 0:
+        raise ValueError("annotation_revision invalida")
+    return revision
+
+
+def _entry_revision(entry: dict | None) -> int:
+    if entry is None:
+        return 0
+    revision = entry.get("annotation_revision", 0)
+    return revision if type(revision) is int and revision >= 0 else 0
+
+
+def _stale_result(expected: int, current: int) -> dict:
+    return {
+        "stale": True,
+        "annotation_revision": expected,
+        "current_revision": current,
+    }
+
+
+def _staging_export_root(root: Path, job_id: object, lease_token: object) -> Path:
+    identity = f"{job_id}:{lease_token}"
+    token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return root / f".export-{token}.part"
+
+
+def _trash_export_root(root: Path, job_id: object, operation: str) -> Path:
+    token = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:16]
+    return root / f".{operation}-{token}.trash"
 
 
 def _run_ffmpeg(
@@ -226,6 +284,7 @@ def run_proxy_window(job: dict, queue: PostgresJobQueue, token: str) -> dict:
 
 
 def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    from server import durable_jobs
     from server import export as video_export
     from server import ffmpeg
     from server.config import EXPORT_QSCALE
@@ -236,58 +295,238 @@ def run_video_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     video = ctx.index.get(video_id)
     if video is None:
         raise ValueError(f"video nao encontrado: {video_id}")
-    entry = ctx.store.entry(video.relpath)
-    if entry is None or not entry.get("intervals"):
-        raise ValueError("anotacao ou intervalos ausentes")
-    intervals = entry["intervals"]
-    media = entry.get("media") or ctx.index.cached_probe(video_id) or {}
-    root = video_export.export_root_for(ctx, video)
-    root.mkdir(parents=True, exist_ok=True)
+    expected_revision = _payload_revision(payload)
+
+    with durable_jobs.video_advisory_lock(payload["object_id"], video_id):
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {
+                "current": 0,
+                "total": int(payload.get("total") or 0),
+                "message": "preparando export",
+            },
+        ):
+            raise Cancelled("cancelamento solicitado")
+        ctx.store.load()
+        entry = ctx.store.entry(video.relpath)
+        current_revision = _entry_revision(entry)
+        if current_revision != expected_revision or (entry or {}).get("status") == "no_boom":
+            return _stale_result(expected_revision, current_revision)
+        if entry is None or not entry.get("intervals"):
+            raise ValueError("anotacao ou intervalos ausentes")
+        intervals = entry["intervals"]
+        media = entry.get("media") or ctx.index.cached_probe(video_id) or {}
+        basename = payload.get("root_basename")
+        if basename is None:
+            # Compatibilidade com jobs enfileirados antes do fence por revisão.
+            basename = video_export.export_root_for(ctx, video).name
+        root = _export_root_from_basename(ctx, basename)
+
     keep = {interval["segment"] for interval in intervals}
-    video_export.clean_segments(root, keep)
+    if any(
+        not isinstance(name, str)
+        or not name.startswith("seg_")
+        or "/" in name
+        or "\\" in name
+        or Path(name).name != name
+        for name in keep
+    ):
+        raise ValueError("nome de segmento invalido")
+
+    root.mkdir(parents=True, exist_ok=True)
+    staging = _staging_export_root(root, job["id"], token)
+    if staging.exists() or staging.is_symlink():
+        if staging.is_symlink():
+            raise ValueError("staging de export nao pode ser link simbolico")
+        _remove_tree(staging, root)
+    staging.mkdir()
+    publish_trash = _trash_export_root(
+        root, f"{job['id']}:{time.time_ns()}", "replace"
+    )
     source = ctx.index.resolve_path(video_id)
     binaries = ffmpeg.resolve()
     total = sum(int(interval["frame_count"]) for interval in intervals)
     completed = 0
     segments: list[str] = []
-    for interval in intervals:
-        segment_dir = root / interval["segment"]
-        if segment_dir.exists():
-            _remove_tree(segment_dir, root)
-        segment_dir.mkdir(parents=True, exist_ok=True)
-        expected = int(interval["frame_count"])
-        _run_ffmpeg(
-            ffmpeg.export_segment_argv(
-                source, segment_dir, interval["start_frame"], interval["end_frame"]
-            ),
-            job,
-            queue,
-            token,
-            offset=completed,
-            total=total,
-        )
-        produced = len(list(segment_dir.glob("*.jpg")))
-        if produced != expected:
-            raise RuntimeError(
-                f"{interval['segment']}: ffmpeg produziu {produced} frames, esperado {expected}"
+    try:
+        for interval in intervals:
+            segment_dir = staging / interval["segment"]
+            segment_dir.mkdir()
+            expected = int(interval["frame_count"])
+            _run_ffmpeg(
+                ffmpeg.export_segment_argv(
+                    source, segment_dir, interval["start_frame"], interval["end_frame"]
+                ),
+                job,
+                queue,
+                token,
+                offset=completed,
+                total=total,
             )
-        width, height = video_export._frame_size(segment_dir, media)
-        video_export.write_prompt_json(segment_dir, video, interval, width, height)
-        segments.append(interval["segment"])
-        completed += expected
+            produced = len(list(segment_dir.glob("*.jpg")))
+            if produced != expected:
+                raise RuntimeError(
+                    f"{interval['segment']}: ffmpeg produziu {produced} frames, esperado {expected}"
+                )
+            width, height = video_export._frame_size(segment_dir, media)
+            video_export.write_prompt_json(segment_dir, video, interval, width, height)
+            segments.append(interval["segment"])
+            completed += expected
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {"current": completed, "total": total, "message": "exportando frames"},
+            ):
+                raise Cancelled("cancelamento solicitado")
+
+        # FFmpeg roda sem segurar o lock. Só a publicação é serializada e
+        # revalida tanto a revisão quanto a lease imediatamente antes de tocar
+        # os diretórios efetivos.
+        with durable_jobs.video_advisory_lock(ctx.object_id, video_id):
+            ctx.store.load()
+            latest = ctx.store.entry(video.relpath)
+            current_revision = _entry_revision(latest)
+            if (
+                current_revision != expected_revision
+                or (latest or {}).get("status") == "no_boom"
+            ):
+                return _stale_result(expected_revision, current_revision)
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {"current": completed, "total": total, "message": "publicando frames"},
+            ):
+                raise Cancelled("cancelamento solicitado")
+            publish_trash.mkdir()
+            moved_old: list[str] = []
+            published: list[str] = []
+            try:
+                for child in sorted(root.iterdir(), key=lambda path: path.name):
+                    if not child.name.startswith("seg_"):
+                        continue
+                    if child.is_symlink():
+                        raise ValueError("segmento publicado nao pode ser link simbolico")
+                    if not child.is_dir():
+                        if child.name in keep:
+                            raise ValueError("destino de segmento nao e diretorio")
+                        continue
+                    child.replace(publish_trash / child.name)
+                    moved_old.append(child.name)
+                for segment in segments:
+                    (staging / segment).replace(root / segment)
+                    published.append(segment)
+            except Exception:
+                # Falhas normais de publicação restauram a geração anterior.
+                # Em uma queda abrupta a lixeira permanece para recuperação,
+                # em vez de ser apagada no próximo retry.
+                for segment in reversed(published):
+                    current = root / segment
+                    original_staging = staging / segment
+                    if current.exists() and not original_staging.exists():
+                        current.replace(original_staging)
+                for segment in moved_old:
+                    previous = publish_trash / segment
+                    destination = root / segment
+                    if previous.exists() and not destination.exists():
+                        previous.replace(destination)
+                raise
+
+        if publish_trash.exists():
+            try:
+                _remove_tree(publish_trash, root)
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "falha ao remover lixeira de export publicada", exc_info=True
+                )
+
+        return {
+            "root": root.as_posix(),
+            "segments": segments,
+            "total_frames": completed,
+            "jpeg_qscale": EXPORT_QSCALE,
+            "frame_naming": video_export._NAMING_RATIONALE,
+            "ffmpeg_version": binaries.version,
+            "annotation_revision": expected_revision,
+        }
+    finally:
+        if staging.exists():
+            _remove_tree(staging, root)
+
+
+def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    from server import durable_jobs
+
+    ctx = _context(job)
+    payload = job["payload"]
+    video_id = payload["video_id"]
+    relpath = payload.get("relpath")
+    if not isinstance(relpath, str) or not relpath:
+        video = getattr(ctx, "index", None)
+        video = video.get(video_id) if video is not None else None
+        if video is None:
+            raise ValueError(f"video nao encontrado: {video_id}")
+        relpath = video.relpath
+    expected_revision = _payload_revision(payload)
+    basename = payload.get("root_basename")
+    root = _export_root_from_basename(ctx, basename)
+    trash = _trash_export_root(root, job["id"], "cleanup")
+    if trash.is_symlink():
+        raise ValueError("lixeira de cleanup nao pode ser link simbolico")
+    if trash.exists():
+        # Uma tentativa anterior já isolou estes diretórios sob o mesmo job.
+        # Removê-los não disputa o lock e não toca um re-export posterior.
+        _remove_tree(trash, root)
+
+    removed: list[str] = []
+    with durable_jobs.video_advisory_lock(payload["object_id"], video_id):
         if not queue.update_progress(
             str(job["id"]),
             token,
-            {"current": completed, "total": total, "message": "exportando frames"},
+            {"current": 0, "total": 1, "message": "limpando export anterior"},
         ):
             raise Cancelled("cancelamento solicitado")
+        ctx.store.load()
+        entry = ctx.store.entry(relpath)
+        current_revision = _entry_revision(entry)
+        marker = (entry or {}).get("export_cleanup") or {}
+        if (
+            current_revision != expected_revision
+            or (entry or {}).get("status") != "no_boom"
+            or marker.get("root_basename") != basename
+        ):
+            return _stale_result(expected_revision, current_revision)
+
+        if root.exists():
+            for child in sorted(root.iterdir(), key=lambda path: path.name):
+                if not child.name.startswith("seg_"):
+                    continue
+                if child.is_symlink():
+                    raise ValueError("segmento de export nao pode ser link simbolico")
+                if not child.is_dir():
+                    continue
+                if not queue.update_progress(
+                    str(job["id"]),
+                    token,
+                    {
+                        "current": len(removed),
+                        "total": 1,
+                        "message": "limpando export anterior",
+                    },
+                ):
+                    raise Cancelled("cancelamento solicitado")
+                trash.mkdir(exist_ok=True)
+                child.replace(trash / child.name)
+                removed.append(child.name)
+
+    # O lock protege apenas o fence e os renames atômicos. A exclusão de
+    # milhares de JPEGs acontece depois, para não bloquear ações da interface.
+    if trash.exists():
+        _remove_tree(trash, root)
     return {
+        "removed": removed,
         "root": root.as_posix(),
-        "segments": segments,
-        "total_frames": completed,
-        "jpeg_qscale": EXPORT_QSCALE,
-        "frame_naming": video_export._NAMING_RATIONALE,
-        "ffmpeg_version": binaries.version,
+        "annotation_revision": expected_revision,
     }
 
 
@@ -721,6 +960,8 @@ def main() -> int:
                 result = run_proxy_window(job, queue, token)
             elif job["kind"] == "video_export":
                 result = run_video_export(job, queue, token)
+            elif job["kind"] == "video_export_cleanup":
+                result = run_video_export_cleanup(job, queue, token)
             else:
                 raise ValueError(f"job CPU sem handler registrado: {job['kind']}")
             if lease_errors:

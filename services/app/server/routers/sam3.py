@@ -267,6 +267,8 @@ async def result(
     # descreve o vídeo — a fila é estado de sessão, o dataset é o artefato.
     if item.state == "done":
         try:
+            from .. import durable_jobs
+
             ctx = workspace.context(object_id)
             ctx.ensure_loaded()
 
@@ -283,7 +285,14 @@ async def result(
                         },
                     }
 
-            await ctx.store.mutate(apply)
+            if durable_jobs.enabled():
+                async with durable_jobs.video_advisory_lock_async(
+                    object_id, item.video_id
+                ):
+                    await asyncio.to_thread(ctx.store.load)
+                    await ctx.store.mutate(apply)
+            else:
+                await ctx.store.mutate(apply)
         except Exception:  # noqa: BLE001 — a fila já registrou; não derruba o worker
             pass
 
