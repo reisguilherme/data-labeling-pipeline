@@ -330,21 +330,70 @@ async def global_export(
         raise HTTPException(422, "as frações precisam estar em [0, 1)")
     if payload.val_fraction + payload.test_fraction >= 1:
         raise HTTPException(422, "val + test precisa sobrar algo para o treino")
-    try:
-        await asyncio.to_thread(_global_contexts, payload.object_ids)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
     if workspace.root is None:
         raise HTTPException(409, "workspace não configurado")
-    stamp = iso().replace(":", "-").split(".")[0]
-    name = payload.name or f"global-{payload.task}-{payload.format}-{stamp}"
-    if Path(name).name != name or name in {"", ".", ".."}:
-        raise HTTPException(422, "nome de dataset inválido")
-    out_dir = workspace.root / "_datasets" / name
-    if out_dir.exists():
-        raise HTTPException(409, f"já existe um dataset chamado '{name}'")
     if not durable_jobs.enabled():
         raise HTTPException(503, "PostgreSQL é obrigatório para exportação global")
+    try:
+        contexts = await asyncio.to_thread(_global_contexts, payload.object_ids)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    from ..multiclass_dataset import (
+        bind_multiclass_export_spec,
+        build_multiclass_snapshot,
+    )
+
+    selections = [item.model_dump() for item in payload.filters.videos]
+    flags = {
+        key: values for key, values in payload.filters.flags.items() if values
+    }
+    try:
+        snapshot = await asyncio.to_thread(
+            build_multiclass_snapshot,
+            contexts,
+            selections,
+            flags=flags,
+            include_empty=payload.filters.include_empty,
+            task=payload.task,
+            workspace_root=workspace.root,
+        )
+        snapshot = bind_multiclass_export_spec(
+            snapshot,
+            fmt=payload.format,
+            val_fraction=payload.val_fraction,
+            test_fraction=payload.test_fraction,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if int((snapshot.get("totals") or {}).get("frames") or 0) == 0:
+        raise HTTPException(422, "nenhum frame concluído casa com os filtros")
+    if not snapshot.get("export_allowed", True):
+        reasons = snapshot.get("blocking_reasons") or []
+        raise HTTPException(
+            422,
+            f"exportacao bloqueada: {reasons[0] if reasons else 'snapshot incompleto'}",
+        )
+
+    stamp = iso().replace(":", "-").split(".")[0]
+    name = payload.name or f"global-{payload.task}-{payload.format}-{stamp}"
+    if (
+        Path(name).name != name
+        or name in {"", ".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HTTPException(422, "nome de dataset inválido")
+    out_dir = workspace.root / "_datasets" / name
+    try:
+        await asyncio.to_thread(
+            dataset_module.reserve_dataset_target,
+            workspace.root / "_datasets",
+            name,
+            snapshot["snapshot_id"],
+        )
+    except dataset_module.DatasetTargetConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     job_id = await asyncio.to_thread(
         durable_jobs.create,
         kind="dataset_export_global",
@@ -358,15 +407,17 @@ async def global_export(
             "val_fraction": payload.val_fraction,
             "test_fraction": payload.test_fraction,
             "filters": {
-                "flags": payload.filters.flags,
-                "videos": [item.model_dump() for item in payload.filters.videos],
+                "flags": flags,
+                "videos": selections,
                 "include_empty": payload.filters.include_empty,
                 "reviewed_only": True,
             },
+            "snapshot": snapshot,
             "client_id": client_id,
             "user": user.user_id,
             "message": f"exportando dataset global {payload.task} {payload.format}",
         },
+        idempotency_key=f"dataset-export-global:{name}",
     )
     return {"job_id": job_id, "name": name, "out_dir": out_dir.as_posix()}
 

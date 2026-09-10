@@ -736,27 +736,20 @@ def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
 
 
 def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    from server.dataset import _safe_dataset_name
     from server.config import settings
-    from server.multiclass_dataset import export_multiclass
-    from server.workspace import workspace
+    from server.multiclass_dataset import (
+        export_multiclass_snapshot_atomic,
+        validate_multiclass_snapshot,
+    )
 
     root = Path(os.environ.get("MST_WORKSPACE", "/workspace")).resolve()
     settings.workspace_root = root
-    workspace.load()
     payload = job["payload"]
-    contexts = []
-    active_ids = {cfg.object_id for cfg in workspace.list()}
-    for object_id in sorted(set(payload.get("object_ids") or [])):
-        if object_id not in active_ids:
-            raise ValueError(f"objeto inexistente ou arquivado: {object_id}")
-        ctx = workspace.context(object_id)
-        ctx.ensure_loaded()
-        contexts.append(ctx)
-    name = Path(str(payload["name"])).name
+    snapshot = payload.get("snapshot")
+    validate_multiclass_snapshot(snapshot)
+    name = _safe_dataset_name(str(payload["name"]))
     out_dir = root / "_datasets" / name
-    if out_dir.exists() and not (out_dir / "dataset_manifest.json").is_file():
-        _remove_tree(out_dir, root)
-    raw_filters = payload.get("filters") or {}
 
     def progress(current: int, total: int) -> None:
         if not queue.update_progress(
@@ -765,31 +758,39 @@ def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) ->
         ):
             raise Cancelled("cancelamento solicitado")
 
-    result = export_multiclass(
-        contexts,
-        raw_filters.get("videos") or [],
-        flags=raw_filters.get("flags") or {},
-        include_empty=bool(raw_filters.get("include_empty")),
+    def before_publish() -> None:
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {"message": "publicando dataset global"},
+        ):
+            raise Cancelled("lease perdido antes da publicacao do dataset global")
+
+    result = export_multiclass_snapshot_atomic(
+        root,
+        snapshot,
         out_dir=out_dir,
         fmt=payload["format"],
         task=payload["task"],
         val_fraction=float(payload.get("val_fraction", 0.2)),
         test_fraction=float(payload.get("test_fraction", 0)),
-        workspace_root=root,
+        owner=f"{job['id']}:{token}",
         on_progress=progress,
+        before_publish=before_publish,
     )
     store = MinioBlobStore.from_env()
     if store is not None:
+        prefix = f"global/{name}/generations/{snapshot['snapshot_id']}"
         stored = 0
-        for path in out_dir.rglob("*"):
+        for path in sorted(out_dir.rglob("*")):
             if path.is_file():
                 store.put_file(
                     "datasets",
-                    f"global/{name}/{path.relative_to(out_dir).as_posix()}",
+                    f"{prefix}/{path.relative_to(out_dir).as_posix()}",
                     path,
                 )
                 stored += 1
-        result["minio_prefix"] = f"datasets/global/{name}"
+        result["minio_prefix"] = f"datasets/{prefix}"
         result["minio_files"] = stored
     return result
 

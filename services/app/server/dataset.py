@@ -210,11 +210,19 @@ def _read_json_identity(path: Path, *, required: bool = True) -> tuple[dict, str
 def _effective_prompt_identity(
     paths: SegmentPaths | _FrozenSegmentPaths,
 ) -> tuple[str, str | None, str]:
+    from pipeline_core.sam3_runs import effective_prompt_override_path
+
     prompt_path = paths.segment_dir / "prompt.json"
     _, raw_prompt = _read_json_payload(prompt_path)
     assert raw_prompt is not None
-    override_path = paths.control_dir / "prompt_override.json"
-    override, raw_override = _read_json_payload(override_path, required=False)
+    override_path = effective_prompt_override_path(
+        paths.segment_dir, migrate_legacy=True
+    )
+    override, raw_override = (
+        _read_json_payload(override_path)
+        if override_path is not None
+        else ({}, None)
+    )
     effective = raw_prompt
     if raw_override is not None and override.get("objects"):
         effective += raw_override
