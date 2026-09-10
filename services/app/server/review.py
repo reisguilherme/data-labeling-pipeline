@@ -19,6 +19,7 @@ esqueceu a conversão num caminho.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -42,7 +43,161 @@ MASK_REVIEW_FILENAME = "mask_review.json"
 # "edited" = o humano mandou outra coisa (lista vazia = frame sem objeto)
 STATUSES = ("ok", "edited")
 
+_MAX_CONTROL_JSON_BYTES = 16 * 1024 * 1024
+_WALL_CLOCK_KEYS = {
+    "at",
+    "created_at",
+    "enqueued_at",
+    "exported_at",
+    "finished_at",
+    "projected_at",
+    "published_at",
+    "requested_at",
+    "started_at",
+    "updated_at",
+}
+
 _lock = threading.Lock()
+
+
+def _without_wall_clock(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _without_wall_clock(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _WALL_CLOCK_KEYS
+            and not str(key).endswith("_timestamp")
+        }
+    if isinstance(value, list):
+        return [_without_wall_clock(item) for item in value]
+    return value
+
+
+def _json_digest(value: dict) -> str:
+    payload = json.dumps(
+        _without_wall_clock(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def mask_review_manifest_identity(path: Path) -> dict:
+    """Return a deterministic, bounded identity for ``mask_review.json``.
+
+    Timestamps and filesystem metadata are deliberately excluded.  The
+    immutable per-frame revision and instance manifest remain in the digest,
+    so any effective review change invalidates a stale projection without
+    opening a mask PNG.
+    """
+
+    if not path.exists():
+        return {
+            "state": "missing",
+            "sha256": None,
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+    if path.is_symlink() or not path.is_file():
+        return {
+            "state": "invalid",
+            "sha256": None,
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_CONTROL_JSON_BYTES + 1)
+    except OSError:
+        return {
+            "state": "invalid",
+            "sha256": None,
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+    if len(raw) > _MAX_CONTROL_JSON_BYTES:
+        return {
+            "state": "invalid",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "max_revision": 0,
+            "reviewed_frames": 0,
+            "oversized": True,
+        }
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "state": "invalid",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+    if not isinstance(value, dict):
+        return {
+            "state": "invalid",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+    try:
+        digest = _json_digest(value)
+    except (TypeError, ValueError):
+        return {
+            "state": "invalid",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+
+    schema = value.get("schema_version")
+    frames = value.get("frames")
+    if schema not in (None, SCHEMA_VERSION) or not isinstance(frames, dict):
+        return {
+            "state": "invalid",
+            "sha256": digest,
+            "max_revision": 0,
+            "reviewed_frames": 0,
+        }
+
+    legacy = schema is None
+    revisions: list[int] = []
+    reviewed = 0
+    for frame, entry in frames.items():
+        if (
+            not isinstance(frame, str)
+            or not frame.isdigit()
+            or int(frame) < 0
+            or not isinstance(entry, dict)
+            or entry.get("status") not in STATUSES
+        ):
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
+        revision = entry.get("revision")
+        if revision is None:
+            legacy = True
+        elif type(revision) is not int or revision <= 0:
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
+        else:
+            revisions.append(revision)
+        reviewed += 1
+
+    return {
+        "state": "legacy" if legacy else "valid",
+        "sha256": digest,
+        "max_revision": max(revisions, default=0),
+        "reviewed_frames": reviewed,
+    }
 
 
 # --------------------------------------------------------------------------

@@ -9,20 +9,42 @@ revisadas.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from pipeline_core.masks import MaskValidationError, inspect_binary_png
 from pipeline_core.sam3_runs import (
     Sam3GenerationError,
     active_segment_output,
+    current_manifest_path,
     effective_prompt_override_path,
+    generation_root,
+    legacy_segment_output,
     load_current_manifest,
     resolve_export_root,
     resolve_segment_dir,
 )
+
+from .review import mask_review_manifest_identity
+
+
+_MAX_CONTROL_JSON_BYTES = 16 * 1024 * 1024
+_WALL_CLOCK_KEYS = {
+    "at",
+    "created_at",
+    "enqueued_at",
+    "exported_at",
+    "finished_at",
+    "projected_at",
+    "published_at",
+    "requested_at",
+    "started_at",
+    "updated_at",
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +67,37 @@ class PipelineSnapshot:
             "validation_status": self.validation_status,
             "inconsistencies": list(self.inconsistencies),
         }
+
+    def projection_dict(self) -> dict:
+        """Stable database payload; no timestamps or filesystem metadata."""
+        return {
+            "pipeline_stage": self.stage,
+            "stage_status": self.status,
+            "expected_frames": self.expected_frames,
+            "reviewed_frames": self.reviewed_frames,
+            "edited_frames": self.edited_frames,
+            "artifacts_valid": self.artifacts_valid,
+            "validation_status": self.validation_status,
+            "inconsistencies": list(self.inconsistencies),
+            "complete": (
+                self.stage == "completed"
+                and self.status == "validated"
+                and self.validation_status == "manifest"
+                and self.artifacts_valid
+                and self.expected_frames > 0
+                and self.reviewed_frames >= self.expected_frames
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PipelineSource:
+    identity: dict[str, Any]
+    snapshot: PipelineSnapshot
+
+    @property
+    def snapshot_dict(self) -> dict:
+        return self.snapshot.projection_dict()
 
 
 def classify_pipeline(
@@ -91,12 +144,214 @@ def classify_pipeline(
     return PipelineSnapshot("review", "waiting", **common)
 
 
-def _read_json(path: Path) -> dict | None:
+def _without_wall_clock(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _without_wall_clock(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _WALL_CLOCK_KEYS
+            and not str(key).endswith("_timestamp")
+        }
+    if isinstance(value, list):
+        return [_without_wall_clock(item) for item in value]
+    return value
+
+
+def _metadata_digest(value: Any) -> str:
+    payload = json.dumps(
+        _without_wall_clock(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _read_control_json(path: Path) -> tuple[dict, dict | None]:
+    """Read one small control document and return identity plus parsed value."""
+    if not path.exists():
+        return {"state": "missing", "sha256": None}, None
+    if path.is_symlink() or not path.is_file():
+        return {"state": "invalid", "sha256": None}, None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_CONTROL_JSON_BYTES + 1)
+    except OSError:
+        return {"state": "invalid", "sha256": None}, None
+    if len(raw) > _MAX_CONTROL_JSON_BYTES:
+        return {
+            "state": "invalid",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "oversized": True,
+        }, None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"state": "invalid", "sha256": hashlib.sha256(raw).hexdigest()}, None
+    if not isinstance(value, dict):
+        return {"state": "invalid", "sha256": hashlib.sha256(raw).hexdigest()}, None
+    try:
+        digest = _metadata_digest(value)
+    except (TypeError, ValueError):
+        return {"state": "invalid", "sha256": hashlib.sha256(raw).hexdigest()}, None
+    return {
+        "state": "valid",
+        "sha256": digest,
+        "schema_version": value.get("schema_version"),
+    }, value
+
+
+def _read_json(path: Path) -> dict | None:
+    _identity, value = _read_control_json(path)
+    return value
+
+
+def _manifest_identity(path: Path, *, schema_optional: bool = False) -> tuple[dict, dict | None]:
+    identity, value = _read_control_json(path)
+    if value is None:
+        return identity, None
+    schema = value.get("schema_version")
+    if schema is None and schema_optional:
+        return identity, value
+    if schema is None:
+        identity["state"] = "legacy"
+    elif type(schema) is not int or schema != _SCHEMA_VERSION:
+        identity["state"] = "invalid"
+    return identity, value
+
+
+def _annotation_identity(entry: dict | None) -> tuple[dict, list[str], list[str]]:
+    invalid: list[str] = []
+    audit: list[str] = []
+    if entry is None:
+        return {
+            "state": "missing",
+            "status": "pending",
+            "revision": 0,
+            "export": {"state": "missing", "sha256": None},
+            "export_completion": {"state": "missing", "sha256": None},
+        }, invalid, audit
+    if not isinstance(entry, dict):
+        return {
+            "state": "invalid",
+            "status": None,
+            "revision": None,
+            "export": {"state": "invalid", "sha256": None},
+            "export_completion": {"state": "invalid", "sha256": None},
+        }, ["anotacao invalida"], audit
+
+    status = entry.get("status", "pending")
+    if status not in {"pending", "in_progress", "done", "no_boom"}:
+        invalid.append("status da anotacao invalido")
+    revision = entry.get("annotation_revision")
+    if revision is None:
+        if status in {"done", "no_boom"}:
+            audit.append("anotacao legada sem revision")
+        revision = 0
+    elif type(revision) is not int or revision < 0:
+        invalid.append("annotation_revision invalida")
+        revision = None
+
+    export = entry.get("export")
+    if export is None:
+        export_identity = {"state": "missing", "sha256": None}
+    elif not isinstance(export, dict):
+        export_identity = {"state": "invalid", "sha256": None}
+        invalid.append("identidade do export invalida")
+    else:
+        try:
+            export_digest = _metadata_digest(export)
+        except (TypeError, ValueError):
+            export_digest = None
+        root = export.get("root")
+        segments = export.get("segments")
+        export_revision = export.get("annotation_revision")
+        owner = export.get("owner")
+        export_state = "valid"
+        if (
+            not isinstance(root, str)
+            or not root
+            or not isinstance(segments, list)
+            or not segments
+            or any(not isinstance(item, str) or not item for item in segments)
+            or len(set(segments)) != len(segments)
+        ):
+            export_state = "invalid"
+            invalid.append("identidade do export invalida")
+        if export_revision is None or owner is None:
+            if export_state != "invalid":
+                export_state = "legacy"
+            audit.append("export legado sem ownership completo")
+        elif (
+            type(export_revision) is not int
+            or revision is None
+            or export_revision != revision
+            or not isinstance(owner, dict)
+            or owner.get("video_id") != entry.get("video_id")
+            or owner.get("relpath") != entry.get("relpath")
+            or owner.get("annotation_revision") != export_revision
+        ):
+            export_state = "invalid"
+            invalid.append("ownership do export diverge da anotacao")
+        export_identity = {
+            "state": export_state,
+            "sha256": export_digest,
+            "root": root if isinstance(root, str) else None,
+            "segments": list(segments) if isinstance(segments, list) else None,
+            "annotation_revision": (
+                export_revision if type(export_revision) is int else None
+            ),
+        }
+
+    completion = entry.get("export_completion")
+    if completion is None:
+        completion_identity = {"state": "missing", "sha256": None}
+    elif isinstance(completion, dict):
+        try:
+            completion_digest = _metadata_digest(completion)
+        except (TypeError, ValueError):
+            completion_digest = None
+        completion_identity = {
+            "state": "valid" if completion_digest is not None else "invalid",
+            "sha256": completion_digest,
+        }
+        if completion_digest is None:
+            invalid.append("conclusao do export invalida")
+    else:
+        completion_identity = {"state": "invalid", "sha256": None}
+        invalid.append("conclusao do export invalida")
+
+    return {
+        "state": "invalid" if invalid else ("legacy" if audit else "valid"),
+        "status": status if isinstance(status, str) else None,
+        "revision": revision,
+        "export": export_identity,
+        "export_completion": completion_identity,
+    }, invalid, audit
+
+
+def _sam3_job_identity(sam3: dict | None) -> tuple[dict, list[str]]:
+    if sam3 is None:
+        return {"state": None, "run_id": None, "annotation_revision": None}, []
+    if not isinstance(sam3, dict):
+        return {
+            "state": "invalid",
+            "run_id": None,
+            "annotation_revision": None,
+        }, ["estado da fila SAM3 invalido"]
+    state = sam3.get("state")
+    revision = sam3.get("annotation_revision")
+    invalid = []
+    if state not in {"queued", "leased", "running", "done", "error", "cancelled"}:
+        invalid.append("estado da fila SAM3 invalido")
+    if revision is not None and (type(revision) is not int or revision < 0):
+        invalid.append("revisao da fila SAM3 invalida")
+    return {
+        "state": state,
+        "run_id": sam3.get("run_id") if isinstance(sam3.get("run_id"), str) else None,
+        "annotation_revision": revision if type(revision) is int else None,
+    }, invalid
 
 
 def _export_root(entry: dict, output_root: Path) -> Path | None:
@@ -136,6 +391,228 @@ def _object_ids(value: object) -> list[int] | None:
             return None
         result.append(obj_id)
     return result
+
+
+def _projection_downgrade(
+    snapshot: PipelineSnapshot,
+    *,
+    invalid: list[str],
+    audit: list[str],
+) -> PipelineSnapshot:
+    if invalid:
+        inconsistencies = tuple(dict.fromkeys((*snapshot.inconsistencies, *invalid)))
+        if snapshot.stage == "discarded":
+            return replace(
+                snapshot,
+                artifacts_valid=False,
+                validation_status="invalid",
+                inconsistencies=inconsistencies,
+            )
+        return PipelineSnapshot(
+            stage="sam3",
+            status="invalid",
+            expected_frames=snapshot.expected_frames,
+            reviewed_frames=snapshot.reviewed_frames,
+            edited_frames=snapshot.edited_frames,
+            artifacts_valid=False,
+            validation_status="invalid",
+            inconsistencies=inconsistencies,
+        )
+    if audit and snapshot.validation_status not in {"invalid", "not_applicable"}:
+        return PipelineSnapshot(
+            stage="review",
+            status="audit_required",
+            expected_frames=snapshot.expected_frames,
+            reviewed_frames=snapshot.reviewed_frames,
+            edited_frames=snapshot.edited_frames,
+            artifacts_valid=False,
+            validation_status="audit_required",
+            inconsistencies=snapshot.inconsistencies,
+        )
+    return snapshot
+
+
+def derive_pipeline_source(
+    entry: dict | None,
+    sam3: dict | None,
+    output_root: Path,
+) -> PipelineSource:
+    """Derive a deterministic source identity and metadata-only projection.
+
+    Only named control documents are opened.  Mask directories are never
+    enumerated and PNG bytes are reserved for the explicit deep-audit path.
+    """
+
+    annotation, invalid, audit = _annotation_identity(entry)
+    sam3_job, sam3_invalid = _sam3_job_identity(sam3)
+    invalid.extend(sam3_invalid)
+    identity: dict[str, Any] = {
+        "schema_version": 1,
+        "annotation": annotation,
+        "sam3_job": sam3_job,
+        "sam3_generation": {
+            "state": "missing",
+            "generation_id": None,
+            "manifest_sha256": None,
+        },
+        "segments": [],
+    }
+
+    raw_entry = entry if isinstance(entry, dict) else {}
+    raw_export = raw_entry.get("export")
+    raw_segments = raw_export.get("segments") if isinstance(raw_export, dict) else []
+    segments = (
+        list(raw_segments)
+        if isinstance(raw_segments, list)
+        and all(isinstance(item, str) and item for item in raw_segments)
+        else []
+    )
+    root: Path | None = None
+    if isinstance(raw_export, dict) and raw_export.get("root"):
+        try:
+            root = _export_root(raw_entry, output_root)
+        except Sam3GenerationError as exc:
+            invalid.append(str(exc))
+
+    current: dict | None = None
+    pointer_value: dict | None = None
+    pointer_identity = {"state": "missing", "sha256": None}
+    if root is not None:
+        pointer_identity, pointer_value = _manifest_identity(
+            current_manifest_path(root)
+        )
+        if pointer_identity["state"] == "invalid":
+            invalid.append("ponteiro SAM3 invalido")
+        elif pointer_value is not None:
+            generation_id = pointer_value.get("generation_id")
+            manifest_sha = pointer_value.get("manifest_sha256")
+            immutable = pointer_value.get("format") == "immutable-generation-v1"
+            generation_control = {"state": "missing", "sha256": None}
+            generation_identifier_invalid = False
+            if isinstance(generation_id, str) and generation_id:
+                try:
+                    manifest_path = generation_root(root, generation_id) / "generation.json"
+                except Sam3GenerationError:
+                    generation_identifier_invalid = True
+                    generation_control = {"state": "invalid", "sha256": None}
+                else:
+                    generation_control, _ = _manifest_identity(manifest_path)
+            if immutable and (
+                not isinstance(generation_id, str)
+                or not generation_id
+                or generation_identifier_invalid
+                or not isinstance(manifest_sha, str)
+                or _SHA256.fullmatch(manifest_sha) is None
+                or generation_control["state"] != "valid"
+            ):
+                invalid.append("manifesto da geracao SAM3 invalido")
+                generation_state = "invalid"
+            else:
+                try:
+                    current = load_current_manifest(root)
+                except Sam3GenerationError as exc:
+                    invalid.append(str(exc))
+                    generation_state = "invalid"
+                else:
+                    generation_state = "valid" if immutable else "legacy"
+                    if not immutable:
+                        audit.append("ponteiro SAM3 legado")
+            identity["sam3_generation"] = {
+                "state": generation_state,
+                "generation_id": generation_id if isinstance(generation_id, str) else None,
+                "manifest_sha256": manifest_sha if isinstance(manifest_sha, str) else None,
+                "pointer_sha256": pointer_identity.get("sha256"),
+                "manifest_control_sha256": generation_control.get("sha256"),
+            }
+
+    legacy_run_found = False
+    for segment_name in segments:
+        segment_identity: dict[str, Any] = {
+            "segment": segment_name,
+            "prompt": {"state": "missing", "sha256": None},
+            "prompt_override": {"state": "missing", "sha256": None},
+            "run": {"state": "missing", "sha256": None},
+            "mask_review": {
+                "state": "missing",
+                "sha256": None,
+                "max_revision": 0,
+                "reviewed_frames": 0,
+            },
+        }
+        identity["segments"].append(segment_identity)
+        if root is None:
+            continue
+        try:
+            segment = resolve_segment_dir(root, segment_name)
+        except Sam3GenerationError as exc:
+            invalid.append(f"{segment_name}: {exc}")
+            continue
+
+        prompt_identity, _ = _manifest_identity(segment / "prompt.json")
+        segment_identity["prompt"] = prompt_identity
+        if prompt_identity["state"] == "missing":
+            invalid.append(f"{segment_name}: prompt.json ausente")
+        elif prompt_identity["state"] == "legacy":
+            audit.append(f"{segment_name}: prompt.json legado")
+        elif prompt_identity["state"] == "invalid":
+            invalid.append(f"{segment_name}: prompt.json invalido")
+
+        try:
+            override_path = effective_prompt_override_path(segment)
+        except Sam3GenerationError as exc:
+            invalid.append(f"{segment_name}: {exc}")
+            override_path = None
+        if override_path is not None:
+            override_identity, _ = _manifest_identity(
+                override_path, schema_optional=True
+            )
+            segment_identity["prompt_override"] = override_identity
+            if override_identity["state"] == "invalid":
+                invalid.append(f"{segment_name}: prompt_override.json invalido")
+
+        out = legacy_segment_output(segment)
+        if pointer_value is not None and current is not None:
+            try:
+                out = active_segment_output(segment)
+            except Sam3GenerationError as exc:
+                invalid.append(f"{segment_name}: {exc}")
+                continue
+
+        run_identity, _ = _manifest_identity(out / "run.json")
+        segment_identity["run"] = run_identity
+        if run_identity["state"] == "legacy":
+            audit.append(f"{segment_name}: run.json legado")
+        elif run_identity["state"] == "invalid":
+            invalid.append(f"{segment_name}: run.json invalido")
+        if pointer_value is None and run_identity["state"] != "missing":
+            legacy_run_found = True
+
+        review_identity = mask_review_manifest_identity(out / "mask_review.json")
+        segment_identity["mask_review"] = review_identity
+        if review_identity["state"] == "legacy":
+            audit.append(f"{segment_name}: mask_review.json legado")
+        elif review_identity["state"] == "invalid":
+            invalid.append(f"{segment_name}: mask_review.json invalido")
+
+    if pointer_value is None and legacy_run_found:
+        identity["sam3_generation"] = {
+            "state": "legacy",
+            "generation_id": None,
+            "manifest_sha256": None,
+            "pointer_sha256": pointer_identity.get("sha256"),
+        }
+        audit.append("run SAM3 legado sem geracao imutavel")
+    elif pointer_identity["state"] == "invalid":
+        identity["sam3_generation"] = {
+            "state": "invalid",
+            "generation_id": None,
+            "manifest_sha256": None,
+            "pointer_sha256": pointer_identity.get("sha256"),
+        }
+
+    snapshot = inspect_pipeline_entry(entry, sam3, output_root)
+    snapshot = _projection_downgrade(snapshot, invalid=invalid, audit=audit)
+    return PipelineSource(identity=identity, snapshot=snapshot)
 
 
 def inspect_pipeline_entry(
