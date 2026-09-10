@@ -673,6 +673,31 @@ def get_many(
     return {record.video_id: record for record in records}
 
 
+def persisted_keys(
+    *,
+    database_url: str | None = None,
+    connect: ConnectArg = None,
+) -> set[tuple[str, str]]:
+    """Return every video key retained by either projection table in one query."""
+
+    connection = _open_connection(database_url, connect)
+    if connection is None:
+        return set()
+    with connection:
+        with connection.cursor() as cursor:
+            _configure_transaction(cursor)
+            cursor.execute(
+                """
+                SELECT object_id, video_id FROM video_pipeline_projection
+                UNION
+                SELECT object_id, video_id FROM video_pipeline_projection_events
+                ORDER BY object_id, video_id
+                """
+            )
+            rows = cursor.fetchall()
+    return {(str(object_id), str(video_id)) for object_id, video_id in rows}
+
+
 def pending_intents(
     *,
     limit: int = 100,

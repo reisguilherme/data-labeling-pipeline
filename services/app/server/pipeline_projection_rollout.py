@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .pipeline_projection import get_many
+from .pipeline_projection import apply_intent, get_many, persisted_keys, reserve_repair_intent
 
 
 @dataclass(frozen=True)
@@ -149,47 +149,28 @@ def run_batch(
     }
 
 
-def _load_annotation_store_read_only(ctx) -> bool:
-    """Load annotations without AnnotationStore's corrupt-file backup write."""
+def _unregistered_source(
+    object_id: str,
+    video_id: str,
+    *,
+    state: str,
+):
+    from .pipeline_state import PipelineSnapshot, PipelineSource
 
-    path = ctx.annotations_path
-    invalid = False
-    if path.exists():
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(document, dict):
-                raise ValueError("annotations root must be an object")
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            document = {"schema_version": 2, "videos": {}, "counts": {}}
-            invalid = True
-    else:
-        document = {"schema_version": 2, "videos": {}, "counts": {}}
-    document.setdefault("videos", {})
-    document.setdefault("counts", {})
-    with ctx.store._state_lock:
-        ctx.store._doc = document
-        ctx.store.loaded = True
-    return invalid
-
-
-def _pending_by_object(*, database_url: str) -> dict[str, set[str]]:
-    from .pipeline_projection import pending_intents
-
-    found: dict[str, set[str]] = defaultdict(set)
-    seen: set[int] = set()
-    after = 0
-    while True:
-        batch = pending_intents(
-            limit=1000, after_event_seq=after, database_url=database_url
-        )
-        fresh = [intent for intent in batch if intent.event_seq not in seen]
-        if not fresh:
-            break
-        for intent in fresh:
-            seen.add(intent.event_seq)
-            found[intent.object_id].add(intent.video_id)
-        after = max(intent.event_seq for intent in fresh)
-    return found
+    return PipelineSource(
+        identity={
+            "schema_version": 1,
+            "object": {"object_id": object_id, "state": state},
+            "video": {"video_id": video_id, "present": None},
+        },
+        snapshot=PipelineSnapshot(
+            stage="triage",
+            status=state,
+            artifacts_valid=False,
+            validation_status="invalid",
+            inconsistencies=(f"objeto {state} no registro canonico",),
+        ),
+    )
 
 
 def collect_candidates(
@@ -200,8 +181,7 @@ def collect_candidates(
 ) -> list[ProjectionCandidate]:
     """Read canonical control metadata and build a deterministic inventory."""
 
-    from .pipeline_reconcile import _terminal_source
-    from .pipeline_state import PipelineSnapshot, PipelineSource, derive_pipeline_source
+    from .pipeline_reconcile import derive_read_only_pipeline_source
     from .sam3_postgres import PostgresSam3Queue
     from .workspace import ObjectConfig, ObjectContext
     from . import pipeline_reconcile
@@ -215,57 +195,50 @@ def collect_candidates(
     if not isinstance(raw_objects, list):
         raise RuntimeError(f"registro de objetos invalido: {registry}")
     selected = set(object_ids or ())
-    configs = [ObjectConfig.from_json(item, workspace_root) for item in raw_objects]
+    configs_by_id = {}
+    invalid_object_ids: set[str] = set()
+    for item in raw_objects:
+        raw_id = (
+            str(item.get("object_id") or "").strip()
+            if isinstance(item, dict)
+            else ""
+        )
+        try:
+            config = ObjectConfig.from_json(item, workspace_root)
+        except (KeyError, TypeError, ValueError):
+            if raw_id:
+                invalid_object_ids.add(raw_id)
+            continue
+        configs_by_id[config.object_id] = config
     if selected:
-        known = {config.object_id for config in configs}
+        known = set(configs_by_id) | invalid_object_ids
         missing = sorted(selected - known)
         if missing:
             raise ValueError("objetos desconhecidos: " + ", ".join(missing))
-        configs = [config for config in configs if config.object_id in selected]
+        configs_by_id = {
+            object_id: config
+            for object_id, config in configs_by_id.items()
+            if object_id in selected
+        }
+        invalid_object_ids.intersection_update(selected)
 
-    pending = _pending_by_object(database_url=database_url)
+    persisted_by_object: dict[str, set[str]] = defaultdict(set)
+    for object_id, video_id in persisted_keys(database_url=database_url):
+        if not selected or object_id in selected:
+            persisted_by_object[object_id].add(video_id)
     queue = PostgresSam3Queue(database_url)
     pipeline_reconcile.sam3_queue = queue
     candidates: list[ProjectionCandidate] = []
-    for config in sorted(configs, key=lambda item: item.object_id):
+    for config in sorted(configs_by_id.values(), key=lambda item: item.object_id):
         ctx = ObjectContext(config)
+        # Missing deployment mounts are operational errors, not canonical
+        # evidence that every video was deleted.
+        ctx._require_registered_roots()
         ctx.index.scan()
-        invalid_annotations = _load_annotation_store_read_only(ctx)
-        # Prevent reconcile_video from calling ensure_dirs or binding any file
-        # queue.  Everything it needs for metadata repair is already loaded.
-        ctx._loaded = True
         video_ids = {video.video_id for video in ctx.index.all()}
-        video_ids.update(pending.get(config.object_id, set()))
+        video_ids.update(persisted_by_object.pop(config.object_id, set()))
         for video_id in sorted(video_ids):
-            video = ctx.index.get(video_id)
-            if config.archived or video is None:
-                source = _terminal_source(
-                    object_id=config.object_id,
-                    video_id=video_id,
-                    archived=config.archived,
-                    present=None if config.archived else False,
-                )
-            elif invalid_annotations:
-                source = PipelineSource(
-                    identity={
-                        "schema_version": 1,
-                        "annotation": {"state": "invalid"},
-                        "video": {"video_id": video_id, "present": True},
-                    },
-                    snapshot=PipelineSnapshot(
-                        stage="triage",
-                        status="invalid",
-                        artifacts_valid=False,
-                        validation_status="invalid",
-                        inconsistencies=("annotations.json invalido",),
-                    ),
-                )
-            else:
-                source = derive_pipeline_source(
-                    ctx.store.entry(video.relpath),
-                    queue.public(config.object_id, video.relpath),
-                    ctx.output_root,
-                )
+            source = derive_read_only_pipeline_source(ctx, video_id)
             candidates.append(
                 ProjectionCandidate(
                     config.object_id,
@@ -273,7 +246,19 @@ def collect_candidates(
                     source.identity,
                     source.snapshot_dict,
                     ctx,
-                    not invalid_annotations,
+                    True,
+                )
+            )
+    for object_id in sorted(persisted_by_object):
+        state = "invalid" if object_id in invalid_object_ids else "missing"
+        for video_id in sorted(persisted_by_object[object_id]):
+            source = _unregistered_source(object_id, video_id, state=state)
+            candidates.append(
+                ProjectionCandidate(
+                    object_id,
+                    video_id,
+                    source.identity,
+                    source.snapshot_dict,
                 )
             )
     return candidates
@@ -292,15 +277,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def verify_projection_schema(database_url: str) -> None:
+    """Fail read-only when migrations 005/006 have not been marked applied."""
+
+    import psycopg
+
+    with psycopg.connect(database_url, connect_timeout=5) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT to_regclass('video_pipeline_projection_events')::text,
+                       to_regclass('video_pipeline_projection')::text,
+                       to_regclass('video_pipeline_projection_barriers')::text,
+                       to_regclass('schema_migrations')::text
+                """
+            )
+            tables = cursor.fetchone()
+            marked = False
+            if tables[3] is not None:
+                cursor.execute(
+                    """
+                    SELECT count(*) = 2 FROM schema_migrations
+                     WHERE name IN ('005_video_pipeline_projection.sql',
+                                    '006_video_pipeline_projection_barriers.sql')
+                    """
+                )
+                marked = bool(cursor.fetchone()[0])
+    if any(name is None for name in tables[:3]) or not marked:
+        raise RuntimeError(
+            "schema de projecao incompleto: aplique as migrations 005 e 006 "
+            "iniciando app/worker antes de executar o reconciliador"
+        )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    database_url_factory: Callable[[], str] | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
     if not 1 <= args.limit <= 1000:
         build_parser().error("--limit deve estar entre 1 e 1000")
     database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url and database_url_factory is not None:
+        database_url = database_url_factory()
+        os.environ["DATABASE_URL"] = database_url
     if not database_url:
         print("DATABASE_URL ausente", file=sys.stderr)
         return 2
     try:
+        verify_projection_schema(database_url)
         candidates = collect_candidates(
             args.workspace.resolve(),
             database_url=database_url,
@@ -310,7 +336,26 @@ def main(argv: list[str] | None = None) -> int:
             from .pipeline_reconcile import reconcile_video
 
             def repair(candidate: ProjectionCandidate):
-                return reconcile_video(candidate.context, candidate.video_id)
+                if candidate.context is not None:
+                    return reconcile_video(
+                        candidate.context,
+                        candidate.video_id,
+                        read_only=True,
+                    )
+                intent, current = reserve_repair_intent(
+                    object_id=candidate.object_id,
+                    video_id=candidate.video_id,
+                    source_identity=candidate.source_identity,
+                    snapshot=candidate.snapshot,
+                    database_url=database_url,
+                )
+                if current is not None or intent is None:
+                    return current
+                return apply_intent(
+                    intent,
+                    candidate.snapshot,
+                    database_url=database_url,
+                )
         else:
             repair = None
         report = run_batch(

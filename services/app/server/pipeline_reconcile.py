@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 
@@ -47,6 +48,82 @@ def _terminal_source(
     )
 
 
+def _invalid_annotation_source(
+    *, object_id: str, video_id: str, present: bool
+) -> PipelineSource:
+    return PipelineSource(
+        identity={
+            "schema_version": 1,
+            "object": {"object_id": object_id, "archived": False},
+            "annotation": {"state": "invalid"},
+            "video": {"video_id": video_id, "present": present},
+        },
+        snapshot=PipelineSnapshot(
+            stage="triage",
+            status="invalid",
+            artifacts_valid=False,
+            validation_status="invalid",
+            inconsistencies=("annotations.json invalido",),
+        ),
+    )
+
+
+def _read_annotation_entry(ctx, relpath: str) -> tuple[object | None, bool]:
+    """Read one annotation entry without invoking AnnotationStore recovery writes."""
+
+    path = ctx.annotations_path
+    if not path.exists():
+        return None, False
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, True
+    if not isinstance(document, dict):
+        return None, True
+    videos = document.get("videos")
+    counts = document.get("counts")
+    if not isinstance(videos, dict) or not isinstance(counts, dict):
+        return None, True
+    return videos.get(relpath), False
+
+
+def derive_read_only_pipeline_source(
+    ctx,
+    video_id: str,
+    *,
+    archived: bool | None = None,
+) -> PipelineSource:
+    """Derive canonical metadata without creating directories or backup files."""
+
+    object_id = str(getattr(ctx, "object_id", "") or "").strip()
+    if archived is None:
+        archived = bool(getattr(getattr(ctx, "config", None), "archived", False))
+    if archived:
+        return _terminal_source(
+            object_id=object_id,
+            video_id=video_id,
+            archived=True,
+            present=None,
+        )
+    video = ctx.index.get(video_id)
+    if video is None:
+        return _terminal_source(
+            object_id=object_id,
+            video_id=video_id,
+            archived=False,
+            present=False,
+        )
+    entry, invalid = _read_annotation_entry(ctx, video.relpath)
+    if invalid:
+        return _invalid_annotation_source(
+            object_id=object_id,
+            video_id=video_id,
+            present=True,
+        )
+    sam3 = sam3_queue.public(object_id, video.relpath)
+    return derive_pipeline_source(entry, sam3, ctx.output_root)
+
+
 def _record_failure(intent: ProjectionIntent | None, error: Exception) -> None:
     if intent is None:
         return
@@ -75,6 +152,7 @@ def reconcile_video(
     *,
     intent: ProjectionIntent | None = None,
     publication_fence: Callable[[], AbstractContextManager] | None = None,
+    read_only: bool = False,
 ) -> ProjectionRecord | None:
     """Rebuild and conditionally apply one video's projection.
 
@@ -101,7 +179,13 @@ def reconcile_video(
         # event_seq while another process is publishing newer metadata.
         with video_fence(object_id, video_id), pipeline_projection.object_fence(object_id):
             archived = _authoritative_archived(ctx, object_id)
-            if archived:
+            if read_only:
+                source = derive_read_only_pipeline_source(
+                    ctx,
+                    video_id,
+                    archived=archived,
+                )
+            elif archived:
                 source = _terminal_source(
                     object_id=object_id,
                     video_id=video_id,

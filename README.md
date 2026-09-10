@@ -232,9 +232,10 @@ demonstram nem substituem essa medicao operacional.
 As migrations `005_video_pipeline_projection.sql` e
 `006_video_pipeline_projection_barriers.sql` sao aditivas. A 006 cria a barreira
 monotonicamente ordenada que impede uma aplicacao antiga de voltar a tornar
-atual uma projecao invalidada por archive, restore ou rename. O entrypoint roda
-todas as migrations pendentes antes de importar ou executar o reconciliador;
-portanto, use sempre os wrappers abaixo dentro da imagem nova.
+atual uma projecao invalidada por archive, restore ou rename. Inicie primeiro a
+app ou o worker da imagem nova para aplicar as migrations 005/006. O
+reconciliador nao executa migrations: ele verifica o schema somente para leitura
+e falha com orientacao quando os marcadores ou tabelas ainda nao existem.
 
 O padrao e um inventario estritamente somente-leitura:
 
@@ -250,6 +251,10 @@ O JSON informa `current`, `stale`, `missing`, `pending`, `legacy` e `invalid`.
 `legacy` e `invalid` tambem descrevem a saude dos metadados canonicos e podem
 coexistir com uma linha atual. O comando le apenas o registro, nomes de videos,
 JSONs de controle e PostgreSQL; nao abre pixels de mascara nem escreve arquivos.
+Os wrappers preservam a selecao Compose do deploy (`compose.override.yml` e
+`COMPOSE_FILE`, quando usados). Antes de inventariar, o comando exige que as
+raizes registradas estejam montadas; raiz ausente e erro operacional, nao
+tombstone de video.
 
 Escrita exige `--apply` explicito e fica limitada as tabelas aditivas
 `video_pipeline_projection_events`, `video_pipeline_projection` e

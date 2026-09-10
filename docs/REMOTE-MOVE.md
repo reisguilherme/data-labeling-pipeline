@@ -146,18 +146,24 @@ docker compose logs --since 10m app worker
 
 Para a versao com projecao operacional, mantenha PostgreSQL ativo, mas app e
 workers parados. Depois do backup e do `git pull --ff-only`, construa a imagem e
-rode primeiro o dry-run. O entrypoint aplica a migration aditiva 006 antes de
-carregar o novo comando; nao inicie o codigo novo contra um banco onde ela ainda
-nao rodou:
+inicie app/worker para aplicar as migrations aditivas 005/006. So entao rode o
+dry-run. O reconciliador apenas verifica schema e marcadores, sem executar
+migration; se a 006 nao tiver rodado, ele falha com orientacao e sem escrita:
 
 ```bash
 docker compose build app worker
+docker compose up -d --no-deps --force-recreate app worker
 ./scripts/reconcile-pipeline-projection.sh --limit 100
 ```
 
 O relatorio e somente-leitura e separa `current`, `stale`, `missing`, `pending`,
 `legacy` e `invalid`. Investigue erros de metadados antes do apply. Para reparar,
 use lotes limitados e retome exatamente do token retornado:
+
+Os wrappers usam a mesma selecao Compose do deploy, incluindo
+`compose.override.yml`/`COMPOSE_FILE`. O inventario valida primeiro todas as
+raizes registradas; um mount ausente aborta como erro operacional em vez de ser
+interpretado como video removido.
 
 ```bash
 ./scripts/reconcile-pipeline-projection.sh --apply --limit 100

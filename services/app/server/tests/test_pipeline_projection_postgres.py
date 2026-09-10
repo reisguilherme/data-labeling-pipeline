@@ -9,6 +9,7 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from server.pipeline_projection import (
     apply_intent,
@@ -34,9 +35,104 @@ class PipelineProjectionRolloutCommandTests(unittest.TestCase):
         self.assertIn("--limit", completed.stdout)
         self.assertIn("--resume-token", completed.stdout)
 
+    def test_packaged_entrypoint_dispatches_help_without_migration_or_database_setup(self):
+        import entrypoint
+
+        with patch.object(sys, "argv", ["entrypoint.py", "reconcile-pipeline-projection", "--help"]), \
+             patch.object(entrypoint, "secret", return_value="synthetic"), \
+             patch.object(entrypoint, "migrate") as migrate, \
+             patch.object(entrypoint, "database_url", return_value="synthetic") as database:
+            with self.assertRaises(SystemExit) as stopped:
+                entrypoint.main()
+        self.assertEqual(stopped.exception.code, 0)
+        migrate.assert_not_called()
+        database.assert_not_called()
+
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
 class PipelineProjectionPostgresTests(unittest.TestCase):
+    def test_cli_refuses_missing_schema_without_writing_migration_markers(self):
+        from server import pipeline_projection_rollout as rollout
+
+        with self._connect() as connection:
+            connection.execute("DROP TABLE video_pipeline_projection_barriers")
+            connection.execute(
+                "CREATE TABLE schema_migrations(name text PRIMARY KEY, applied_at timestamptz DEFAULT now())"
+            )
+        before = self._all_schema_rows()
+        with patch.dict(os.environ, {"DATABASE_URL": self.url, "PGOPTIONS": f"-c search_path={self.schema}"}):
+            with patch("builtins.print") as output:
+                code = rollout.main(["--workspace", "/does/not/matter"])
+        self.assertEqual(code, 2)
+        self.assertIn("006", " ".join(str(call) for call in output.call_args_list))
+        self.assertEqual(self._all_schema_rows(), before)
+
+    def test_persisted_removed_video_and_unregistered_object_are_inventoried_in_bulk(self):
+        from server import pipeline_projection_rollout as rollout
+
+        root = self._workspace_root()
+        for object_id, video_id in (("boom", "removed-video"), ("ghost", "orphan-video")):
+            intent = reserve_intent(
+                object_id=object_id,
+                video_id=video_id,
+                event_kind="fixture",
+                source_identity={"state": "valid"},
+                connect=self._connect,
+            )
+            apply_intent(intent, {"complete": True}, connect=self._connect)
+        with patch.dict(os.environ, {"PGOPTIONS": f"-c search_path={self.schema}"}):
+            candidates = rollout.collect_candidates(root, database_url=self.url)
+        by_key = {(item.object_id, item.video_id): item for item in candidates}
+        self.assertIn(("boom", "removed-video"), by_key)
+        self.assertIn(("ghost", "orphan-video"), by_key)
+        self.assertEqual(by_key[("boom", "removed-video")].snapshot["stage_status"], "missing")
+        self.assertEqual(by_key[("ghost", "orphan-video")].source_identity["object"]["state"], "missing")
+        self.assertTrue(by_key[("ghost", "orphan-video")].repairable)
+
+    def test_read_only_apply_does_not_backup_annotations_corrupted_after_inventory(self):
+        from server import pipeline_projection_rollout as rollout
+        from server import pipeline_reconcile
+        from server.sam3_postgres import PostgresSam3Queue
+
+        root = self._workspace_root(with_video=True)
+        with patch.dict(os.environ, {"DATABASE_URL": self.url, "PGOPTIONS": f"-c search_path={self.schema}"}):
+            with self._connect() as connection:
+                migration = Path(__file__).resolve().parents[4] / "migrations" / "001_initial.sql"
+                connection.execute(migration.read_text(encoding="utf-8"))
+            candidates = rollout.collect_candidates(root, database_url=self.url)
+            candidate = candidates[0]
+            candidate.context.annotations_path.write_text("{broken", encoding="utf-8")
+            pipeline_reconcile.sam3_queue = PostgresSam3Queue(self.url)
+            try:
+                rollout.run_batch(
+                    candidates,
+                    limit=1,
+                    apply=True,
+                    repair=lambda item: pipeline_reconcile.reconcile_video(
+                        item.context, item.video_id, read_only=True
+                    ),
+                    database_url=self.url,
+                )
+            except TypeError as exc:
+                self.fail(f"reconciliacao read-only ausente: {exc}")
+        self.assertFalse(candidate.context.annotations_path.with_suffix(".corrupt.json").exists())
+        record = get_many("boom", [candidate.video_id], connect=self._connect)[candidate.video_id]
+        self.assertEqual(record.snapshot["validation_status"], "invalid")
+
+    def test_structurally_invalid_annotations_are_counted_without_exception(self):
+        from server import pipeline_projection_rollout as rollout
+
+        for malformed in ({"videos": []}, {"videos": None}, {"videos": {}, "counts": []}):
+            with self.subTest(malformed=malformed):
+                root = self._workspace_root(with_video=True, annotations=malformed)
+                with patch.dict(os.environ, {"PGOPTIONS": f"-c search_path={self.schema}"}), \
+                     patch("server.sam3_postgres.PostgresSam3Queue.public", return_value=None):
+                    try:
+                        candidates = rollout.collect_candidates(root, database_url=self.url)
+                    except (AttributeError, TypeError) as exc:
+                        self.fail(f"JSON estrutural invalido abortou inventario: {exc}")
+                report = rollout.run_batch(candidates, connect=self._connect)
+                self.assertEqual(report["counts"]["invalid"], 1)
     def test_rollout_dry_run_command_reads_workspace_without_changing_files_or_database(self):
         root = Path(tempfile.mkdtemp())
         raw = root / "boom" / "raw"
@@ -68,6 +164,16 @@ class PipelineProjectionPostgresTests(unittest.TestCase):
         migration = Path(__file__).resolve().parents[4] / "migrations" / "001_initial.sql"
         with self._connect() as connection:
             connection.execute(migration.read_text(encoding="utf-8"))
+            connection.execute(
+                "CREATE TABLE schema_migrations(name text PRIMARY KEY, applied_at timestamptz DEFAULT now())"
+            )
+            connection.execute(
+                "INSERT INTO schema_migrations(name) VALUES (%s), (%s)",
+                (
+                    "005_video_pipeline_projection.sql",
+                    "006_video_pipeline_projection_barriers.sql",
+                ),
+            )
         before_files = sorted(
             (path.relative_to(root).as_posix(), path.read_bytes())
             for path in root.rglob("*")
@@ -226,6 +332,32 @@ class PipelineProjectionPostgresTests(unittest.TestCase):
                 "FROM video_pipeline_projection ORDER BY object_id, video_id"
             ).fetchall()
         return events, rows
+
+    def _all_schema_rows(self):
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema=%s ORDER BY table_name",
+                (self.schema,),
+            ).fetchall()
+
+    def _workspace_root(self, *, with_video=False, annotations=None):
+        root = Path(tempfile.mkdtemp())
+        raw = root / "boom" / "raw"
+        dataset = root / "boom" / "dataset"
+        raw.mkdir(parents=True)
+        dataset.mkdir(parents=True)
+        if with_video:
+            (raw / "clip.mp4").write_bytes(b"")
+        document = annotations if annotations is not None else {"schema_version": 2, "videos": {}, "counts": {}}
+        (dataset / "annotations.json").write_text(json.dumps(document), encoding="utf-8")
+        (root / "objects.json").write_text(
+            json.dumps({"schema_version": 2, "objects": [{
+                "object_id": "boom", "display_name": "Boom", "label": "boom",
+                "videos_root": "boom/raw", "output_root": "boom/dataset",
+            }]}),
+            encoding="utf-8",
+        )
+        return root
 
     def test_barrier_upgrade_after_005_is_independent_and_replay_safe(self):
         migrations = Path(__file__).resolve().parents[4] / "migrations"

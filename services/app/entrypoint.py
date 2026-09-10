@@ -70,13 +70,22 @@ def ensure_buckets() -> None:
 
 
 def main() -> int:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "app"
+    if mode == "reconcile-pipeline-projection":
+        ensure_app_import_path()
+        from server.pipeline_projection_rollout import main as reconcile_main
+
+        return reconcile_main(
+            ["--workspace", os.environ.get("MST_WORKSPACE", "/workspace"), *sys.argv[2:]],
+            database_url_factory=database_url,
+        )
+
     secret("MST_WORKER_TOKEN", required=True)
     secret("MINIO_ROOT_USER", required=True)
     secret("MINIO_ROOT_PASSWORD", required=True)
     url = database_url()
     os.environ["DATABASE_URL"] = url
     migrate(url)
-    mode = sys.argv[1] if len(sys.argv) > 1 else "app"
     if mode == "migrate-legacy":
         ensure_buckets()
         return subprocess.call(
@@ -96,13 +105,6 @@ def main() -> int:
         return subprocess.call([sys.executable, "/opt/service/backup.py", *sys.argv[2:]])
     if mode == "restore":
         return subprocess.call([sys.executable, "/opt/service/restore.py", *sys.argv[2:]])
-    if mode == "reconcile-pipeline-projection":
-        ensure_app_import_path()
-        from server.pipeline_projection_rollout import main as reconcile_main
-
-        return reconcile_main(
-            ["--workspace", os.environ.get("MST_WORKSPACE", "/workspace"), *sys.argv[2:]]
-        )
     if mode == "app":
         ensure_buckets()
     if mode == "worker":
