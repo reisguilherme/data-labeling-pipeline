@@ -19,7 +19,7 @@ from typing import Callable
 
 from pipeline_core.jobs import PostgresJobQueue
 from pipeline_core.storage import MinioBlobStore
-from server.pipeline_projection_jobs import run_projection_reconcile
+from server.pipeline_projection_jobs import ProjectionRepairLeaseLost, run_projection_reconcile
 
 
 class Cancelled(RuntimeError):
@@ -1198,7 +1198,7 @@ def main() -> int:
                     str(job["id"]), token, state="done", result=result
                 ),
             )
-        except Cancelled as exc:
+        except (Cancelled, ProjectionRepairLeaseLost) as exc:
             stop_heartbeat.set()
             heartbeat.join(timeout=5)
             _settle_job_best_effort(

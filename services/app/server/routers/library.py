@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import replace
 import logging
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from starlette.responses import FileResponse, Response
@@ -21,6 +24,15 @@ router = APIRouter(prefix="/api/objects/{object_id}", tags=["library"])
 _listing_singleflight = AsyncSingleFlight()
 _STORE_ENTRY_UNSET = object()
 _REPAIR_LIMIT = 20
+_repair_cursors: OrderedDict[str, str] = OrderedDict()
+_repair_cursor_lock = threading.Lock()
+_STAGE_STATUSES = {
+    "triage": {"pending", "in_progress", "missing"},
+    "discarded": {"discarded", "archived"},
+    "sam3": {"ready", "queued", "leased", "running", "error", "cancelled", "invalid"},
+    "review": {"waiting", "in_progress", "audit_required"},
+    "completed": {"validated"},
+}
 log = logging.getLogger(__name__)
 
 
@@ -83,18 +95,47 @@ def _verified_snapshot(record, source):
     value = record.snapshot
     try:
         counts = [value[key] for key in ("expected_frames", "reviewed_frames", "edited_frames")]
-        if any(type(count) is not int or count < 0 for count in counts):
+        if any(type(count) is not int or not 0 <= count <= 2**53 - 1 for count in counts):
             return None, "stale"
-        if value["pipeline_stage"] not in {"triage", "sam3", "review", "completed", "discarded"}:
+        expected, reviewed, edited = counts
+        if not edited <= reviewed <= expected:
             return None, "stale"
-        if not isinstance(value["stage_status"], str) or type(value["artifacts_valid"]) is not bool:
+        stage, status = value["pipeline_stage"], value["stage_status"]
+        if not isinstance(stage, str) or not isinstance(status, str) or status not in _STAGE_STATUSES.get(stage, set()):
             return None, "stale"
-        if not isinstance(value["validation_status"], str) or not isinstance(value["inconsistencies"], list):
+        if type(value["complete"]) is not bool or value["complete"] != (stage == "completed"):
             return None, "stale"
-        if value["pipeline_stage"] == "completed" or value.get("complete"):
-            if not (value["pipeline_stage"] == "completed" and value["stage_status"] == "validated"
-                    and value.get("complete") is True and value["artifacts_valid"] is True
-                    and value["validation_status"] == "manifest" and counts[0] > 0 and counts[1] >= counts[0]):
+        if type(value["artifacts_valid"]) is not bool or value["validation_status"] not in {
+            "manifest", "invalid", "audit_required", "not_applicable",
+        }:
+            return None, "stale"
+        diagnostics = value["inconsistencies"]
+        if not isinstance(diagnostics, list) or len(diagnostics) > 64:
+            return None, "stale"
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, str) or not diagnostic.strip() or len(diagnostic) > 1000:
+                return None, "stale"
+            if any(ord(char) < 32 for char in diagnostic):
+                return None, "stale"
+            diagnostic.encode("utf-8")
+        if stage == "completed":
+            if not (value["artifacts_valid"] and value["validation_status"] == "manifest"
+                    and expected > 0 and reviewed == expected and not diagnostics):
+                return None, "stale"
+        if stage == "review":
+            if expected <= 0:
+                return None, "stale"
+            if status == "audit_required":
+                if value["validation_status"] != "audit_required" or value["artifacts_valid"]:
+                    return None, "stale"
+            elif not (value["artifacts_valid"] and value["validation_status"] == "manifest"
+                      and not diagnostics and reviewed < expected
+                      and (reviewed == 0) == (status == "waiting")):
+                return None, "stale"
+        if stage == "sam3":
+            if status == "ready" and (value["artifacts_valid"] or diagnostics):
+                return None, "stale"
+            if status == "invalid" and (value["artifacts_valid"] or not diagnostics or value["validation_status"] != "invalid"):
                 return None, "stale"
         return PipelineSnapshot(
             stage=value["pipeline_stage"], status=value["stage_status"],
@@ -102,8 +143,24 @@ def _verified_snapshot(record, source):
             artifacts_valid=value["artifacts_valid"], validation_status=value["validation_status"],
             inconsistencies=tuple(value["inconsistencies"]),
         ), "current"
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, UnicodeError):
         return None, "stale"
+
+
+def _next_repair_batch(object_id: str, repairs: list[dict]) -> list[dict]:
+    """Round-robin through metadata repairs, including persistent failures."""
+    ordered = sorted(repairs, key=lambda item: item["video_id"])
+    ids = [item["video_id"] for item in ordered]
+    with _repair_cursor_lock:
+        start = bisect_right(ids, _repair_cursors.get(object_id, ""))
+        batch = (ordered[start:] + ordered[:start])[:_REPAIR_LIMIT]
+        if batch:
+            _repair_cursors[object_id] = batch[-1]["video_id"]
+            _repair_cursors.move_to_end(object_id)
+            # Bound process memory across object archive/delete churn.
+            if len(_repair_cursors) > 256:
+                _repair_cursors.popitem(last=False)
+        return batch
 
 
 def _build_video_listing(
@@ -133,8 +190,7 @@ def _build_video_listing(
             pipeline = source.snapshot
             if pipeline.stage == "completed":
                 pipeline = replace(pipeline, stage="review", status="projection_pending")
-            if len(repairs) < _REPAIR_LIMIT:
-                repairs.append({"video_id": video.video_id, "source_identity": source.identity})
+            repairs.append({"video_id": video.video_id, "source_identity": source.identity})
         item = video_payload(
             ctx,
             video,
@@ -150,7 +206,7 @@ def _build_video_listing(
         items.append(item)
     if repairs:
         try:
-            durable_jobs.enqueue_projection_reconciles(ctx.object_id, repairs)
+            durable_jobs.enqueue_projection_reconciles(ctx.object_id, _next_repair_batch(ctx.object_id, repairs))
         except Exception:
             log.warning("Pipeline projection repair queue unavailable for object %s", ctx.object_id)
     pipeline_counts: dict[str, int] = {}

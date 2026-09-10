@@ -80,6 +80,61 @@ class LibraryProjectionTests(unittest.TestCase):
         self.assertEqual(result["videos"][0]["pipeline_stage"], "review")
         self.assertEqual(result["pipeline_counts"], {"review": 1})
 
+    def test_malformed_nested_diagnostics_and_incoherent_snapshots_fall_back_safely(self):
+        mutations = [
+            {"inconsistencies": [{"bad": "not renderable"}]},
+            {"inconsistencies": [["nested"]]}, {"inconsistencies": [None]},
+            {"inconsistencies": [1]}, {"inconsistencies": [""]},
+            {"inconsistencies": ["x" * 1001]}, {"inconsistencies": ["error"] * 257},
+            {"inconsistencies": ["bad\x00text"]}, {"inconsistencies": ["\ud800"]},
+            {"inconsistencies": ["valid diagnostic still prevents completion"]},
+            {"reviewed_frames": 2}, {"edited_frames": 2}, {"edited_frames": True},
+            {"pipeline_stage": "triage", "stage_status": "validated", "complete": False},
+            {"pipeline_stage": "review", "stage_status": "waiting", "complete": False},
+            {"pipeline_stage": "sam3", "stage_status": "not-a-status", "complete": False},
+            {"pipeline_stage": "sam3", "stage_status": "running", "complete": "false"},
+            {"pipeline_stage": "sam3", "stage_status": "ready", "complete": False},
+            {"pipeline_stage": "sam3", "stage_status": "invalid", "complete": False},
+            {"pipeline_stage": "review", "stage_status": "audit_required", "validation_status": "audit_required", "complete": False},
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=repr(mutation)[:100]):
+                result, _, enqueue = self.listing({"video-1": self.record(snapshot={**self.source.snapshot_dict, **mutation})})
+                item = result["videos"][0]
+                self.assertEqual(item["projection_status"], "stale")
+                self.assertEqual(item["pipeline_stage"], "review")
+                self.assertEqual(item["stage_progress"]["inconsistencies"], [])
+                enqueue.assert_called_once()
+
+    def test_noncompleted_diagnostics_are_bounded_strings_and_valid_errors_are_kept(self):
+        base = {**self.source.snapshot_dict, "pipeline_stage": "sam3", "stage_status": "invalid",
+                "complete": False, "artifacts_valid": False, "validation_status": "invalid"}
+        for diagnostic in [{"nested": "object"}, ["nested"], None, 3, "", "x" * 1001, "\ud800", "bad\x00"]:
+            with self.subTest(diagnostic=repr(diagnostic)[:40]):
+                result, _, enqueue = self.listing({"video-1": self.record(snapshot={**base, "inconsistencies": [diagnostic]})})
+                self.assertEqual(result["videos"][0]["projection_status"], "stale")
+                self.assertEqual(result["videos"][0]["stage_progress"]["inconsistencies"], [])
+                enqueue.assert_called_once()
+        result, _, enqueue = self.listing({"video-1": self.record(snapshot={**base, "inconsistencies": ["Manifesto inválido"]})})
+        self.assertEqual(result["videos"][0]["projection_status"], "current")
+        self.assertEqual(result["videos"][0]["stage_progress"]["inconsistencies"], ["Manifesto inválido"])
+        enqueue.assert_not_called()
+
+    def test_repair_batches_rotate_past_permanently_failing_first_twenty(self):
+        self.ctx.object_id = "rotation-test"
+        videos = [SimpleNamespace(**{**vars(self.video), "video_id": f"v-{n:03}"}) for n in range(45)]
+        self.ctx.index.all = lambda: list(reversed(videos))
+        batches = []
+        for _ in range(3):
+            _, lookup, enqueue = self.listing({})
+            lookup.assert_called_once()
+            enqueue.assert_called_once()
+            batches.append([item["video_id"] for item in enqueue.call_args.args[1]])
+        self.assertEqual(batches[0], [f"v-{n:03}" for n in range(20)])
+        self.assertEqual(batches[1], [f"v-{n:03}" for n in range(20, 40)])
+        self.assertEqual(batches[2], [f"v-{n:03}" for n in list(range(40, 45)) + list(range(15))])
+        self.assertEqual(set().union(*map(set, batches)), {video.video_id for video in videos})
+
     def test_large_listing_bounds_repair_batch_without_per_video_queries(self):
         videos = [SimpleNamespace(**{**vars(self.video), "video_id": f"v-{n}"}) for n in range(100)]
         self.ctx.index.all = lambda: videos

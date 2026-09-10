@@ -35,6 +35,22 @@ class ProjectionListingPostgresTests(unittest.TestCase):
         after = projection.get_many("boom", ["v"], connect=self._connect)["v"]
         self.assertEqual(after.projection_status, "pending")
 
+    def test_repair_of_unchanged_source_overtakes_abandoned_newer_mutation(self):
+        first = projection.reserve_intent(object_id="boom", video_id="v", event_kind="reconcile",
+                                          source_identity={"revision": 1}, connect=self._connect)
+        projection.apply_intent(first, {"pipeline_stage": "triage"}, connect=self._connect)
+        abandoned = projection.reserve_intent(object_id="boom", video_id="v", event_kind="mutation",
+                                              source_identity={"revision": 2}, connect=self._connect)
+        repair, existing = projection.reserve_repair_intent(object_id="boom", video_id="v",
+                                                           source_identity={"revision": 1},
+                                                           snapshot={"pipeline_stage": "triage"}, connect=self._connect)
+        self.assertIsNone(existing)
+        projection.apply_intent(repair, {"pipeline_stage": "triage"}, connect=self._connect)
+        current = projection.get_many("boom", ["v"], connect=self._connect)["v"]
+        self.assertEqual(current.projection_status, "current")
+        self.assertGreater(current.event_seq, abandoned.event_seq)
+        self.assertEqual(current.source_identity, {"revision": 1})
+
     def test_bulk_enqueue_is_bounded_idempotent_and_preserves_active_lease(self):
         migration = Path(__file__).resolve().parents[4] / "migrations" / "001_initial.sql"
         with self._connect() as connection:
