@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 from server import durable_jobs, export as export_module
 from server.models import BBoxIn, IntervalIn, VideoEntryIn
 from server.routers.annotations import (
+    ExportVideoPayload,
     FinishPayload,
     NoBoomPayload,
     _cleanup_basename,
@@ -101,8 +102,10 @@ def _context(root: Path, media: dict | None = None):
     )
 
 
-def _payload(note: str = "") -> VideoEntryIn:
+def _payload(note: str = "", *, expected_revision: int = 0) -> VideoEntryIn:
     return VideoEntryIn(
+        expected_revision=expected_revision,
+        lock_token="test-lock-token",
         status="in_progress",
         notes=note,
         intervals=[
@@ -257,7 +260,7 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch("server.routers.annotations.durable_jobs.enabled", return_value=False),
             ):
-                entry = await put_one("video-1", _payload(), False, ctx, _user(), "tab-1")
+                entry = await put_one("video-1", _payload(), True, ctx, _user(), "tab-1")
 
             self.assertEqual(ctx.index.probe_calls, [])
             self.assertEqual(entry["annotation_revision"], 1)
@@ -271,7 +274,7 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 patch("server.routers.annotations.proxy.is_complete", return_value=None),
                 patch("server.routers.annotations.durable_jobs.enabled", return_value=False),
             ):
-                await put_one("video-1", _payload(), False, ctx, _user(), "tab-1")
+                await put_one("video-1", _payload(), True, ctx, _user(), "tab-1")
 
             self.assertEqual(ctx.index.probe_calls, [False])
 
@@ -320,7 +323,12 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 patch("server.routers.annotations.durable_jobs.create", side_effect=create),
             ):
                 result = await mark_no_object(
-                    "video-1", NoBoomPayload(), False, ctx, _user(), "tab-1"
+                    "video-1",
+                    NoBoomPayload(expected_revision=7, lock_token="test-lock-token"),
+                    True,
+                    ctx,
+                    _user(),
+                    "tab-1",
                 )
 
             self.assertEqual(ctx.index.probe_calls, [])
@@ -369,7 +377,12 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 result = await mark_no_object(
-                    "video-1", NoBoomPayload(), False, ctx, _user(), "tab-1"
+                    "video-1",
+                    NoBoomPayload(expected_revision=1, lock_token="test-lock-token"),
+                    True,
+                    ctx,
+                    _user(),
+                    "tab-1",
                 )
 
             persisted = ctx.store.entry("clip.mp4")
@@ -433,7 +446,12 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 patch("server.routers.annotations.durable_jobs.create", side_effect=create),
             ):
                 result = await mark_no_object(
-                    "video-1", NoBoomPayload(), False, ctx, _user(), "tab-1"
+                    "video-1",
+                    NoBoomPayload(expected_revision=2, lock_token="test-lock-token"),
+                    True,
+                    ctx,
+                    _user(),
+                    "tab-1",
                 )
 
             self.assertEqual(result["annotation_revision"], 2)
@@ -453,16 +471,25 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 patch("server.routers.annotations.proxy.is_complete", return_value=100),
                 patch("server.routers.annotations.durable_jobs.enabled", return_value=False),
             ):
-                first, second = await asyncio.gather(
-                    put_one("video-1", _payload("first"), False, ctx, _user(), "tab-1"),
-                    put_one("video-1", _payload("second"), False, ctx, _user(), "tab-1"),
+                results = await asyncio.gather(
+                    put_one("video-1", _payload("first"), True, ctx, _user(), "tab-1"),
+                    put_one("video-1", _payload("second"), True, ctx, _user(), "tab-1"),
+                    return_exceptions=True,
                 )
 
-            self.assertEqual({first["annotation_revision"], second["annotation_revision"]}, {1, 2})
+            saved = [item for item in results if isinstance(item, dict)]
+            conflicts = [
+                item
+                for item in results
+                if isinstance(item, Exception) and getattr(item, "status_code", None) == 409
+            ]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(saved[0]["annotation_revision"], 1)
             final = ctx.store.entry("clip.mp4")
-            self.assertEqual(final["annotation_revision"], 2)
-            self.assertEqual(len(final["history"]), 2)
-            self.assertEqual([item["revision"] for item in final["history"]], [1, 2])
+            self.assertEqual(final["annotation_revision"], 1)
+            self.assertEqual(len(final["history"]), 1)
+            self.assertEqual([item["revision"] for item in final["history"]], [1])
 
     async def test_separate_application_stores_reload_inside_shared_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -489,23 +516,30 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
             ):
                 results = await asyncio.gather(
                     put_one(
-                        "video-1", _payload("first process"), False,
+                        "video-1", _payload("first process"), True,
                         first_ctx, _user(), "tab-1",
                     ),
                     put_one(
-                        "video-1", _payload("second process"), False,
+                        "video-1", _payload("second process"), True,
                         second_ctx, _user(), "tab-2",
                     ),
+                    return_exceptions=True,
                 )
 
-            self.assertEqual(
-                {entry["annotation_revision"] for entry in results}, {1, 2}
-            )
+            saved = [item for item in results if isinstance(item, dict)]
+            conflicts = [
+                item
+                for item in results
+                if isinstance(item, Exception) and getattr(item, "status_code", None) == 409
+            ]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(saved[0]["annotation_revision"], 1)
             persisted = json.loads(
                 first_ctx.store.annotations_path.read_text(encoding="utf-8")
             )["videos"]["clip.mp4"]
-            self.assertEqual(persisted["annotation_revision"], 2)
-            self.assertEqual([item["revision"] for item in persisted["history"]], [1, 2])
+            self.assertEqual(persisted["annotation_revision"], 1)
+            self.assertEqual([item["revision"] for item in persisted["history"]], [1])
 
     async def test_cleanup_enqueue_does_not_block_other_coroutines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -549,7 +583,12 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
             ):
                 task = asyncio.create_task(
                     mark_no_object(
-                        "video-1", NoBoomPayload(), False, ctx, _user(), "tab-1"
+                        "video-1",
+                        NoBoomPayload(expected_revision=2, lock_token="test-lock-token"),
+                        True,
+                        ctx,
+                        _user(),
+                        "tab-1",
                     )
                 )
                 await asyncio.to_thread(started.wait, 1)
@@ -878,7 +917,16 @@ class TriageMutationTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch("server.routers.annotations.durable_jobs.create", side_effect=create),
             ):
-                result = await export_video("video-1", False, ctx, _user(), "tab-1")
+                result = await export_video(
+                    "video-1",
+                    ExportVideoPayload(
+                        expected_revision=4, lock_token="test-lock-token"
+                    ),
+                    True,
+                    ctx,
+                    _user(),
+                    "tab-1",
+                )
 
             self.assertEqual(result["job_id"], "export-job")
             self.assertTrue(create_threads)

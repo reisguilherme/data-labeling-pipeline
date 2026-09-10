@@ -299,6 +299,7 @@ const TRIAGE_ANNOTATION = {
   intervals: [TRIAGE_INTERVAL],
   exported_at: null,
   export: null,
+  annotation_revision: 0,
   suggested_flags: {},
 };
 const PROXY_STATUS = {
@@ -871,8 +872,8 @@ const routes = [
   [/\/api\/objects\/[^/]+\/videos\/[^/]+\/sam3$/, { state: "queued" }],
   [/\/api\/objects\/[^/]+\/session\/active-video$/, { cancelled: 0, lock: null }],
   [/\/api\/objects\/[^/]+\/lock\/release$/, { released: true }],
-  [/\/api\/objects\/[^/]+\/lock$/, { lock: { user: "Guilherme", since: "2026-01-01T00:00:00-03:00" }, heartbeat_seconds: 30, ttl_seconds: 90 }],
-  [/\/api\/objects\/[^/]+\/annotations\/[^/]+\/no-object$/, { ...TRIAGE_ANNOTATION, status: "no_boom", intervals: [] }],
+  [/\/api\/objects\/[^/]+\/lock$/, { lock: { user: "Guilherme", since: "2026-01-01T00:00:00-03:00", token: "lock-token-1" }, heartbeat_seconds: 30, ttl_seconds: 90 }],
+  [/\/api\/objects\/[^/]+\/annotations\/[^/]+\/no-object$/, { ...TRIAGE_ANNOTATION, status: "no_boom", intervals: [], annotation_revision: 1 }],
   [/\/api\/objects\/[^/]+\/annotations\/[^/]+$/, scenario.annotation ?? TRIAGE_ANNOTATION],
   [/\/api\/objects\/[^/]+\/videos\/[^/]+\/meta$/, scenario.videoMeta ?? VIDEO_META],
   [/\/api\/objects\/[^/]+\/videos\/[^/]+\/proxy\/status$/, scenario.proxyStatus ?? PROXY_STATUS],
@@ -1054,11 +1055,25 @@ window.fetch = async (input, init = {}) => {
   if (match && init.method === "POST" && /\/videos\/aaa\/export$/.test(url)) {
     eventLog.push("export:ack");
   }
+  let responseValue = typeof match?.[1] === "function" ? match[1](url) : match?.[1];
+  if (
+    match &&
+    init.method === "PUT" &&
+    /\/api\/objects\/[^/]+\/annotations\/[^/]+$/.test(url)
+  ) {
+    const payload = JSON.parse(init.body ?? "{}");
+    responseValue = {
+      ...(scenario.annotation ?? TRIAGE_ANNOTATION),
+      ...payload,
+      intervals: TRIAGE_ANNOTATION.intervals,
+      annotation_revision: (payload.expected_revision ?? 0) + 1,
+    };
+  }
   return {
     ok: Boolean(match),
     status: match ? 200 : 404,
     statusText: match ? "OK" : "Not Found",
-    json: async () => typeof match?.[1] === "function" ? match[1](url) : match?.[1] ?? { detail: "not found" },
+    json: async () => responseValue ?? { detail: "not found" },
   };
 };
 
@@ -1595,6 +1610,16 @@ if (scenario.action === "submit-triage-slow-refresh") {
     (request) => request.method === "POST" && /\/videos\/aaa\/export$/.test(request.url),
   );
   check(saveAt >= 0 && exportAt > saveAt, "salvamento precede o enqueue da exportacao");
+  const saveBody = JSON.parse(requestLog[saveAt]?.body ?? "{}");
+  const exportBody = JSON.parse(requestLog[exportAt]?.body ?? "{}");
+  check(
+    saveBody.expected_revision === 0 && saveBody.lock_token === "lock-token-1",
+    "salvamento envia revisao e token da aquisicao",
+  );
+  check(
+    exportBody.expected_revision === 1 && exportBody.lock_token === "lock-token-1",
+    "exportacao usa a revisao confirmada pelo salvamento",
+  );
   check(
     eventLog[0] === "mutation:ack" &&
       eventLog[1] === "export:ack" &&
@@ -1610,6 +1635,11 @@ if (scenario.action === "mark-no-object-slow-refresh") {
     (request) => request.method === "POST" && /\/annotations\/aaa\/no-object$/.test(request.url),
   );
   check(mutationAt >= 0, "sem objeto foi persistido antes da navegacao");
+  const mutationBody = JSON.parse(requestLog[mutationAt]?.body ?? "{}");
+  check(
+    mutationBody.expected_revision === 0 && mutationBody.lock_token === "lock-token-1",
+    "sem objeto envia revisao e token da aquisicao",
+  );
   check(!navigatedBeforeMutationAck, "sem objeto espera o ACK da mutação");
   check(window.location.pathname.includes("/eee/"), "sem objeto nao espera refresh lento", window.location.pathname);
 }

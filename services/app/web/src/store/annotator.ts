@@ -120,6 +120,7 @@ interface AnnotatorState {
   error: string | null;
   saving: boolean;
   dirty: boolean;
+  annotationRevision: number;
 
   phase: Phase;
   currentFrame: number;
@@ -220,7 +221,7 @@ function toPayload(intervals: DraftInterval[], label: string): IntervalPayload[]
  */
 const HEARTBEAT_MS = 30_000;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-let beaconBound: string | null = null;
+let beaconBound: { videoId: string; lockToken: string } | null = null;
 let openGeneration = 0;
 let stopProxyWatcher: (() => void) | null = null;
 let lifecycleTransition: Promise<void> = Promise.resolve();
@@ -264,17 +265,25 @@ function stopHeartbeat(): void {
 }
 
 function releaseOnUnload(): void {
-  if (beaconBound) api.releaseLockBeacon(beaconBound);
+  if (beaconBound) api.releaseLockBeacon(beaconBound.videoId, beaconBound.lockToken);
 }
 
-function startHeartbeat(videoId: string): void {
+function startHeartbeat(
+  videoId: string,
+  lockToken: string,
+  onLost: (lock: LockInfo | null) => void,
+): void {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
-    void sequenceLifecycle(() => api.setActiveVideo(videoId)).catch(() => undefined);
+    void sequenceLifecycle(() => api.setActiveVideo(videoId, lockToken))
+      .then((result) => {
+        if (result.lock?.token !== lockToken) onLost(result.lock);
+      })
+      .catch(() => undefined);
   }, HEARTBEAT_MS);
   // `pagehide` em vez de `beforeunload`: dispara também quando a aba vai para o
   // cache de navegação do browser, e é o evento em que o sendBeacon ainda vale.
-  beaconBound = videoId;
+  beaconBound = { videoId, lockToken };
   window.addEventListener("pagehide", releaseOnUnload);
 }
 
@@ -287,6 +296,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   error: null,
   saving: false,
   dirty: false,
+  annotationRevision: 0,
 
   phase: "scan",
   currentFrame: 0,
@@ -338,6 +348,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       selected: -1,
       selectedBbox: -1,
       dirty: false,
+      annotationRevision: 0,
       filmstripStride: 1,
       suggestedFlags: {},
       lock: null,
@@ -356,11 +367,21 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       // tela abre em leitura desde o primeiro render, em vez de deixar alguém
       // marcar dez intervalos para só então descobrir que não pode salvar.
       try {
-        await sequenceLifecycle(() => api.acquireLock(videoId));
+        const acquired = await sequenceLifecycle(() => api.acquireLock(videoId));
         if (!isActive()) {
           return;
         }
-        startHeartbeat(videoId);
+        const lockToken = acquired.lock.token;
+        if (!lockToken) throw new Error("servidor não devolveu o token da trava");
+        set({ lock: acquired.lock });
+        startHeartbeat(videoId, lockToken, (currentLock) => {
+          if (!isActive() || get().lock?.token !== lockToken) return;
+          set({
+            lock: currentLock,
+            readOnly: true,
+            error: "A trava deste vídeo expirou ou foi substituída. Reabra-o antes de salvar.",
+          });
+        });
       } catch (error) {
         const lock = error instanceof ApiError ? error.lock : null;
         if (!isActive()) return;
@@ -382,6 +403,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         selected: intervals.length ? 0 : -1,
         status: entry.status === "pending" ? "in_progress" : entry.status,
         videoNotes: entry.notes ?? "",
+        annotationRevision: entry.annotation_revision ?? 0,
         suggestedFlags: entry.suggested_flags ?? {},
       });
 
@@ -431,7 +453,8 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
     cancelFrameAvailabilityFlights();
     stopProxyWatcher?.();
     stopProxyWatcher = null;
-    const { videoId, readOnly } = get();
+    const { videoId, readOnly, lock } = get();
+    const lockToken = lock?.token;
     stopHeartbeat();
     void sequenceLifecycle(async () => {
       try {
@@ -439,7 +462,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       } finally {
         // A liberação faz parte da mesma transição: uma abertura seguinte só
         // ativa/adquire depois que o vídeo anterior terminou de fechar.
-        if (videoId && !readOnly) await api.releaseLock(videoId);
+        if (videoId && !readOnly && lockToken) await api.releaseLock(videoId, lockToken);
       }
     }).catch(() => undefined);
     set({
@@ -450,6 +473,7 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
       intervals: [],
       saving: false,
       dirty: false,
+      annotationRevision: 0,
       lock: null,
       readOnly: false,
     });
@@ -649,8 +673,22 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   blockers: () => computeBlockers(get().intervals),
 
   save: async () => {
-    const { videoId, intervals, status, videoNotes, label, readOnly } = get();
+    const {
+      videoId,
+      intervals,
+      status,
+      videoNotes,
+      label,
+      readOnly,
+      annotationRevision,
+      lock,
+    } = get();
     if (!videoId || readOnly) return false;
+    const lockToken = lock?.token;
+    if (!lockToken) {
+      set({ error: "A trava deste vídeo expirou. Reabra-o antes de salvar.", readOnly: true });
+      return false;
+    }
     const generation = openGeneration;
     const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
@@ -659,9 +697,16 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
         status,
         intervals: toPayload(intervals, label),
         notes: videoNotes,
+        expected_revision: annotationRevision,
+        lock_token: lockToken,
       });
       if (!isActive()) return false;
-      set({ intervals: saved.intervals.map(fromServer), dirty: false, saving: false });
+      set({
+        intervals: saved.intervals.map(fromServer),
+        annotationRevision: saved.annotation_revision,
+        dirty: false,
+        saving: false,
+      });
       return true;
     } catch (error) {
       if (!isActive()) return false;
@@ -677,13 +722,18 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   },
 
   queueExport: async () => {
-    const { videoId, readOnly } = get();
+    const { videoId, readOnly, annotationRevision, lock } = get();
     if (!videoId || readOnly) return null;
+    const lockToken = lock?.token;
+    if (!lockToken) {
+      set({ error: "A trava deste vídeo expirou. Reabra-o antes de exportar.", readOnly: true });
+      return null;
+    }
     const generation = openGeneration;
     const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
     try {
-      const queued = await api.exportVideo(videoId);
+      const queued = await api.exportVideo(videoId, annotationRevision, lockToken);
       if (!isActive()) return null;
       // Criar o job é a barreira de durabilidade. O FFmpeg continua no worker
       // CPU e não deve prender o operador nesta tela durante centenas de frames.
@@ -697,15 +747,32 @@ export const useAnnotator = create<AnnotatorState>((set, get) => ({
   },
 
   markNoBoom: async () => {
-    const { videoId, videoNotes, readOnly } = get();
+    const { videoId, videoNotes, readOnly, annotationRevision, lock } = get();
     if (!videoId || readOnly) return false;
+    const lockToken = lock?.token;
+    if (!lockToken) {
+      set({ error: "A trava deste vídeo expirou. Reabra-o antes de continuar.", readOnly: true });
+      return false;
+    }
     const generation = openGeneration;
     const isActive = () => openGeneration === generation && get().videoId === videoId;
     set({ saving: true, error: null });
     try {
-      await api.markNoObject(videoId, videoNotes);
+      const saved = await api.markNoObject(
+        videoId,
+        videoNotes,
+        annotationRevision,
+        lockToken,
+      );
       if (!isActive()) return false;
-      set({ status: "no_boom", intervals: [], selected: -1, dirty: false, saving: false });
+      set({
+        status: "no_boom",
+        intervals: [],
+        selected: -1,
+        annotationRevision: saved.annotation_revision,
+        dirty: false,
+        saving: false,
+      });
       return true;
     } catch (error) {
       if (!isActive()) return false;

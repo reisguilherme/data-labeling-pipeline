@@ -20,6 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from .videos import iso
 
@@ -38,6 +39,7 @@ class Lock:
     relpath: str
     user: str
     client_id: str
+    token: str
     acquired_at: str
     heartbeat_at: str
     expires_at: float  # monotônico-ish: time.time(), comparado só localmente
@@ -50,6 +52,7 @@ class Lock:
             "relpath": self.relpath,
             "user": self.user,
             "client_id": self.client_id,
+            "token": self.token,
             "acquired_at": self.acquired_at,
             "heartbeat_at": self.heartbeat_at,
             # Instante ABSOLUTO, não duração restante. Gravar "faltam 90 s" faria
@@ -63,6 +66,10 @@ class Lock:
     def public(self) -> dict:
         """O que a biblioteca mostra num card travado."""
         return {"user": self.user, "since": self.acquired_at}
+
+    def owner(self) -> dict:
+        """Contrato entregue somente ao cliente que adquiriu/renovou a trava."""
+        return {**self.public(), "token": self.token}
 
 
 class LockHeld(Exception):
@@ -109,6 +116,7 @@ class LockRegistry:
                 relpath=item.get("relpath", ""),
                 user=item.get("user", "?"),
                 client_id=item.get("client_id", ""),
+                token=item.get("token") or str(uuid4()),
                 acquired_at=item.get("acquired_at", ""),
                 heartbeat_at=item.get("heartbeat_at", ""),
                 expires_at=expires_at,
@@ -166,9 +174,15 @@ class LockRegistry:
                 if oid == object_id
             }
 
-    def held_by(self, object_id: str, video_id: str, client_id: str) -> bool:
+    def held_by(
+        self, object_id: str, video_id: str, client_id: str, token: str
+    ) -> bool:
         lock = self.get(object_id, video_id)
-        return lock is not None and lock.client_id == client_id
+        return (
+            lock is not None
+            and lock.client_id == client_id
+            and lock.token == token
+        )
 
     # -- escrita -----------------------------------------------------------
 
@@ -207,6 +221,7 @@ class LockRegistry:
                 relpath=relpath,
                 user=user,
                 client_id=client_id,
+                token=str(uuid4()),
                 acquired_at=iso(),
                 heartbeat_at=iso(),
                 expires_at=now + TTL_SECONDS,
@@ -216,21 +231,43 @@ class LockRegistry:
             self._mirror(force=True)
             return lock
 
-    def heartbeat(self, object_id: str, video_id: str, client_id: str) -> Lock | None:
+    def heartbeat(
+        self,
+        object_id: str,
+        video_id: str,
+        client_id: str,
+        token: str | None,
+    ) -> Lock | None:
         with self._lock:
             lock = self._live((object_id, video_id))
-            if lock is None or lock.client_id != client_id:
+            if (
+                lock is None
+                or lock.client_id != client_id
+                or not token
+                or lock.token != token
+            ):
                 return None
             lock.heartbeat_at = iso()
             lock.expires_at = time.time() + TTL_SECONDS
             self._mirror()
             return lock
 
-    def release(self, object_id: str, video_id: str, client_id: str) -> bool:
+    def release(
+        self,
+        object_id: str,
+        video_id: str,
+        client_id: str,
+        token: str | None,
+    ) -> bool:
         key = (object_id, video_id)
         with self._lock:
             lock = self._locks.get(key)
-            if lock is None or lock.client_id != client_id:
+            if (
+                lock is None
+                or lock.client_id != client_id
+                or not token
+                or lock.token != token
+            ):
                 return False
             self._locks.pop(key, None)
             self._mirror(force=True)

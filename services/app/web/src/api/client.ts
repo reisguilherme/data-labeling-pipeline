@@ -40,6 +40,13 @@ export class ApiError extends Error {
     const detail = (this.body as { detail?: { lock?: LockInfo } } | undefined)?.detail;
     return detail && typeof detail === "object" ? (detail.lock ?? null) : null;
   }
+
+  get code(): string | null {
+    const detail = (this.body as { detail?: { code?: unknown } } | undefined)?.detail;
+    return detail && typeof detail === "object" && typeof detail.code === "string"
+      ? detail.code
+      : null;
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -227,10 +234,10 @@ export const api = {
     request<{ cancelled: boolean }>(`/api/jobs/${jobId}`, { method: "DELETE" }),
 
   /** Troca de vídeo: cancela as extrações desta aba e renova a trava. */
-  setActiveVideo: (videoId: string | null) =>
+  setActiveVideo: (videoId: string | null, lockToken?: string) =>
     request<{ cancelled: number; lock: LockInfo | null }>(`${O()}/session/active-video`, {
       method: "POST",
-      body: JSON.stringify({ video_id: videoId }),
+      body: JSON.stringify({ video_id: videoId, lock_token: lockToken }),
     }),
 
   cacheInfo: () =>
@@ -246,20 +253,20 @@ export const api = {
       { method: "POST", body: JSON.stringify({ video_id: videoId, force }) },
     ),
 
-  releaseLock: (videoId: string) =>
+  releaseLock: (videoId: string, lockToken: string) =>
     request<{ released: boolean }>(`${O()}/lock/release`, {
       method: "POST",
-      body: JSON.stringify({ video_id: videoId }),
+      body: JSON.stringify({ video_id: videoId, lock_token: lockToken }),
     }),
 
   /**
    * Libera no fechamento da aba. sendBeacon sobrevive ao unload, ao contrário de
    * um fetch normal — sem isso o vídeo ficaria preso até o TTL de 90 s.
    */
-  releaseLockBeacon: (videoId: string) => {
+  releaseLockBeacon: (videoId: string, lockToken: string) => {
     try {
       const blob = new Blob(
-        [JSON.stringify({ video_id: videoId, client_id: clientId() })],
+        [JSON.stringify({ video_id: videoId, lock_token: lockToken, client_id: clientId() })],
         { type: "application/json" },
       );
       navigator.sendBeacon(`${O()}/lock/release?client=${clientId()}`, blob);
@@ -274,7 +281,13 @@ export const api = {
 
   saveAnnotation: (
     videoId: string,
-    payload: { status: Status; intervals: IntervalPayload[]; notes: string },
+    payload: {
+      status: Status;
+      intervals: IntervalPayload[];
+      notes: string;
+      expected_revision: number;
+      lock_token: string;
+    },
     force = false,
   ) =>
     request<VideoEntry & { intervals: Interval[] }>(
@@ -282,15 +295,27 @@ export const api = {
       { method: "PUT", body: JSON.stringify(payload) },
     ),
 
-  markNoObject: (videoId: string, notes = "", deleteExported = true) =>
+  markNoObject: (
+    videoId: string,
+    notes: string,
+    expectedRevision: number,
+    lockToken: string,
+    deleteExported = true,
+  ) =>
     request<VideoEntry>(`${O()}/annotations/${videoId}/no-object`, {
       method: "POST",
-      body: JSON.stringify({ notes, delete_exported: deleteExported }),
+      body: JSON.stringify({
+        notes,
+        delete_exported: deleteExported,
+        expected_revision: expectedRevision,
+        lock_token: lockToken,
+      }),
     }),
 
-  exportVideo: (videoId: string) =>
+  exportVideo: (videoId: string, expectedRevision: number, lockToken: string) =>
     request<{ job_id: string; total: number }>(`${O()}/videos/${videoId}/export`, {
       method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, lock_token: lockToken }),
     }),
 
   // -- entrada de vídeos ---------------------------------------------------

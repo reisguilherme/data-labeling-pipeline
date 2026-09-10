@@ -42,7 +42,13 @@ def _require(ctx: ObjectContext, video_id: str):
     return video
 
 
-def _require_lock(ctx: ObjectContext, video_id: str, client_id: str, force: bool) -> None:
+def _require_lock(
+    ctx: ObjectContext,
+    video_id: str,
+    client_id: str,
+    lock_token: str,
+    force: bool,
+) -> None:
     """A trava é validada na ESCRITA, não só na interface.
 
     Sem isto, uma aba aberta antes de outra pessoa assumir o vídeo sobrescreveria
@@ -52,12 +58,34 @@ def _require_lock(ctx: ObjectContext, video_id: str, client_id: str, force: bool
     if force:
         return
     lock = locks.get(ctx.object_id, video_id)
-    if lock is not None and lock.client_id != client_id:
+    if lock is None or lock.client_id != client_id or lock.token != lock_token:
+        current = lock.public() if lock is not None else None
+        message = (
+            f"{current.get('user', 'outro usuario')} esta com este video em triagem"
+            if lock is not None
+            else "a trava de triagem expirou; reabra o video"
+        )
         raise HTTPException(
             409,
             {
-                "detail": f"{lock.user} está com este vídeo em triagem",
-                "lock": lock.public(),
+                "detail": message,
+                "code": "lock_changed" if lock is not None else "lock_required",
+                "lock": current,
+            },
+        )
+
+
+def _require_revision(previous: dict, expected_revision: int) -> None:
+    current = previous.get("annotation_revision", 0)
+    if type(current) is not int or current < 0:
+        current = 0
+    if current != expected_revision:
+        raise HTTPException(
+            409,
+            {
+                "detail": "a anotacao mudou desde que este video foi aberto; recarregue antes de salvar",
+                "code": "revision_conflict",
+                "current_revision": current,
             },
         )
 
@@ -137,8 +165,15 @@ def _cleanup_basename(output_root: Path, export_data: dict | None) -> str | None
 
 
 @asynccontextmanager
-async def _video_mutation_lock(ctx: ObjectContext, video_id: str):
+async def _video_mutation_lock(
+    ctx: ObjectContext,
+    video_id: str,
+    client_id: str,
+    lock_token: str,
+    force: bool,
+):
     if not durable_jobs.enabled():
+        _require_lock(ctx, video_id, client_id, lock_token, force)
         yield
         return
     async with durable_jobs.video_advisory_lock_async(ctx.object_id, video_id):
@@ -146,6 +181,7 @@ async def _video_mutation_lock(ctx: ObjectContext, video_id: str):
         # serializa o arquivo compartilhado; recarregar aqui impede um processo
         # antigo de apagar a revisão gravada por outro.
         await asyncio.to_thread(ctx.store.load)
+        _require_lock(ctx, video_id, client_id, lock_token, force)
         yield
 
 
@@ -188,6 +224,7 @@ async def get_one(video_id: str, ctx: ObjectContext = Depends(get_object)) -> di
             "notes": "",
             "exported_at": None,
             "export": None,
+            "annotation_revision": 0,
             "suggested_flags": suggested,
             "lock": lock.public() if lock else None,
         }
@@ -204,7 +241,7 @@ async def put_one(
     client_id: str = Depends(current_client),
 ) -> dict:
     video = _require(ctx, video_id)
-    _require_lock(ctx, video_id, client_id, force)
+    _require_lock(ctx, video_id, client_id, payload.lock_token, force)
     media_hint = await _media_for_write(ctx, video_id)
 
     errors = validate_intervals(payload.intervals, media_hint.get("frame_count"))
@@ -214,6 +251,7 @@ async def put_one(
     ordered = sorted(payload.intervals, key=lambda i: i.start_frame)
     def apply(doc: dict) -> dict:
         previous = doc["videos"].get(video.relpath) or {}
+        _require_revision(previous, payload.expected_revision)
         media = _effective_media(previous, media_hint)
         width = int(media.get("width") or 0)
         height = int(media.get("height") or 0)
@@ -254,13 +292,17 @@ async def put_one(
         doc["videos"][video.relpath] = entry
         return entry
 
-    async with _video_mutation_lock(ctx, video_id):
+    async with _video_mutation_lock(
+        ctx, video_id, client_id, payload.lock_token, force
+    ):
         entry = await ctx.store.mutate(apply)
     await _cancel_stale_exports(ctx, video_id, entry["annotation_revision"])
     return entry
 
 
 class NoBoomPayload(BaseModel):
+    expected_revision: int = Field(ge=0, strict=True)
+    lock_token: str = Field(min_length=8, max_length=128)
     delete_exported: bool = True
     notes: str = ""
 
@@ -275,7 +317,7 @@ async def mark_no_object(
     client_id: str = Depends(current_client),
 ) -> dict:
     video = _require(ctx, video_id)
-    _require_lock(ctx, video_id, client_id, force)
+    _require_lock(ctx, video_id, client_id, payload.lock_token, force)
     media_hint = await _media_for_write(ctx, video_id, allow_probe=False)
     cleanup: dict | None = None
     should_enqueue = False
@@ -284,6 +326,7 @@ async def mark_no_object(
     def apply(doc: dict) -> dict:
         nonlocal cleanup, should_enqueue, revision_changed
         previous = doc["videos"].get(video.relpath) or {}
+        _require_revision(previous, payload.expected_revision)
         previous_cleanup = previous.get("export_cleanup")
         requested_notes = payload.notes or previous.get("notes", "")
         same_decision = (
@@ -383,7 +426,9 @@ async def mark_no_object(
         doc["videos"][video.relpath] = entry
         return entry
 
-    async with _video_mutation_lock(ctx, video_id):
+    async with _video_mutation_lock(
+        ctx, video_id, client_id, payload.lock_token, force
+    ):
         entry = await ctx.store.mutate(apply)
     revision = entry["annotation_revision"]
     if revision_changed:
@@ -423,7 +468,9 @@ async def mark_no_object(
                 video_id,
                 exc_info=True,
             )
-        async with _video_mutation_lock(ctx, video_id):
+        async with _video_mutation_lock(
+            ctx, video_id, client_id, payload.lock_token, True
+        ):
             entry = await ctx.store.mutate(
                 lambda doc: _update_cleanup_marker(
                     doc, video.relpath, revision, updated_cleanup, cleanup_job_id
@@ -436,7 +483,9 @@ async def mark_no_object(
             "error": "fila duravel indisponivel",
         }
         updated_cleanup.pop("job_id", None)
-        async with _video_mutation_lock(ctx, video_id):
+        async with _video_mutation_lock(
+            ctx, video_id, client_id, payload.lock_token, True
+        ):
             entry = await ctx.store.mutate(
                 lambda doc: _update_cleanup_marker(
                     doc, video.relpath, revision, updated_cleanup, None
@@ -460,23 +509,32 @@ def _update_cleanup_marker(
     return current
 
 
+class ExportVideoPayload(BaseModel):
+    expected_revision: int = Field(ge=0, strict=True)
+    lock_token: str = Field(min_length=8, max_length=128)
+
+
 @router.post("/videos/{video_id}/export")
 async def export_video(
     video_id: str,
+    payload: ExportVideoPayload,
     force: bool = False,
     ctx: ObjectContext = Depends(get_object),
     user: User = Depends(current_user),
     client_id: str = Depends(current_client),
 ) -> dict:
     video = _require(ctx, video_id)
-    _require_lock(ctx, video_id, client_id, force)
+    _require_lock(ctx, video_id, client_id, payload.lock_token, force)
     entry = ctx.store.entry(video.relpath)
 
     if durable_jobs.enabled():
-        async with _video_mutation_lock(ctx, video_id):
+        async with _video_mutation_lock(
+            ctx, video_id, client_id, payload.lock_token, force
+        ):
             entry = ctx.store.entry(video.relpath)
             if entry is None or not entry.get("intervals"):
                 raise HTTPException(409, "salve pelo menos um intervalo antes de exportar")
+            _require_revision(entry, payload.expected_revision)
             total = sum(
                 int(interval.get("frame_count") or 0) for interval in entry["intervals"]
             )
@@ -503,8 +561,13 @@ async def export_video(
             )
         return {"job_id": job_id, "total": total}
 
-    if entry is None or not entry.get("intervals"):
-        raise HTTPException(409, "salve pelo menos um intervalo antes de exportar")
+    async with _video_mutation_lock(
+        ctx, video_id, client_id, payload.lock_token, force
+    ):
+        entry = ctx.store.entry(video.relpath)
+        if entry is None or not entry.get("intervals"):
+            raise HTTPException(409, "salve pelo menos um intervalo antes de exportar")
+        _require_revision(entry, payload.expected_revision)
     job = await export_module.export_video(
         ctx, video_id, entry, client_id=client_id, user=user.user_id
     )

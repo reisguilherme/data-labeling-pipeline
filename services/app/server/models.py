@@ -42,6 +42,8 @@ class IntervalIn(BaseModel):
 
 
 class VideoEntryIn(BaseModel):
+    expected_revision: int = Field(ge=0, strict=True)
+    lock_token: str = Field(min_length=8, max_length=128)
     status: Status = "in_progress"
     intervals: list[IntervalIn] = Field(default_factory=list)
     notes: str = ""

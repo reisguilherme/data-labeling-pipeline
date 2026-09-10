@@ -50,6 +50,8 @@ export interface UserInfo {
 export interface LockInfo {
   user: string;
   since: string;
+  /** Segredo efêmero desta aquisição; só é devolvido ao dono da trava. */
+  token?: string;
 }
 
 /** `null` = ainda não revisado; "ok" = conferido; "edited" = corrigido à mão. */
@@ -435,6 +437,8 @@ export interface VideoEntry {
   intervals: Interval[];
   exported_at: string | null;
   export: ExportInfo | null;
+  /** Versão otimista usada para impedir sobrescrita por uma aba antiga. */
+  annotation_revision: number;
   media?: VideoMedia;
   /** Flags inferidas do nome do arquivo, para pré-marcar intervalos novos. */
   suggested_flags?: FlagValues;

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
@@ -83,6 +83,7 @@ scoped = APIRouter(prefix="/api/objects/{object_id}", tags=["session"])
 
 class ActiveVideo(BaseModel):
     video_id: str | None = None
+    lock_token: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 @scoped.post("/session/active-video")
@@ -115,11 +116,13 @@ async def set_active_video(
         )
     lock = None
     if payload.video_id:
-        lock = locks.heartbeat(ctx.object_id, payload.video_id, client_id)
+        lock = locks.heartbeat(
+            ctx.object_id, payload.video_id, client_id, payload.lock_token
+        )
     jobs.prune()
     return {
         "cancelled": cancelled,
-        "lock": lock.to_json() if lock else None,
+        "lock": lock.owner() if lock else None,
         "heartbeat_seconds": HEARTBEAT_SECONDS,
     }
 
@@ -153,15 +156,20 @@ async def acquire_lock(
             409, {"detail": str(exc), "lock": exc.lock.public()}
         ) from exc
     return {
-        "lock": lock.to_json(),
+        "lock": lock.owner(),
         "heartbeat_seconds": HEARTBEAT_SECONDS,
         "ttl_seconds": TTL_SECONDS,
     }
 
 
+class ReleaseLockPayload(BaseModel):
+    video_id: str
+    lock_token: str = Field(min_length=8, max_length=128)
+
+
 @scoped.post("/lock/release")
 async def release_lock(
-    payload: LockPayload,
+    payload: ReleaseLockPayload,
     client: str | None = None,
     ctx: ObjectContext = Depends(get_object),
     client_id: str = Depends(current_client),
@@ -170,17 +178,24 @@ async def release_lock(
     POST — é o que libera o vídeo quando a aba fecha, em vez de esperar o TTL.
 
     O beacon também não manda header customizado, então o id da aba pode vir na
-    query. Não é elevação de privilégio: quem sabe o client_id é quem tem a
-    trava, e o pior caso é liberar um vídeo que já ia expirar em 90 s.
+    query. O token secreto da aquisição impede outra aba de liberar a trava,
+    mesmo que ela conheça o client_id.
     """
-    return {"released": locks.release(ctx.object_id, payload.video_id, client or client_id)}
+    return {
+        "released": locks.release(
+            ctx.object_id,
+            payload.video_id,
+            client or client_id,
+            payload.lock_token,
+        )
+    }
 
 
 @scoped.get("/locks")
 async def list_locks(ctx: ObjectContext = Depends(get_object)) -> dict:
     return {
         "locks": {
-            video_id: lock.to_json()
+            video_id: lock.public()
             for video_id, lock in locks.map_for(ctx.object_id).items()
         }
     }
