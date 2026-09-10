@@ -51,6 +51,9 @@ class PipelineProjectionRolloutCommandTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
 class PipelineProjectionPostgresTests(unittest.TestCase):
+    @unittest.skipIf(
+        os.name == "nt", "caminho Windows nao e estrangeiro no Windows"
+    )
     def test_foreign_registered_roots_abort_instead_of_becoming_invalid_candidates(self):
         from server import pipeline_projection_rollout as rollout
 
