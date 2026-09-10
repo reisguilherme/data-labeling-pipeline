@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from pipeline_core.masks import inspect_binary_png
@@ -509,17 +510,19 @@ def _index_revision_with_cursor(
     )
 
 
-def index_revisions(
+@contextmanager
+def _revision_transaction(
     *,
     object_id: str,
     relpath: str,
     segment_dir: Path,
     revisions: list[tuple[int, dict]],
     user: str | None,
-) -> None:
+):
     """Indexa um trecho inteiro usando uma conexão e uma transação."""
     database_url = os.environ.get("DATABASE_URL")
     if not database_url or not revisions:
+        yield
         return
     import psycopg
 
@@ -579,6 +582,23 @@ def index_revisions(
                 entry=entry,
                 user=user,
             )
+        # The file publisher holds this transaction open through os.replace.
+        # A failed manifest publication exits with an exception and rolls back.
+        yield
+
+
+def index_revisions(
+    *, object_id: str, relpath: str, segment_dir: Path,
+    revisions: list[tuple[int, dict]], user: str | None,
+    publication_guard: ExitStack | None = None,
+) -> None:
+    transaction = _revision_transaction(object_id=object_id, relpath=relpath,
+        segment_dir=segment_dir, revisions=revisions, user=user)
+    if publication_guard is not None:
+        publication_guard.enter_context(transaction)
+    else:
+        with transaction:
+            pass
 
 
 def index_revision(
@@ -589,6 +609,7 @@ def index_revision(
     frame_idx: int,
     entry: dict,
     user: str | None,
+    publication_guard: ExitStack | None = None,
 ) -> None:
     """Compatibilidade para a gravação individual de um frame."""
     index_revisions(
@@ -597,4 +618,5 @@ def index_revision(
         segment_dir=segment_dir,
         revisions=[(frame_idx, entry)],
         user=user,
+        publication_guard=publication_guard,
     )

@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -637,6 +638,7 @@ def publish_generation(
     annotation_revision: int,
     expected_model: dict | None,
     worker_result: dict,
+    before_publish: Callable[[dict], None] | None = None,
 ) -> dict:
     """Validate one live attempt and atomically switch the video pointer.
 
@@ -690,6 +692,8 @@ def publish_generation(
         for name in names:
             _freeze_raw_generation(final_root / name)
         generation_manifest_path.chmod(0o444)
+        if before_publish is not None:
+            before_publish(existing)
         _publish_pointer(export_root, existing)
         return dict(existing["result"])
 
@@ -800,11 +804,14 @@ def publish_generation(
             annotation_revision=annotation_revision,
             expected_model=expected_model,
             worker_result=worker_result,
+            before_publish=before_publish,
         )
     for name in names:
         _freeze_raw_generation(final_root / name)
     _validate_published_generation(export_root, generation_manifest, names)
     (final_root / "generation.json").chmod(0o444)
+    if before_publish is not None:
+        before_publish(generation_manifest)
     _publish_pointer(export_root, generation_manifest)
     return normalized_result
 

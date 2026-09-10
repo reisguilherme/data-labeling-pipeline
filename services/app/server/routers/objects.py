@@ -220,6 +220,7 @@ class ObjectPatch(BaseModel):
 async def update_object(
     object_id: str, payload: ObjectPatch, _: User = Depends(current_user)
 ) -> dict:
+    projection_outcome = {}
     try:
         validate_object_id(object_id)
         changes = payload.model_dump(exclude_unset=True)
@@ -230,41 +231,43 @@ async def update_object(
         if "label" in changes:
             changes["label"] = str(changes["label"]).strip()
             _validate_label(object_id, changes["label"])
-        cfg = workspace.update(object_id, **changes)
+        cfg = workspace.update(object_id, projection_outcome=projection_outcome, **changes)
     except KeyError as exc:
         raise HTTPException(404, f"objeto '{object_id}' não existe") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _object_payload(cfg)
+    return {**_object_payload(cfg), **projection_outcome}
 
 
 @router.post("/objects/{object_id}/archive")
 async def archive_object(object_id: str, _: User = Depends(current_user)) -> dict:
+    projection_outcome = {}
     try:
         validate_object_id(object_id)
         cfg = workspace.get(object_id)
         if cfg.archived:
             return _object_payload(cfg)
-        cfg = workspace.update(object_id, archived=True)
+        cfg = workspace.update(object_id, archived=True, projection_outcome=projection_outcome)
     except KeyError as exc:
         raise HTTPException(404, f"objeto '{object_id}' não existe") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return _object_payload(cfg)
+    return {**_object_payload(cfg), **projection_outcome}
 
 
 @router.post("/objects/{object_id}/restore")
 async def restore_object(object_id: str, _: User = Depends(current_user)) -> dict:
+    projection_outcome = {}
     try:
         validate_object_id(object_id)
         cfg = workspace.get(object_id)
         _validate_label(object_id, cfg.label)
-        cfg = workspace.update(object_id, archived=False)
+        cfg = workspace.update(object_id, archived=False, projection_outcome=projection_outcome)
     except KeyError as exc:
         raise HTTPException(404, f"objeto '{object_id}' não existe") from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return _object_payload(cfg)
+    return {**_object_payload(cfg), **projection_outcome}
 
 
 class PurgeIn(BaseModel):

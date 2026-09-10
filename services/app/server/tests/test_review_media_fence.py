@@ -30,6 +30,126 @@ from server.video_fence import async_video_fence, video_fence
 
 
 class ReviewMediaFenceTests(unittest.TestCase):
+    def test_legacy_review_retry_uses_stable_identity_despite_audit_timestamps(self):
+        from server.routers import review as router
+        version = _export_version(self.root)
+        self.ctx.label = "boom"
+        identities = []
+        def reserve(**kwargs):
+            identities.append(kwargs["source_identity"])
+            return None
+        with (patch("server.routers.review._export_root", return_value=(self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4"))),
+              patch("server.routers.review._require_lock"), patch("server.pipeline_projection.reserve_intent", side_effect=reserve),
+              patch("server.review.iso", side_effect=["first", "first", "second", "second"])):
+            for _ in range(2):
+                router.put_frame("video-1", "seg_00", 0, router.FrameIn(export_version=version, status="ok"),
+                                 self.ctx, SimpleNamespace(user_id="ana"), "tab")
+        self.assertEqual(identities[0], identities[1])
+
+    def test_manifest_failure_rolls_back_review_index_transaction(self):
+        from unittest.mock import MagicMock
+        from server import sam3_run_index
+        payload = MaskBatchIn.model_validate({"export_version": _export_version(self.root),
+            "frames": [{"frame": 0, "expected_revision": 0, "status": "ok"}]})
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        cursor = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.side_effect = [("run", "project"), None, ("revision",)]
+        with (patch("server.routers.review._export_root", return_value=(self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4"))),
+              patch("server.routers.review._require_lock"), patch("server.pipeline_projection.reserve_intent", return_value=None),
+              patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}),
+              patch("server.video_fence.durable_jobs.enabled", return_value=False),
+              patch("psycopg.connect", return_value=connection),
+              patch.object(sam3_run_index, "_effective_prompt", return_value=({"source_start_frame": 0, "frame_count": 1}, "digest")),
+              patch("pipeline_core.review_store.os.replace", side_effect=OSError("replace failed"))):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                save_mask_review_batch("video-1", "seg_00", payload, self.ctx, SimpleNamespace(user_id="ana"), "tab")
+        self.assertFalse((self.segment / "_sam3/mask_review.json").exists())
+        self.assertIs(connection.__exit__.call_args.args[0], OSError)
+
+    def test_each_review_writer_reserves_before_manifest_publication(self):
+        from server.routers import review as router
+        version = _export_version(self.root)
+        user = SimpleNamespace(user_id="ana")
+        self.ctx.label = "boom"
+        calls = [
+            lambda: router.save_mask_review("video-1", "seg_00", 0,
+                router.MaskFrameCommitIn(export_version=version, expected_revision=0, status="ok"), self.ctx, user, "tab"),
+            lambda: router.put_frame("video-1", "seg_00", 0,
+                router.FrameIn(export_version=version, status="ok"), self.ctx, user, "tab"),
+            lambda: router.confirm("video-1", "seg_00",
+                router.ConfirmIn(export_version=version, end=0), self.ctx, user, "tab"),
+            lambda: router.reset_frame("video-1", "seg_00", 0, version, self.ctx, user, "tab"),
+        ]
+        with (patch("server.routers.review._export_root", return_value=(self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4"))),
+              patch("server.routers.review._require_lock"), patch("server.routers.review.index_revision"),
+              patch("server.pipeline_projection.reserve_intent", side_effect=RuntimeError("reserve failed"))):
+            for call in calls:
+                with self.subTest(writer=call), self.assertRaisesRegex(RuntimeError, "reserve failed"):
+                    call()
+        self.assertFalse((self.segment / "_sam3/mask_review.json").exists())
+        self.assertFalse((self.segment / "_sam3/review.json").exists())
+
+    def test_batch_reservation_failure_leaves_manifest_unpublished(self):
+        payload = MaskBatchIn.model_validate({"export_version": _export_version(self.root),
+            "frames": [{"frame": 0, "expected_revision": 0, "status": "ok"}]})
+        with (patch("server.routers.review._export_root", return_value=(self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4"))),
+              patch("server.routers.review._require_lock"),
+              patch("server.routers.review.index_revisions"),
+              patch("server.pipeline_projection.reserve_intent", side_effect=RuntimeError("reserve failed"))):
+            with self.assertRaisesRegex(RuntimeError, "reserve failed"):
+                save_mask_review_batch("video-1", "seg_00", payload, self.ctx, SimpleNamespace(user_id="ana"), "tab")
+        self.assertFalse((self.segment / "_sam3/mask_review.json").exists())
+
+    def test_batch_apply_runs_after_export_fence_and_preserves_success(self):
+        from server.tests.test_projection_mutation_hooks import intent
+        payload = MaskBatchIn.model_validate({"export_version": _export_version(self.root),
+            "frames": [{"frame": 0, "expected_revision": 0, "status": "ok"}]})
+        held = []
+        observations = []
+        @contextmanager
+        def locked(*args):
+            held.append(True)
+            try:
+                yield self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4")
+            finally:
+                held.clear()
+        def reconcile(*args, **kwargs):
+            observations.append((list(held), (self.segment / "_sam3/mask_review.json").exists()))
+            raise RuntimeError("apply failed")
+        with (patch("server.routers.review._locked_export", side_effect=locked),
+              patch("server.routers.review.index_revisions"),
+              patch("server.pipeline_projection.reserve_intent", side_effect=intent) as reserve,
+              patch("server.pipeline_projection.fail_intent"),
+              patch("server.pipeline_reconcile.reconcile_video", side_effect=reconcile)):
+            result = save_mask_review_batch("video-1", "seg_00", payload, self.ctx, SimpleNamespace(user_id="ana"), "tab")
+        self.assertEqual(reserve.call_count, 1)
+        self.assertEqual(observations, [([], True)])
+        self.assertTrue(result["projection_pending"])
+        self.assertEqual(result["projection_event_seq"], 41)
+        self.assertEqual(result["reviewed"], 1)
+
+    def test_last_frame_conflict_is_409_without_reservation_or_partial_manifest(self):
+        (self.segment / "000001.jpg").write_bytes(b"jpeg")
+        mask = self.segment / "_sam3/masks/1/000001.png"
+        mask.write_bytes(encode_binary_png(Image.new("1", (4, 4), 1)))
+        paths = _segment_paths(self.root, ["seg_00"], "seg_00")
+        from server.routers.review import _mask_store
+        store = _mask_store(paths)
+        store.save_frame(1, expected_revision=0, status="ok", instances=[])
+        before = store.manifest_path.read_bytes()
+        payload = MaskBatchIn.model_validate({"export_version": _export_version(self.root),
+            "frames": [{"frame": 0, "expected_revision": 0, "status": "ok"},
+                       {"frame": 1, "expected_revision": 0, "status": "ok"}]})
+        with (patch("server.routers.review._export_root", return_value=(self.root, ["seg_00"], SimpleNamespace(relpath="clip.mp4"))),
+              patch("server.routers.review._require_lock"),
+              patch("server.pipeline_projection.reserve_intent", side_effect=AssertionError("reserved before full validation"))):
+            with self.assertRaises(HTTPException) as conflict:
+                save_mask_review_batch("video-1", "seg_00", payload, self.ctx, SimpleNamespace(user_id="ana"), "tab")
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertEqual(store.manifest_path.read_bytes(), before)
+
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp()) / "export"
         self.segment = self.root / "seg_00"

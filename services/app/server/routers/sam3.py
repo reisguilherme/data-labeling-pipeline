@@ -22,6 +22,7 @@ from ..sam3 import DEFAULT_LEASE_SECONDS, queue
 from ..sam3_worker_status import worker_status
 from ..users import User
 from ..video_fence import async_video_fence
+from ..pipeline_mutation import reserve_mutation
 from ..videos import iso
 from ..workspace import ObjectContext, workspace
 
@@ -343,6 +344,7 @@ async def _finish_done_result(
     ctx,
     durable: bool,
 ) -> dict:
+    mutation = None
     async with sam3_video_fence(object_id, leased_item.video_id):
         if durable:
             await asyncio.to_thread(ctx.store.load)
@@ -377,6 +379,13 @@ async def _finish_done_result(
             resolved_export_root = Path(
                 _resolve_export_root(object_id, item.export_root)
             )
+            def before_publish(manifest):
+                nonlocal mutation
+                mutation = reserve_mutation(ctx, item.video_id, "sam3_published", {
+                    "annotation_revision": item.annotation_revision,
+                    "generation_id": manifest["generation_id"],
+                    "manifest_sha256": manifest["manifest_sha256"],
+                })
             try:
                 published_result = await asyncio.to_thread(
                     sam3_runs.publish_generation,
@@ -391,6 +400,7 @@ async def _finish_done_result(
                         "sam3_commit": item.sam3_commit,
                     },
                     worker_result=payload.result or {},
+                    before_publish=before_publish,
                 )
             except sam3_runs.Sam3GenerationError as exc:
                 raise HTTPException(409, str(exc)) from exc
@@ -414,7 +424,8 @@ async def _finish_done_result(
             )
             if found is None:
                 raise HTTPException(409, "lease inválido ou expirado")
-            return {"ok": True, "state": found[1].state, "stale": False}
+            response = {"ok": True, "state": found[1].state, "stale": False}
+    return {**response, **await asyncio.to_thread(mutation.complete)}
 
 
 @worker_router.post("/lease/{lease_id}/result")

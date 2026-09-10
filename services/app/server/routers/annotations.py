@@ -22,6 +22,7 @@ from ..models import VideoEntryIn, build_interval, validate_intervals
 from ..deps import get_object
 from ..users import User
 from ..videos import iso
+from ..pipeline_mutation import reserve_mutation
 from ..video_export_completion import (
     ExportCompletionConflict,
     finalize_video_export,
@@ -240,6 +241,7 @@ async def put_one(
     user: User = Depends(current_user),
     client_id: str = Depends(current_client),
 ) -> dict:
+    mutation = None
     video = _require(ctx, video_id)
     _require_lock(ctx, video_id, client_id, payload.lock_token, force)
     media_hint = await _media_for_write(ctx, video_id)
@@ -288,7 +290,12 @@ async def put_one(
             "intervals": intervals,
             "annotation_revision": _next_revision(previous),
         }
+        nonlocal mutation
         _stamp_history(entry, previous, user, "save")
+        mutation = reserve_mutation(ctx, video_id, "annotation_saved", {
+            "annotation_revision": entry["annotation_revision"],
+            "status": entry["status"],
+        })
         doc["videos"][video.relpath] = entry
         return entry
 
@@ -297,7 +304,7 @@ async def put_one(
     ):
         entry = await ctx.store.mutate(apply)
     await _cancel_stale_exports(ctx, video_id, entry["annotation_revision"])
-    return entry
+    return {**entry, **await asyncio.to_thread(mutation.complete)}
 
 
 class NoBoomPayload(BaseModel):
@@ -322,9 +329,10 @@ async def mark_no_object(
     cleanup: dict | None = None
     should_enqueue = False
     revision_changed = False
+    mutation = None
 
     def apply(doc: dict) -> dict:
-        nonlocal cleanup, should_enqueue, revision_changed
+        nonlocal cleanup, should_enqueue, revision_changed, mutation
         previous = doc["videos"].get(video.relpath) or {}
         _require_revision(previous, payload.expected_revision)
         previous_cleanup = previous.get("export_cleanup")
@@ -375,6 +383,9 @@ async def mark_no_object(
                 entry["export_cleanup"] = cleanup
                 entry.pop("cleanup_job_id", None)
                 should_enqueue = True
+            mutation = reserve_mutation(ctx, video_id, "no_object", {
+                "annotation_revision": entry["annotation_revision"], "status": "no_boom",
+            })
             doc["videos"][video.relpath] = entry
             return entry
 
@@ -423,6 +434,9 @@ async def mark_no_object(
         else:
             entry.pop("export_cleanup", None)
         _stamp_history(entry, previous, user, "no_object")
+        mutation = reserve_mutation(ctx, video_id, "no_object", {
+            "annotation_revision": revision, "status": "no_boom",
+        })
         doc["videos"][video.relpath] = entry
         return entry
 
@@ -491,7 +505,7 @@ async def mark_no_object(
                     doc, video.relpath, revision, updated_cleanup, None
                 )
             )
-    return entry
+    return {**entry, **await asyncio.to_thread(mutation.complete)}
 
 
 def _update_cleanup_marker(
@@ -674,8 +688,10 @@ async def complete_export_internal(
                 )
             except ExportCompletionConflict as exc:
                 raise HTTPException(409, str(exc)) from exc
+    projection_flags = await asyncio.to_thread(finalized.projection.complete)
     return {
         "ok": True,
+        **projection_flags,
         "digest": finalized.digest,
         "replayed": finalized.replayed,
     }

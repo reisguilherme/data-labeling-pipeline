@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+from contextlib import contextmanager
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -62,6 +64,69 @@ class _ConnectionFactory(Protocol):
 
 
 ConnectArg: TypeAlias = _ConnectionFactory | None
+
+_object_guard = threading.Lock()
+_object_locks: dict[str, threading.RLock] = {}
+
+
+@contextmanager
+def object_fence(object_id: str, *, database_url=None, connect=None):
+    """Serialize lifecycle publication with canonical reads/event allocation.
+
+    Lock order: video (when applicable), object, registry, projection rows.
+    The object lock is separate from the row barrier used by delayed applies.
+    """
+    object_id = _validate_identifier("object_id", object_id)
+    connection = _open_connection(database_url, connect)
+    if connection is None:
+        with _object_guard:
+            lock = _object_locks.setdefault(object_id, threading.RLock())
+        with lock:
+            yield
+        return
+    with connection:
+        with connection.cursor() as cursor:
+            _configure_transaction(cursor)
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (f"pipeline-object:{object_id}",))
+            yield
+
+
+def invalidate_object(object_id: str, *, database_url=None, connect=None) -> int | None:
+    """Durably fence all video rows without scanning videos or deleting data.
+
+    The caller holds object_fence through this reservation and registry commit.
+    """
+    object_id = _validate_identifier("object_id", object_id)
+    connection = _open_connection(database_url, connect)
+    if connection is None:
+        return None
+    with connection:
+        with connection.cursor() as cursor:
+            _configure_transaction(cursor)
+            cursor.execute("""
+                INSERT INTO video_pipeline_projection_barriers(object_id, event_seq)
+                VALUES (%s, nextval('video_pipeline_projection_events_event_seq_seq'))
+                ON CONFLICT (object_id) DO UPDATE
+                   SET event_seq = GREATEST(video_pipeline_projection_barriers.event_seq,
+                                            EXCLUDED.event_seq)
+                RETURNING event_seq
+            """, (object_id,))
+            return int(cursor.fetchone()[0])
+
+
+def _locked_barrier(cursor, object_id: str) -> int:
+    # Ensure there is a row even before the first lifecycle mutation. The row
+    # lock makes concurrent invalidation and apply atomic in either order.
+    cursor.execute("""
+        INSERT INTO video_pipeline_projection_barriers(object_id) VALUES (%s)
+        ON CONFLICT (object_id) DO NOTHING
+    """, (object_id,))
+    cursor.execute("""
+        SELECT event_seq FROM video_pipeline_projection_barriers
+         WHERE object_id = %s FOR SHARE
+    """, (object_id,))
+    return int(cursor.fetchone()[0])
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -292,6 +357,7 @@ def reserve_repair_intent(
     with connection:
         with connection.cursor() as cursor:
             _configure_transaction(cursor)
+            barrier = _locked_barrier(cursor, object_id)
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (_video_lock_key(object_id, video_id),),
@@ -324,6 +390,7 @@ def reserve_repair_intent(
 
             current_matches = bool(
                 current is not None
+                and current.event_seq > barrier
                 and _canonical_json(
                     current.source_identity, field="current source_identity"
                 )
@@ -337,6 +404,7 @@ def reserve_repair_intent(
                 return None, current
             if (
                 latest is not None
+                and latest.event_seq > barrier
                 and latest.status == "pending"
                 and latest.event_kind == event_kind
                 and _canonical_json(
@@ -409,6 +477,7 @@ def apply_intent(
             if identity is None:
                 raise LookupError(f"projection intent {event_seq} nao existe")
             object_id, video_id = identity
+            barrier = _locked_barrier(cursor, object_id)
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (_video_lock_key(str(object_id), str(video_id)),),
@@ -426,6 +495,20 @@ def apply_intent(
             if event is None:
                 raise LookupError(f"projection intent {event_seq} nao existe")
             object_id, video_id, source_identity, source_digest = event
+            if event_seq <= barrier:
+                cursor.execute("""
+                    UPDATE video_pipeline_projection_events
+                       SET status = 'superseded', updated_at = now()
+                     WHERE event_seq = %s
+                """, (event_seq,))
+                cursor.execute(f"""
+                    SELECT {_RECORD_COLUMNS},
+                           CASE WHEN event_seq <= %s THEN 'stale' ELSE 'current' END
+                      FROM video_pipeline_projection
+                     WHERE object_id = %s AND video_id = %s
+                """, (barrier, object_id, video_id))
+                row = cursor.fetchone()
+                return _record_from_row(row) if row else None
             cursor.execute(
                 f"""
                 INSERT INTO video_pipeline_projection
@@ -563,7 +646,9 @@ def get_many(
                 SELECT r.object_id, r.video_id, COALESCE(p.event_seq, latest.event_seq),
                        COALESCE(p.source_identity, latest.source_identity),
                        COALESCE(p.snapshot, '{}'::jsonb), p.projected_at,
-                       CASE WHEN latest.status = 'pending'
+                       CASE WHEN COALESCE(p.event_seq, latest.event_seq) <= COALESCE(b.event_seq, 0)
+                            THEN 'stale'
+                            WHEN latest.status = 'pending'
                                  AND (p.event_seq IS NULL OR latest.event_seq > p.event_seq)
                             THEN 'pending'
                             WHEN applied.status = 'applied' AND latest.event_seq = p.event_seq
@@ -571,6 +656,7 @@ def get_many(
                   FROM requested r
                   LEFT JOIN video_pipeline_projection p
                     ON p.object_id = r.object_id AND p.video_id = r.video_id
+                  LEFT JOIN video_pipeline_projection_barriers b ON b.object_id = r.object_id
                   LEFT JOIN video_pipeline_projection_events applied ON applied.event_seq = p.event_seq
                   LEFT JOIN LATERAL (
                       SELECT event_seq, status, source_identity FROM video_pipeline_projection_events e

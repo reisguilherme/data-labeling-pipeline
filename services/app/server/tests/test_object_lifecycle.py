@@ -6,6 +6,85 @@ import tempfile
 
 
 class ObjectLifecycleTests(unittest.TestCase):
+    def test_restore_active_is_noop_and_mutation_response_has_projection_flags(self):
+        import asyncio
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from server.workspace import Workspace, ObjectConfig
+        from server.routers import objects
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = Workspace()
+            registry.root = root
+            registry.create(ObjectConfig(object_id="boom", display_name="Boom", label="boom",
+                                         videos_root=root / "boom/raw", output_root=root / "boom/dataset"))
+            with patch.object(objects, "workspace", registry), patch(
+                "server.pipeline_projection.invalidate_object", return_value=52
+            ) as invalidate:
+                response = asyncio.run(objects.archive_object("boom", SimpleNamespace()))
+                self.assertTrue(response["projection_pending"])
+                self.assertEqual(response["projection_event_seq"], 52)
+                response = asyncio.run(objects.restore_object("boom", SimpleNamespace()))
+                self.assertTrue(response["projection_pending"])
+                before = registry.registry_path.read_bytes()
+                asyncio.run(objects.restore_object("boom", SimpleNamespace()))
+                self.assertEqual(invalidate.call_count, 2)
+                self.assertEqual(registry.registry_path.read_bytes(), before)
+                response = asyncio.run(objects.update_object("boom", objects.ObjectPatch(display_name="Renamed"), SimpleNamespace()))
+                self.assertEqual(response["projection_event_seq"], 52)
+                self.assertTrue(response["projection_pending"])
+                self.assertEqual(invalidate.call_count, 3)
+                self.assertNotIn("projection_pending", registry.registry_path.read_text())
+
+    def test_lifecycle_barrier_failure_prevents_registry_mutation_without_scanning(self):
+        from unittest.mock import patch
+        from server.workspace import Workspace, ObjectConfig
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = Workspace()
+            registry.root = root
+            registry.create(ObjectConfig(object_id="boom", display_name="Boom", label="boom",
+                                         videos_root=root / "boom/raw", output_root=root / "boom/dataset"))
+            before = registry.registry_path.read_bytes()
+            for changes in ({"archived": True}, {"display_name": "Renamed"}, {"label": "renamed"}):
+                with self.subTest(changes=changes), patch(
+                    "server.pipeline_projection.invalidate_object", create=True,
+                    side_effect=RuntimeError("barrier failed")
+                ), patch.object(registry, "context", side_effect=AssertionError("must not load media")):
+                    with self.assertRaisesRegex(RuntimeError, "barrier failed"):
+                        registry.update("boom", **changes)
+                    self.assertEqual(registry.registry_path.read_bytes(), before)
+                    self.assertFalse(registry.get("boom").archived)
+
+    def test_archive_restore_rename_reserve_inside_shared_object_protection(self):
+        from unittest.mock import patch
+        from contextlib import contextmanager
+        from server.workspace import Workspace, ObjectConfig
+        from server import pipeline_projection
+        events = []
+        @contextmanager
+        def fence(object_id):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+        def invalidate(object_id):
+            self.assertEqual(events[-1], "enter")
+            events.append("reserve")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = Workspace()
+            registry.root = root
+            registry.create(ObjectConfig(object_id="boom", display_name="Boom", label="boom",
+                                         videos_root=root / "boom/raw", output_root=root / "boom/dataset"))
+            with patch.object(pipeline_projection, "object_fence", side_effect=fence, create=True), patch.object(
+                pipeline_projection, "invalidate_object", side_effect=invalidate, create=True
+            ), patch.object(registry, "context", side_effect=AssertionError("media scan")):
+                for changes in ({"archived": True}, {"archived": False}, {"display_name": "Renamed"}):
+                    registry.update("boom", **changes)
+            self.assertEqual(events, ["enter", "reserve", "exit"] * 3)
+
     def test_confirmation_must_equal_excluir_object_id(self) -> None:
         from server.object_lifecycle import validate_purge_confirmation
 

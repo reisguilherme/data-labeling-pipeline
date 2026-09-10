@@ -18,6 +18,100 @@ from server.pipeline_projection import (
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
 class PipelineProjectionPostgresTests(unittest.TestCase):
+    def test_barrier_upgrade_after_005_is_independent_and_replay_safe(self):
+        migrations = Path(__file__).resolve().parents[4] / "migrations"
+        with self._connect() as connection:
+            connection.execute("DROP TABLE video_pipeline_projection_barriers")
+            connection.execute((migrations / "005_video_pipeline_projection.sql").read_text())
+            self.assertIsNone(connection.execute("SELECT to_regclass('video_pipeline_projection_barriers')").fetchone()[0])
+            upgrade = migrations / "006_video_pipeline_projection_barriers.sql"
+            self.assertTrue(upgrade.is_file(), "upgrade for already-applied 005 missing")
+            connection.execute(upgrade.read_text())
+            connection.execute("INSERT INTO video_pipeline_projection_barriers VALUES ('boom', 19)")
+            connection.execute(upgrade.read_text())
+            self.assertEqual(connection.execute("SELECT event_seq FROM video_pipeline_projection_barriers WHERE object_id='boom'").fetchone()[0], 19)
+
+    def test_paused_canonical_read_cannot_allocate_after_archive_and_restore(self):
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from server import pipeline_projection as store, pipeline_reconcile as reconcile
+        from server.tests.test_pipeline_reconcile import _CanonicalVideo, _context
+        self.assertTrue(callable(getattr(store, "object_fence", None)), "object fence missing")
+        fixture = _CanonicalVideo(Path(tempfile.mkdtemp()))
+        ctx = _context(fixture)
+        config = SimpleNamespace(archived=False)
+        read = threading.Event()
+        resume = threading.Event()
+        lifecycle_entered = threading.Event()
+        real_fence = store.object_fence
+        authoritative = reconcile._authoritative_archived
+        def paused(ctx, object_id):
+            result = authoritative(ctx, object_id)
+            read.set()
+            if not resume.wait(3):
+                raise TimeoutError("test did not release canonical read")
+            return result
+        def archive():
+            with real_fence("boom", connect=self._connect):
+                lifecycle_entered.set()
+                barrier = store.invalidate_object("boom", connect=self._connect)
+                config.archived = True
+                return barrier
+        with patch.object(store, "object_fence", side_effect=lambda oid: real_fence(oid, connect=self._connect)), patch.object(
+            reconcile, "workspace", SimpleNamespace(ready=True, get=lambda oid: config)
+        ), patch.object(reconcile.sam3_queue, "public", return_value={"state": "done", "annotation_revision": 7, "run_id": "generation-a"}), patch.object(
+            reconcile, "reserve_repair_intent", side_effect=lambda **kw: store.reserve_repair_intent(**kw, connect=self._connect)
+        ), patch.object(reconcile, "apply_intent", side_effect=lambda event, snapshot: store.apply_intent(event, snapshot, connect=self._connect)):
+            with ThreadPoolExecutor(max_workers=2) as pool, patch.object(reconcile, "_authoritative_archived", side_effect=paused):
+                rebuilding = pool.submit(reconcile.reconcile_video, ctx, "video-1")
+                self.assertTrue(read.wait(2))
+                archiving = pool.submit(archive)
+                try:
+                    self.assertFalse(lifecycle_entered.wait(0.1))
+                finally:
+                    resume.set()
+                old = rebuilding.result(timeout=3)
+                barrier = archiving.result(timeout=3)
+            self.assertGreater(barrier, old.event_seq)
+            self.assertEqual(store.get_many("boom", ["video-1"], connect=self._connect)["video-1"].projection_status, "stale")
+            with real_fence("boom", connect=self._connect):
+                restore_barrier = store.invalidate_object("boom", connect=self._connect)
+                config.archived = False
+            restored = reconcile.reconcile_video(ctx, "video-1")
+            self.assertGreater(restored.event_seq, restore_barrier)
+            self.assertEqual(restored.source_identity, old.source_identity)
+            self.assertEqual(reconcile.reconcile_video(ctx, "video-1").event_seq, restored.event_seq)
+
+    def test_object_barrier_blocks_old_apply_and_forces_fresh_repair(self):
+        from server import pipeline_projection as store
+        invalidate = getattr(store, "invalidate_object", None)
+        self.assertTrue(callable(invalidate), "monotonic object barrier missing")
+        older = reserve_intent(object_id="boom", video_id="video-1", event_kind="saved",
+                               source_identity={"revision": 1}, connect=self._connect)
+        apply_intent(older, {"complete": True}, connect=self._connect)
+        delayed = reserve_intent(object_id="boom", video_id="video-2", event_kind="saved",
+                                 source_identity={"revision": 1}, connect=self._connect)
+        reserve_intent(object_id="boom", video_id="video-1", event_kind="saved",
+                       source_identity={"revision": 2}, connect=self._connect)
+        barrier = invalidate("boom", connect=self._connect)
+        self.assertGreater(barrier, delayed.event_seq)
+        self.assertEqual(get_many("boom", ["video-1", "video-2"], connect=self._connect)["video-1"].projection_status, "stale")
+        apply_intent(older, {"complete": True}, connect=self._connect)
+        apply_intent(delayed, {"complete": True}, connect=self._connect)
+        rows = get_many("boom", ["video-1", "video-2"], connect=self._connect)
+        self.assertEqual(rows["video-1"].projection_status, "stale")
+        self.assertTrue("video-2" not in rows or rows["video-2"].projection_status != "current")
+        repair, current = reserve_repair_intent(object_id="boom", video_id="video-1",
+            source_identity={"revision": 1}, snapshot={"complete": True}, connect=self._connect)
+        self.assertIsNone(current)
+        self.assertGreater(repair.event_seq, barrier)
+        apply_intent(repair, {"complete": True}, connect=self._connect)
+        self.assertEqual(get_many("boom", ["video-1"], connect=self._connect)["video-1"].projection_status, "current")
+        with self._connect() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM video_pipeline_projection").fetchone()[0], 1)
+
     def setUp(self) -> None:
         import psycopg
 
@@ -29,6 +123,8 @@ class PipelineProjectionPostgresTests(unittest.TestCase):
             / "migrations"
             / "005_video_pipeline_projection.sql"
         ).read_text(encoding="utf-8")
+        migration += (Path(__file__).resolve().parents[4] / "migrations" /
+                      "006_video_pipeline_projection_barriers.sql").read_text(encoding="utf-8")
         self.migration = migration
         with psycopg.connect(self.url, autocommit=True) as connection:
             connection.execute(f'CREATE SCHEMA "{self.schema}"')

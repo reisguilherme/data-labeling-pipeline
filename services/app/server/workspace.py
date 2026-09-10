@@ -588,12 +588,35 @@ class Workspace:
             self._contexts[cfg.object_id] = context
         return cfg
 
-    def update(self, object_id: str, **changes) -> ObjectConfig:
-        with self._lock, _exclusive_registry_lock(self.registry_lock_path):
+    def update(
+        self, object_id: str, *, projection_outcome: dict | None = None, **changes
+    ) -> ObjectConfig:
+        from . import pipeline_projection
+
+        with (
+            pipeline_projection.object_fence(object_id),
+            self._lock,
+            _exclusive_registry_lock(self.registry_lock_path),
+        ):
             self._read_registry_unlocked()
             cfg = self._objects.get(object_id)
             if cfg is None:
                 raise ObjectNotFound(object_id)
+            if projection_outcome is not None:
+                projection_outcome.update(projection_pending=False, projection_event_seq=None)
+            changes = {
+                key: value for key, value in changes.items()
+                if value is not None and hasattr(cfg, key) and value != getattr(cfg, key)
+            }
+            if not changes:
+                return cfg
+            if {"archived", "display_name", "label"}.intersection(changes):
+                barrier = pipeline_projection.invalidate_object(object_id)
+                if projection_outcome is not None:
+                    projection_outcome.update(
+                        projection_pending=barrier is not None,
+                        projection_event_seq=barrier,
+                    )
             for key, value in changes.items():
                 if value is not None and hasattr(cfg, key):
                     setattr(cfg, key, value)

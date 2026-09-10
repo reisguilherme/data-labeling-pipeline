@@ -12,6 +12,7 @@ from .pipeline_projection import (
     fail_intent,
     reserve_repair_intent,
 )
+from . import pipeline_projection
 from .pipeline_state import PipelineSnapshot, PipelineSource, derive_pipeline_source
 from .sam3 import queue as sam3_queue
 from .video_fence import video_fence
@@ -98,7 +99,7 @@ def reconcile_video(
         # The source read and event allocation must share the same fence as
         # canonical writers.  Otherwise an old read could reserve a newer
         # event_seq while another process is publishing newer metadata.
-        with video_fence(object_id, video_id):
+        with video_fence(object_id, video_id), pipeline_projection.object_fence(object_id):
             archived = _authoritative_archived(ctx, object_id)
             if archived:
                 source = _terminal_source(

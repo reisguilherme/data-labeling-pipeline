@@ -407,6 +407,25 @@ assignments:
 
 
 class Sam3PublicationTests(unittest.TestCase):
+    def test_reservation_wraps_only_validated_pointer_and_covers_replay(self):
+        from pipeline_core.sam3_runs import publish_generation, current_manifest_path
+        result = self._worker_result()
+        calls = []
+        def before_pointer(manifest):
+            calls.append(manifest["generation_id"])
+            self.assertTrue((self.export_root / "_sam3/runs/run-1/generation.json").is_file())
+            raise RuntimeError("reserve failed")
+        kwargs = dict(export_root=self.export_root, segments=["seg_00"],
+                      generation_id="run-1", attempt_id="lease-1", annotation_revision=7,
+                      expected_model=self.model, worker_result=result)
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "reserve failed"):
+                publish_generation(**kwargs, before_publish=before_pointer)
+            self.assertFalse(current_manifest_path(self.export_root).exists())
+        self.assertEqual(calls, ["run-1", "run-1"])
+        publish_generation(**kwargs)
+        self.assertTrue(current_manifest_path(self.export_root).exists())
+
     def setUp(self) -> None:
         self.export_root = Path(tempfile.mkdtemp()) / "video"
         self.segment = self.export_root / "seg_00"
@@ -1016,7 +1035,25 @@ class Sam3PublicationRouterTests(unittest.IsolatedAsyncioTestCase):
             "publication": {"generation_id": queued.run_id},
         }
         store = Store()
-        ctx = SimpleNamespace(store=store, ensure_loaded=lambda: None)
+        ctx = SimpleNamespace(object_id="boom", store=store, ensure_loaded=lambda: None)
+        from server.tests.test_projection_mutation_hooks import intent
+        events = []
+        observations = []
+        @asynccontextmanager
+        async def fence(*args):
+            events.append("video-enter")
+            try:
+                yield
+            finally:
+                events.append("video-exit")
+        def publish_result(**kwargs):
+            kwargs["before_publish"]({"generation_id": queued.run_id, "manifest_sha256": "a" * 64})
+            events.append("pointer")
+            return published_result
+        def reconcile(*args, **kwargs):
+            observations.append((list(events), queue.get("boom", "clip.mp4").state,
+                                 "sam3" in store.entry("clip.mp4")))
+            raise RuntimeError("apply failed")
 
         with patch.object(sam3_router, "queue", queue), patch.object(
             sam3_router.workspace, "context", return_value=ctx
@@ -1024,8 +1061,12 @@ class Sam3PublicationRouterTests(unittest.IsolatedAsyncioTestCase):
             "server.routers.sam3._resolve_export_root", return_value=str(export_root)
         ), patch(
             "pipeline_core.sam3_runs.publish_generation",
-            return_value=published_result,
-        ) as publish:
+            side_effect=publish_result,
+        ) as publish, patch.object(sam3_router, "sam3_video_fence", side_effect=fence), patch(
+            "server.pipeline_projection.reserve_intent", side_effect=intent
+        ), patch("server.pipeline_projection.fail_intent"), patch(
+            "server.pipeline_reconcile.reconcile_video", side_effect=reconcile
+        ):
             response = await sam3_router.result(
                 leased.lease_id,
                 sam3_router.ResultIn(state="done", result=raw_result),
@@ -1034,6 +1075,9 @@ class Sam3PublicationRouterTests(unittest.IsolatedAsyncioTestCase):
 
         publish.assert_called_once()
         self.assertEqual(response["state"], "done")
+        self.assertTrue(response["projection_pending"])
+        self.assertEqual(observations, [(["video-enter", "pointer", "video-exit"], "done", True)])
+        self.assertEqual(response["projection_event_seq"], 41)
         self.assertEqual(
             store.entry("clip.mp4")["sam3"]["publication"],
             {"generation_id": queued.run_id},

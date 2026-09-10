@@ -617,6 +617,7 @@ def set_frame(
     status: str,
     boxes: list[dict] | None,
     user: str | None,
+    before_commit=None,
 ) -> dict:
     """Grava o estado de UM frame. Serializado: a tela salva a cada ajuste."""
     if status not in STATUSES:
@@ -639,12 +640,15 @@ def set_frame(
         review["frames"][str(frame)] = entry
         if user:
             review["by"] = user
+        if before_commit is not None:
+            before_commit(review)
         save_review(paths, review)
     return entry
 
 
 def confirm_range(
-    paths: SegmentPaths, start: int, end: int, *, user: str | None, overwrite: bool = False
+    paths: SegmentPaths, start: int, end: int, *, user: str | None, overwrite: bool = False,
+    before_commit=None,
 ) -> int:
     """Marca [start, end] como conferido de uma vez.
 
@@ -668,15 +672,19 @@ def confirm_range(
             changed += 1
         if user:
             review["by"] = user
+        if before_commit is not None:
+            before_commit(review)
         save_review(paths, review)
     return changed
 
 
-def clear_frame(paths: SegmentPaths, frame: int) -> None:
+def clear_frame(paths: SegmentPaths, frame: int, *, before_commit=None) -> None:
     """Desfaz a revisão de um frame — volta a valer o resultado do SAM3."""
     with _lock:
         review = load_review(paths)
         review.get("frames", {}).pop(str(frame), None)
+        if before_commit is not None:
+            before_commit(review)
         save_review(paths, review)
 
 

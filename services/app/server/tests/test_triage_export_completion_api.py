@@ -188,7 +188,12 @@ class ExportCompletionApiTests(unittest.IsolatedAsyncioTestCase):
             async def finalize(*_args, **_kwargs):
                 self.assertEqual(events, ["video-enter", "job-enter"])
                 events.append("finalize")
-                return SimpleNamespace(digest="digest", replayed=False)
+                def complete():
+                    self.assertEqual(events[-2:], ["job-exit", "video-exit"])
+                    events.append("reconcile")
+                    return {"projection_pending": False, "projection_event_seq": 42}
+                return SimpleNamespace(digest="digest", replayed=False,
+                                       projection=SimpleNamespace(complete=complete))
 
             with patch(
                 "server.routers.annotations.durable_jobs.video_advisory_lock_async",
@@ -208,7 +213,7 @@ class ExportCompletionApiTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 events,
-                ["video-enter", "job-enter", "finalize", "job-exit", "video-exit"],
+                ["video-enter", "job-enter", "finalize", "job-exit", "video-exit", "reconcile"],
             )
 
     async def test_missing_expired_or_cancelled_lease_is_rejected(self) -> None:

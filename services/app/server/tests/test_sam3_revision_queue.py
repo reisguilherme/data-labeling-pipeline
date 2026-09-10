@@ -16,6 +16,11 @@ from server.sam3 import Sam3Queue
 from server.sam3_postgres import PostgresSam3Queue
 
 
+def _publish_test_result(**kwargs):
+    kwargs["before_publish"]({"generation_id": "test-run", "manifest_sha256": "a" * 64})
+    return kwargs["worker_result"]
+
+
 class _Cursor:
     def __init__(self, rows: list[object]) -> None:
         self.rows = iter(rows)
@@ -701,7 +706,7 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
         _, leased = queue.take("worker", 180)
         lease_id = leased.lease_id
         store = Store()
-        ctx = SimpleNamespace(store=store, ensure_loaded=lambda: None)
+        ctx = SimpleNamespace(object_id="boom", store=store, ensure_loaded=lambda: None)
 
         with patch.object(sam3_router, "queue", queue), patch.object(
             sam3_router.workspace, "context", return_value=ctx
@@ -709,7 +714,7 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
             sam3_router, "_resolve_export_root", return_value="/x"
         ), patch(
             "pipeline_core.sam3_runs.publish_generation",
-            side_effect=lambda **kwargs: kwargs["worker_result"],
+            side_effect=_publish_test_result,
         ) as publish:
             response = await sam3_router.result(
                 lease_id,
@@ -763,7 +768,7 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
         _, leased = queue.take("worker", 180)
         lease_id = leased.lease_id
         store = Store()
-        ctx = SimpleNamespace(store=store, ensure_loaded=lambda: None)
+        ctx = SimpleNamespace(object_id="boom", store=store, ensure_loaded=lambda: None)
 
         with patch.object(sam3_router, "queue", queue), patch.object(
             sam3_router.workspace, "context", return_value=ctx
@@ -771,7 +776,7 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
             sam3_router, "_resolve_export_root", return_value="/x"
         ), patch(
             "pipeline_core.sam3_runs.publish_generation",
-            side_effect=lambda **kwargs: kwargs["worker_result"],
+            side_effect=_publish_test_result,
         ):
             with self.assertRaisesRegex(OSError, "flush failed"):
                 await sam3_router.result(
@@ -840,14 +845,14 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
                         return result
 
                 store = Store()
-                ctx = SimpleNamespace(store=store, ensure_loaded=lambda: None)
+                ctx = SimpleNamespace(object_id="boom", store=store, ensure_loaded=lambda: None)
                 with patch.object(sam3_router, "queue", queue), patch.object(
                     sam3_router.workspace, "context", return_value=ctx
                 ), patch("server.durable_jobs.enabled", return_value=False), patch.object(
                     sam3_router, "_resolve_export_root", return_value="/x"
                 ), patch(
                     "pipeline_core.sam3_runs.publish_generation",
-                    side_effect=lambda **kwargs: kwargs["worker_result"],
+                    side_effect=_publish_test_result,
                 ):
                     response = await sam3_router.result(
                         leased.lease_id,

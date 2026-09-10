@@ -13,6 +13,7 @@ from . import durable_jobs
 from . import export as export_module
 from .sam3 import queue as sam3_queue
 from .videos import iso
+from .pipeline_mutation import ProjectionMutation, reserve_mutation
 
 
 class ExportCompletionConflict(ValueError):
@@ -24,6 +25,15 @@ class FinalizedVideoExport:
     entry: dict
     digest: str
     replayed: bool
+    projection: ProjectionMutation
+
+    @property
+    def projection_pending(self) -> bool:
+        return self.projection.pending
+
+    @property
+    def projection_event_seq(self) -> int | None:
+        return self.projection.event_seq
 
 
 def _conflict(message: str) -> ExportCompletionConflict:
@@ -208,6 +218,12 @@ async def finalize_video_export(
         object_id=ctx.object_id, video_id=video_id, job_id=job_id, result=normalized
     )
     actor = user if isinstance(user, str) and user else "system"
+    mutation = None
+
+    def reserve():
+        return reserve_mutation(ctx, video_id, "video_export_completed", {
+            "annotation_revision": revision, "job_id": job_id, "digest": digest,
+        })
 
     async with _video_lock(ctx, video_id, already_held=_video_lock_held):
         # Recompute after cross-process reload while holding the shared fence.
@@ -216,6 +232,7 @@ async def finalize_video_export(
             raise _conflict("ownership mudou durante a conclusao")
 
         def apply(doc: dict):
+            nonlocal mutation
             entry = doc["videos"].get(video.relpath)
             if entry is None:
                 raise _conflict("anotacao nao encontrada")
@@ -240,6 +257,7 @@ async def finalize_video_export(
                     and completion.get("digest") != digest
                 ):
                     raise _conflict("o mesmo job apresentou um resultado divergente")
+                mutation = reserve()
                 return entry, True
 
             expected_segments = [
@@ -258,6 +276,7 @@ async def finalize_video_export(
                 if segment_dir.is_symlink() or not segment_dir.is_dir():
                     raise _conflict("resultado possui segmento ausente ou inseguro")
 
+            mutation = reserve()
             entry["export"] = normalized
             entry["exported_at"] = iso()
             entry["status"] = "done"
@@ -289,4 +308,7 @@ async def finalize_video_export(
                 annotation_revision=revision,
             )
 
-    return FinalizedVideoExport(entry=entry, digest=digest, replayed=replayed)
+    if not _video_lock_held:
+        await asyncio.to_thread(mutation.complete)
+    return FinalizedVideoExport(entry={**entry, **mutation.flags()}, digest=digest,
+                                replayed=replayed, projection=mutation)

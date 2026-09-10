@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Iterator
 
@@ -14,6 +14,7 @@ from starlette.responses import FileResponse
 from .. import review as review_module
 from ..deps import current_client, current_user, get_object
 from ..locks import locks
+from ..pipeline_mutation import reserve_mutation
 from ..mask_api import decode_mask_edits, serialize_frame_state
 from ..review import SegmentPaths
 from ..sam3_run_index import index_revision, index_revisions
@@ -30,6 +31,18 @@ from pipeline_core.sam3_runs import (
 )
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["review"])
+
+
+def _review_identity(frames: dict) -> dict:
+    """Prospective effective review content; audit timestamps are not a retry key."""
+    return {
+        str(frame): {
+            key: entry[key]
+            for key in ("revision", "status", "boxes", "instances", "deleted_obj_ids")
+            if key in entry
+        }
+        for frame, entry in frames.items()
+    }
 
 
 def _export_version(root: Path) -> str:
@@ -355,16 +368,26 @@ def save_mask_review(
     user: User = Depends(current_user),
     client_id: str = Depends(current_client),
 ) -> dict:
+    mutation = None
     try:
         edits = decode_mask_edits([item.model_dump() for item in payload.instances])
         with _locked_export(
             ctx, video_id, client_id, payload.export_version
-        ) as (root, segments, video):
+        ) as (root, segments, video), ExitStack() as publication:
             paths = _segment_paths(root, segments, segment)
             if not (0 <= frame < _frame_count(paths)):
                 raise HTTPException(404, "frame não existe neste segmento")
             if not (paths.out_dir / "masks").is_dir():
                 raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
+            def before_commit(entry):
+                nonlocal mutation
+                mutation = reserve_mutation(ctx, video_id, "mask_review_saved", {
+                    "export_version": payload.export_version, "segment": segment,
+                    "frames": _review_identity({str(frame): entry}),
+                })
+                index_revision(object_id=ctx.object_id, relpath=video.relpath,
+                               segment_dir=paths.segment_dir, frame_idx=frame,
+                               entry=entry, user=user.user_id, publication_guard=publication)
             state = _mask_store(paths).save_frame(
                 frame,
                 expected_revision=payload.expected_revision,
@@ -372,23 +395,17 @@ def save_mask_review(
                 instances=edits,
                 retain_obj_ids=payload.retain_obj_ids,
                 user=user.user_id,
-                before_commit=lambda entry: index_revision(
-                    object_id=ctx.object_id,
-                    relpath=video.relpath,
-                    segment_dir=paths.segment_dir,
-                    frame_idx=frame,
-                    entry=entry,
-                    user=user.user_id,
-                ),
+                before_commit=before_commit,
             )
     except RevisionConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     except (MaskValidationError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    return serialize_frame_state(
+    response = serialize_frame_state(
         state,
         mask_url=lambda obj_id: _mask_url(ctx, video_id, segment, frame, obj_id),
     )
+    return {**response, **mutation.complete()}
 
 
 @router.put("/videos/{video_id}/segments/{segment}/mask-review")
@@ -402,6 +419,7 @@ def save_mask_review_batch(
 ) -> dict:
     """Publica a revisão humana de um trecho em uma única operação."""
     frame_numbers = [item.frame for item in payload.frames]
+    mutation = None
     if len(set(frame_numbers)) != len(frame_numbers):
         raise HTTPException(422, "o lote contém frames duplicados")
     try:
@@ -419,7 +437,7 @@ def save_mask_review_batch(
         ]
         with _locked_export(
             ctx, video_id, client_id, payload.export_version
-        ) as (root, segments, video):
+        ) as (root, segments, video), ExitStack() as publication:
             paths = _segment_paths(root, segments, segment)
             frame_count = _frame_count(paths)
             invalid = [frame for frame in frame_numbers if frame >= frame_count]
@@ -432,14 +450,20 @@ def save_mask_review_batch(
             pending_index: list[tuple[int, dict]] = []
 
             def index_batch(frame: int, entry: dict) -> None:
+                nonlocal mutation
                 pending_index.append((frame, entry))
                 if len(pending_index) == len(updates):
+                    mutation = reserve_mutation(ctx, video_id, "mask_review_saved", {
+                        "export_version": payload.export_version, "segment": segment,
+                        "frames": _review_identity(dict(pending_index)),
+                    })
                     index_revisions(
                         object_id=ctx.object_id,
                         relpath=video.relpath,
                         segment_dir=paths.segment_dir,
                         revisions=pending_index,
                         user=user.user_id,
+                        publication_guard=publication,
                     )
 
             states = store.save_frames(
@@ -456,7 +480,7 @@ def save_mask_review_batch(
                 for entry in (manifest.get("frames") or {}).values()
                 if entry.get("status") in {"ok", "edited"}
             )
-            return {
+            response = {
                 "frames": [
                     {
                         "frame": state.frame,
@@ -473,6 +497,7 @@ def save_mask_review_batch(
         raise HTTPException(409, str(exc)) from exc
     except (MaskValidationError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
+    return {**response, **mutation.complete()}
 
 
 # --------------------------------------------------------------------------
@@ -523,17 +548,25 @@ def put_frame(
         }
         for position, box in enumerate(payload.boxes, start=1)
     ]
+    mutation = None
+    def before_commit(review):
+        nonlocal mutation
+        mutation = reserve_mutation(ctx, video_id, "legacy_review_saved", {
+            "export_version": payload.export_version, "segment": segment,
+            "frames": _review_identity(review.get("frames") or {}),
+        })
     try:
         with _locked_export(
             ctx, video_id, client_id, payload.export_version
         ) as (root, segments, _):
             paths = _segment_paths(root, segments, segment)
             entry = review_module.set_frame(
-                paths, frame, status=payload.status, boxes=boxes, user=user.user_id
+                paths, frame, status=payload.status, boxes=boxes, user=user.user_id,
+                before_commit=before_commit,
             )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return {"frame": frame, **entry}
+    return {"frame": frame, **entry, **mutation.complete()}
 
 
 class ConfirmIn(BaseModel):
@@ -553,6 +586,13 @@ def confirm(
     client_id: str = Depends(current_client),
 ) -> dict:
     """Confirma um intervalo de frames de uma vez."""
+    mutation = None
+    def before_commit(review):
+        nonlocal mutation
+        mutation = reserve_mutation(ctx, video_id, "legacy_review_saved", {
+            "export_version": payload.export_version, "segment": segment,
+            "frames": _review_identity(review.get("frames") or {}),
+        })
     with _locked_export(
         ctx, video_id, client_id, payload.export_version
     ) as (root, segments, _):
@@ -563,14 +603,16 @@ def confirm(
             payload.end,
             user=user.user_id,
             overwrite=payload.overwrite,
+            before_commit=before_commit,
         )
         names = review_module.class_names(workspace.root) if workspace.root else []
         state = review_module.segment_state(paths, _frame_count(paths), names)
-        return {
+        response = {
             "confirmed": changed,
             "reviewed": state["reviewed"],
             "complete": state["complete"],
         }
+    return {**response, **mutation.complete()}
 
 
 @router.delete("/videos/{video_id}/segments/{segment}/review/{frame}")
@@ -584,9 +626,16 @@ def reset_frame(
     client_id: str = Depends(current_client),
 ) -> dict:
     """Descarta a revisão de um frame: volta a valer o resultado do SAM3."""
+    mutation = None
+    def before_commit(review):
+        nonlocal mutation
+        mutation = reserve_mutation(ctx, video_id, "legacy_review_saved", {
+            "export_version": export_version, "segment": segment,
+            "frames": _review_identity(review.get("frames") or {}),
+        })
     with _locked_export(
         ctx, video_id, client_id, export_version
     ) as (root, segments, _):
         paths = _segment_paths(root, segments, segment)
-        review_module.clear_frame(paths, frame)
-        return {"frame": frame, "status": None}
+        review_module.clear_frame(paths, frame, before_commit=before_commit)
+    return {"frame": frame, "status": None, **mutation.complete()}

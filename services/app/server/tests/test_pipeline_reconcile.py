@@ -891,6 +891,8 @@ class PipelineReconcilePostgresTests(unittest.TestCase):
             / "migrations"
             / "005_video_pipeline_projection.sql"
         ).read_text(encoding="utf-8")
+        migration += (Path(__file__).resolve().parents[4] / "migrations" /
+                      "006_video_pipeline_projection_barriers.sql").read_text(encoding="utf-8")
         with psycopg.connect(self.url, autocommit=True) as connection:
             connection.execute(f'CREATE SCHEMA "{self.schema}"')
             connection.execute(f'SET search_path TO "{self.schema}"')
