@@ -144,6 +144,47 @@ docker compose ps
 docker compose logs --since 10m app worker
 ```
 
+Para a versao com projecao operacional, mantenha PostgreSQL ativo, mas app e
+workers parados. Depois do backup e do `git pull --ff-only`, construa a imagem e
+rode primeiro o dry-run. O entrypoint aplica a migration aditiva 006 antes de
+carregar o novo comando; nao inicie o codigo novo contra um banco onde ela ainda
+nao rodou:
+
+```bash
+docker compose build app worker
+./scripts/reconcile-pipeline-projection.sh --limit 100
+```
+
+O relatorio e somente-leitura e separa `current`, `stale`, `missing`, `pending`,
+`legacy` e `invalid`. Investigue erros de metadados antes do apply. Para reparar,
+use lotes limitados e retome exatamente do token retornado:
+
+```bash
+./scripts/reconcile-pipeline-projection.sh --apply --limit 100
+./scripts/reconcile-pipeline-projection.sh --apply --limit 100 --resume-token TOKEN
+```
+
+Repita ate `resume_token` ser `null`; reexecutar e seguro. O apply grava somente
+nas tres tabelas aditivas de projecao. Nao grava anotacoes, revisoes, mascaras,
+midia, registro de objetos, MinIO ou outros indices. Depois, recrie app/worker e
+acompanhe os logs como no bloco anterior.
+
+Rollback e por codigo: volte ao commit/imagem anterior e recrie app e worker,
+sem remover as migrations 005/006 e sem apagar suas tabelas. As linhas de
+projecao sao derivadas e inertes para o codigo antigo. O backup feito antes do
+rollout ja inclui o banco inteiro, portanto nao copie essas linhas separadamente;
+uma restauracao do `pg_dump` as recupera junto com o restante do PostgreSQL.
+
+As copias imutaveis de snapshots usadas para publicar datasets aumentam o uso
+de disco. Esse custo foi aceito para impedir que bytes de uma publicacao sejam
+alterados por outra execucao e para manter rollback/auditoria reproduziveis;
+dimensione `WORKSPACE_DIR` e o backup considerando essas copias.
+
+Existe ainda um risco menor conhecido: se MinIO/get-frame falhar depois do
+replace do manifesto de revisao, o indice SQL normalizado de revisao pode ficar
+atrasado. A projecao continua reparavel pelo comando acima, mas o indice de
+revisao e separado e exigira reconciliacao propria futura.
+
 Nao use `docker compose down -v`: a opcao `-v` remove os volumes nomeados do
 PostgreSQL e do MinIO. Recriar os containers com `up --force-recreate` preserva
 esses volumes e o bind mount de `WORKSPACE_DIR`, incluindo todo o trabalho

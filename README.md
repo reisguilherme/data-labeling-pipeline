@@ -227,6 +227,50 @@ aceite de referencia e p95 aquecido `<= 500 ms` para 416 videos. Esse valor deve
 ser medido no host implantado depois do build desta branch; testes unitarios nao
 demonstram nem substituem essa medicao operacional.
 
+### Rollout e reparo da projecao da biblioteca
+
+As migrations `005_video_pipeline_projection.sql` e
+`006_video_pipeline_projection_barriers.sql` sao aditivas. A 006 cria a barreira
+monotonicamente ordenada que impede uma aplicacao antiga de voltar a tornar
+atual uma projecao invalidada por archive, restore ou rename. O entrypoint roda
+todas as migrations pendentes antes de importar ou executar o reconciliador;
+portanto, use sempre os wrappers abaixo dentro da imagem nova.
+
+O padrao e um inventario estritamente somente-leitura:
+
+```powershell
+./scripts/reconcile-pipeline-projection.ps1 --limit 100
+```
+
+```bash
+./scripts/reconcile-pipeline-projection.sh --limit 100
+```
+
+O JSON informa `current`, `stale`, `missing`, `pending`, `legacy` e `invalid`.
+`legacy` e `invalid` tambem descrevem a saude dos metadados canonicos e podem
+coexistir com uma linha atual. O comando le apenas o registro, nomes de videos,
+JSONs de controle e PostgreSQL; nao abre pixels de mascara nem escreve arquivos.
+
+Escrita exige `--apply` explicito e fica limitada as tabelas aditivas
+`video_pipeline_projection_events`, `video_pipeline_projection` e
+`video_pipeline_projection_barriers`:
+
+```bash
+./scripts/reconcile-pipeline-projection.sh --apply --limit 100
+./scripts/reconcile-pipeline-projection.sh --apply --limit 100 --resume-token TOKEN
+```
+
+Copie literalmente o `resume_token` retornado; `null` encerra a varredura. A
+ordem e deterministica por objeto/video, lotes sao limitados a 1..1000 e repetir
+um lote e idempotente. O reparo nunca altera `annotations.json`, revisoes,
+mascaras, midia, objetos, MinIO ou indices SQL alheios a projecao.
+
+Ha uma janela menor conhecida: depois do replace bem-sucedido do manifesto de
+revisao, uma falha de MinIO/get-frame pode deixar atrasado o indice SQL
+normalizado de revisao. A projecao da biblioteca continua reparavel por este
+comando, mas esse indice separado precisara de reconciliacao propria em trabalho
+futuro.
+
 Antes de qualquer deploy, revogue tokens HF/GCS/worker que ja tenham aparecido
 em `.env`, logs ou historico e gere novos. Apagar o valor local nao revoga a
 credencial no provedor.

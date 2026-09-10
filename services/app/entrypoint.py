@@ -96,6 +96,13 @@ def main() -> int:
         return subprocess.call([sys.executable, "/opt/service/backup.py", *sys.argv[2:]])
     if mode == "restore":
         return subprocess.call([sys.executable, "/opt/service/restore.py", *sys.argv[2:]])
+    if mode == "reconcile-pipeline-projection":
+        ensure_app_import_path()
+        from server.pipeline_projection_rollout import main as reconcile_main
+
+        return reconcile_main(
+            ["--workspace", os.environ.get("MST_WORKSPACE", "/workspace"), *sys.argv[2:]]
+        )
     if mode == "app":
         ensure_buckets()
     if mode == "worker":

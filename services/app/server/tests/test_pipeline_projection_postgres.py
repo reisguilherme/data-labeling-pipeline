@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 import unittest
 import uuid
@@ -16,8 +20,213 @@ from server.pipeline_projection import (
 )
 
 
+class PipelineProjectionRolloutCommandTests(unittest.TestCase):
+    def test_rollout_command_exposes_explicit_apply_and_resume_controls(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", "server.pipeline_projection_rollout", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--apply", completed.stdout)
+        self.assertIn("--limit", completed.stdout)
+        self.assertIn("--resume-token", completed.stdout)
+
+
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
 class PipelineProjectionPostgresTests(unittest.TestCase):
+    def test_rollout_dry_run_command_reads_workspace_without_changing_files_or_database(self):
+        root = Path(tempfile.mkdtemp())
+        raw = root / "boom" / "raw"
+        dataset = root / "boom" / "dataset"
+        raw.mkdir(parents=True)
+        dataset.mkdir(parents=True)
+        (raw / "clip.mp4").write_bytes(b"")
+        (dataset / "annotations.json").write_text(
+            json.dumps({"schema_version": 2, "videos": {}, "counts": {}}),
+            encoding="utf-8",
+        )
+        (root / "objects.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "objects": [
+                        {
+                            "object_id": "boom",
+                            "display_name": "Boom",
+                            "label": "boom",
+                            "videos_root": "boom/raw",
+                            "output_root": "boom/dataset",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        migration = Path(__file__).resolve().parents[4] / "migrations" / "001_initial.sql"
+        with self._connect() as connection:
+            connection.execute(migration.read_text(encoding="utf-8"))
+        before_files = sorted(
+            (path.relative_to(root).as_posix(), path.read_bytes())
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+        before_database = self._projection_dump()
+        env = dict(os.environ)
+        env.update(
+            DATABASE_URL=self.url,
+            PGOPTIONS=f"-c search_path={self.schema}",
+            PYTHONDONTWRITEBYTECODE="1",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "server.pipeline_projection_rollout",
+                "--workspace",
+                str(root),
+                "--limit",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        try:
+            report = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            self.fail(f"comando nao produziu JSON: {completed.stdout!r}")
+        self.assertEqual(report["mode"], "dry-run")
+        self.assertEqual(report["counts"]["missing"], 1)
+        self.assertEqual(self._projection_dump(), before_database)
+        after_files = sorted(
+            (path.relative_to(root).as_posix(), path.read_bytes())
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(after_files, before_files)
+
+    def test_rollout_dry_run_reports_all_states_without_writes_and_has_stable_resume(self):
+        from server import pipeline_projection_rollout as rollout
+
+        candidates = self._rollout_candidates()
+        before = self._projection_dump()
+        runner = getattr(rollout, "run_batch", lambda *args, **kwargs: {})
+        first = runner(candidates, limit=2, connect=self._connect)
+        second = runner(candidates, limit=2, connect=self._connect)
+
+        self.assertEqual(
+            first["counts"],
+            {
+                "current": 3,
+                "stale": 1,
+                "missing": 1,
+                "pending": 1,
+                "legacy": 1,
+                "invalid": 1,
+            },
+        )
+        self.assertEqual(first["resume_token"], second["resume_token"])
+        self.assertEqual(first["batch_size"], 2)
+        self.assertEqual(first["applied"], 0)
+        self.assertEqual(self._projection_dump(), before)
+
+    def test_rollout_apply_is_bounded_resumable_projection_only_and_idempotent(self):
+        from server import pipeline_projection_rollout as rollout
+
+        candidates = self._rollout_candidates()
+        with self._connect() as connection:
+            connection.execute("CREATE TABLE protected_artifacts(value text NOT NULL)")
+            connection.execute("INSERT INTO protected_artifacts VALUES ('untouched')")
+
+        def repair(candidate):
+            intent, current = reserve_repair_intent(
+                object_id=candidate.object_id,
+                video_id=candidate.video_id,
+                source_identity=candidate.source_identity,
+                snapshot=candidate.snapshot,
+                connect=self._connect,
+            )
+            if intent is not None:
+                apply_intent(intent, candidate.snapshot, connect=self._connect)
+            return current
+
+        first = rollout.run_batch(
+            candidates, limit=2, apply=True, repair=repair, connect=self._connect
+        )
+        self.assertEqual(first["applied"], 2)
+        self.assertIsNotNone(first["resume_token"])
+        middle = rollout.run_batch(
+            candidates,
+            limit=2,
+            resume_token=first["resume_token"],
+            apply=True,
+            repair=repair,
+            connect=self._connect,
+        )
+        self.assertEqual(middle["applied"], 1)
+        self.assertIsNone(middle["resume_token"])
+        final = rollout.run_batch(
+            candidates, limit=2, apply=True, repair=repair, connect=self._connect
+        )
+        self.assertEqual(final["applied"], 0)
+        self.assertEqual(final["counts"]["current"], 6)
+        with self._connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT value FROM protected_artifacts").fetchone()[0],
+                "untouched",
+            )
+
+    def _rollout_candidates(self):
+        from server import pipeline_projection_rollout as rollout
+
+        ProjectionCandidate = getattr(rollout, "ProjectionCandidate", None)
+        self.assertTrue(callable(ProjectionCandidate), "ProjectionCandidate ausente")
+
+        rows = [
+            ProjectionCandidate("boom", "01-current", {"state": "valid", "v": 1}, {"complete": True}),
+            ProjectionCandidate("boom", "02-stale", {"state": "valid", "v": 2}, {"complete": False}),
+            ProjectionCandidate("boom", "03-missing", {"state": "valid", "v": 1}, {"complete": False}),
+            ProjectionCandidate("boom", "04-pending", {"state": "valid", "v": 1}, {"complete": False}),
+            ProjectionCandidate("boom", "05-legacy", {"state": "legacy", "v": 1}, {"complete": False}),
+            ProjectionCandidate("boom", "06-invalid", {"state": "invalid", "v": 1}, {"complete": False}),
+        ]
+        for candidate in (rows[0], rows[4], rows[5]):
+            intent = reserve_intent(
+                object_id=candidate.object_id,
+                video_id=candidate.video_id,
+                event_kind="fixture",
+                source_identity=candidate.source_identity,
+                connect=self._connect,
+            )
+            apply_intent(intent, candidate.snapshot, connect=self._connect)
+        stale = reserve_intent(
+            object_id="boom", video_id="02-stale", event_kind="fixture",
+            source_identity={"state": "valid", "v": 1}, connect=self._connect,
+        )
+        apply_intent(stale, {"complete": True}, connect=self._connect)
+        reserve_intent(
+            object_id="boom", video_id="04-pending", event_kind="fixture",
+            source_identity=rows[3].source_identity, connect=self._connect,
+        )
+        return rows
+
+    def _projection_dump(self):
+        with self._connect() as connection:
+            events = connection.execute(
+                "SELECT event_seq, object_id, video_id, status, source_identity, attempts, last_error "
+                "FROM video_pipeline_projection_events ORDER BY event_seq"
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT object_id, video_id, event_seq, source_identity, snapshot "
+                "FROM video_pipeline_projection ORDER BY object_id, video_id"
+            ).fetchall()
+        return events, rows
+
     def test_barrier_upgrade_after_005_is_independent_and_replay_safe(self):
         migrations = Path(__file__).resolve().parents[4] / "migrations"
         with self._connect() as connection:
