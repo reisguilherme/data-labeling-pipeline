@@ -36,14 +36,14 @@
 - The database allocates `event_seq BIGSERIAL`; callers never manufacture ordering from timestamps or per-frame revisions.
 - `apply_intent` updates `(object_id, video_id)` only when `event_seq` is greater than the currently applied sequence.
 
-- [ ] **Step 1: Write failing unit tests for serialization, disabled-database behavior, and sanitized errors.**
-- [ ] **Step 2: Run `python -m unittest server.tests.test_pipeline_projection -v` and verify RED for the absent module.**
-- [ ] **Step 3: Write a real-PostgreSQL test that reserves two events and applies them in reverse order; assert the newer event wins and the older becomes superseded.**
-- [ ] **Step 4: Add tests for idempotent reservation by `(object_id, video_id, event_kind, source_identity)` and retry of a pending event.**
-- [ ] **Step 5: Add migration 005 with `video_pipeline_projection_events` and `video_pipeline_projection`, JSONB source identity/snapshot, status checks, unique idempotency key, and lookup indexes.**
-- [ ] **Step 6: Implement the focused store with one transaction per public operation, finite connection timeout, and no global connection shared between worker processes.**
-- [ ] **Step 7: Run unit and PostgreSQL tests and verify GREEN.**
-- [ ] **Step 8: Commit as `feat: add durable video pipeline projection store`.**
+- [x] **Step 1: Write failing unit tests for serialization, disabled-database behavior, and sanitized errors.**
+- [x] **Step 2: Run `python -m unittest server.tests.test_pipeline_projection -v` and verify RED for the absent module.**
+- [x] **Step 3: Write a real-PostgreSQL test that reserves two events and applies them in reverse order; assert the newer event wins and the older becomes superseded.**
+- [x] **Step 4: Add tests for idempotent reservation by `(object_id, video_id, event_kind, source_identity)` and retry of a pending event.**
+- [x] **Step 5: Add migration 005 with `video_pipeline_projection_events` and `video_pipeline_projection`, JSONB source identity/snapshot, status checks, unique idempotency key, and lookup indexes.**
+- [x] **Step 6: Implement the focused store with one transaction per public operation, finite connection timeout, and no global connection shared between worker processes.**
+- [x] **Step 7: Run unit and PostgreSQL tests and verify GREEN.**
+- [x] **Step 8: Commit as `feat: add durable video pipeline projection store`.**
 
 ### Task 2: Canonical metadata identity and reconciliation
 
