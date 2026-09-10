@@ -51,6 +51,115 @@ class PipelineProjectionRolloutCommandTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
 class PipelineProjectionPostgresTests(unittest.TestCase):
+    def test_foreign_registered_roots_abort_instead_of_becoming_invalid_candidates(self):
+        from server import pipeline_projection_rollout as rollout
+
+        root = self._workspace_root()
+        registry = json.loads((root / "objects.json").read_text(encoding="utf-8"))
+        registry["objects"].append({
+            "object_id": "foreign",
+            "display_name": "Foreign",
+            "label": "foreign",
+            "videos_root": r"C:\\archive\\foreign\\raw",
+            "output_root": r"C:\\archive\\foreign\\dataset",
+        })
+        (root / "objects.json").write_text(json.dumps(registry), encoding="utf-8")
+
+        with patch.dict(os.environ, {"PGOPTIONS": f"-c search_path={self.schema}"}):
+            with self.assertRaisesRegex(RuntimeError, "raiz.*outro sistema"):
+                rollout.collect_candidates(root, database_url=self.url)
+
+    def test_apply_revalidates_restored_corrected_and_existing_objects(self):
+        from server import pipeline_projection_rollout as rollout
+        from server.videos import make_video_id
+
+        root = self._workspace_root(with_video=True)
+        with self._connect() as connection:
+            migration = Path(__file__).resolve().parents[4] / "migrations" / "001_initial.sql"
+            connection.execute(migration.read_text(encoding="utf-8"))
+        registry_path = root / "objects.json"
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry["objects"].append({"object_id": "corrected"})
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        video_id = make_video_id("clip.mp4")
+        for object_id in ("restored", "corrected"):
+            intent = reserve_intent(
+                object_id=object_id,
+                video_id=video_id,
+                event_kind="fixture",
+                source_identity={"state": "old"},
+                connect=self._connect,
+            )
+            apply_intent(intent, {"complete": True}, connect=self._connect)
+
+        with patch.dict(os.environ, {
+            "DATABASE_URL": self.url,
+            "PGOPTIONS": f"-c search_path={self.schema}",
+        }):
+            candidates = rollout.collect_candidates(root, database_url=self.url)
+            stale = {
+                item.object_id: item
+                for item in candidates
+                if item.object_id in {"restored", "corrected"}
+            }
+            existing = next(item for item in candidates if item.object_id == "boom")
+            self.assertEqual(stale["restored"].source_identity["object"]["state"], "missing")
+            self.assertEqual(stale["corrected"].source_identity["object"]["state"], "invalid")
+
+            for object_id in ("restored", "corrected"):
+                raw = root / object_id / "raw"
+                dataset = root / object_id / "dataset"
+                raw.mkdir(parents=True)
+                dataset.mkdir(parents=True)
+                (raw / "clip.mp4").write_bytes(b"")
+                (dataset / "annotations.json").write_text(
+                    json.dumps({"schema_version": 2, "videos": {}, "counts": {}}),
+                    encoding="utf-8",
+                )
+            registry["objects"] = [
+                item for item in registry["objects"]
+                if item.get("object_id") != "corrected"
+            ]
+            for object_id in ("restored", "corrected"):
+                registry["objects"].append({
+                    "object_id": object_id,
+                    "display_name": object_id.title(),
+                    "label": object_id,
+                    "videos_root": f"{object_id}/raw",
+                    "output_root": f"{object_id}/dataset",
+                })
+            next(
+                item for item in registry["objects"] if item["object_id"] == "boom"
+            )["archived"] = True
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+            for candidate in stale.values():
+                try:
+                    rollout.apply_candidate(
+                        candidate,
+                        workspace_root=root,
+                        database_url=self.url,
+                    )
+                except AttributeError as exc:
+                    self.fail(f"apply sem revalidacao de candidato contextless: {exc}")
+            rollout.apply_candidate(
+                existing,
+                workspace_root=root,
+                database_url=self.url,
+            )
+
+        for object_id in ("restored", "corrected"):
+            record = get_many(object_id, [video_id], connect=self._connect)[video_id]
+            self.assertNotIn("object", record.source_identity)
+            self.assertIn("annotation", record.source_identity)
+        existing_record = get_many(
+            "boom", [existing.video_id], connect=self._connect
+        )[existing.video_id]
+        self.assertEqual(
+            existing_record.source_identity.get("object"),
+            {"object_id": "boom", "archived": True},
+        )
+
     def test_cli_refuses_missing_schema_without_writing_migration_markers(self):
         from server import pipeline_projection_rollout as rollout
 

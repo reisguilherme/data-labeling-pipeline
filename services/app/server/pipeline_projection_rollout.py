@@ -173,6 +173,96 @@ def _unregistered_source(
     )
 
 
+def _parse_registered_config(item: Any, workspace_root: Path):
+    from .workspace import ObjectConfig
+
+    raw_id = (
+        str(item.get("object_id") or "").strip()
+        if isinstance(item, dict)
+        else ""
+    )
+    try:
+        return raw_id, ObjectConfig.from_json(item, workspace_root)
+    except (KeyError, TypeError):
+        return raw_id, None
+    except ValueError as exc:
+        raise RuntimeError(
+            f"raiz registrada incompativel para {raw_id or '?'}: {exc}"
+        ) from exc
+
+
+def _registered_config_for(
+    workspace_root: Path,
+    object_id: str,
+):
+    registry = workspace_root / "objects.json"
+    try:
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"registro de objetos invalido: {registry}") from exc
+    raw_objects = payload.get("objects") if isinstance(payload, dict) else None
+    if not isinstance(raw_objects, list):
+        raise RuntimeError(f"registro de objetos invalido: {registry}")
+    matches = [
+        item
+        for item in raw_objects
+        if isinstance(item, dict)
+        and str(item.get("object_id") or "").strip() == object_id
+    ]
+    if not matches:
+        return None, "missing"
+    _, config = _parse_registered_config(matches[-1], workspace_root)
+    return (config, "valid") if config is not None else (None, "invalid")
+
+
+def apply_candidate(
+    candidate: ProjectionCandidate,
+    *,
+    workspace_root: Path,
+    database_url: str,
+):
+    """Apply one candidate after revalidating its canonical registry state."""
+
+    from . import pipeline_projection
+    from .pipeline_reconcile import derive_read_only_pipeline_source
+    from .video_fence import video_fence
+    from .workspace import ObjectContext
+
+    # Match the established repair lock order.  Source revalidation and event
+    # allocation are indivisible with respect to canonical writers.
+    with video_fence(candidate.object_id, candidate.video_id), pipeline_projection.object_fence(
+        candidate.object_id,
+        database_url=database_url,
+    ):
+        config, state = _registered_config_for(workspace_root, candidate.object_id)
+        if config is None:
+            source = _unregistered_source(
+                candidate.object_id,
+                candidate.video_id,
+                state=state,
+            )
+        else:
+            context = ObjectContext(config)
+            context._require_registered_roots()
+            context.index.scan()
+            source = derive_read_only_pipeline_source(context, candidate.video_id)
+
+        intent, current = reserve_repair_intent(
+            object_id=candidate.object_id,
+            video_id=candidate.video_id,
+            source_identity=source.identity,
+            snapshot=source.snapshot_dict,
+            database_url=database_url,
+        )
+        if current is not None or intent is None:
+            return current
+        return apply_intent(
+            intent,
+            source.snapshot_dict,
+            database_url=database_url,
+        )
+
+
 def collect_candidates(
     workspace_root: Path,
     *,
@@ -183,7 +273,7 @@ def collect_candidates(
 
     from .pipeline_reconcile import derive_read_only_pipeline_source
     from .sam3_postgres import PostgresSam3Queue
-    from .workspace import ObjectConfig, ObjectContext
+    from .workspace import ObjectContext
     from . import pipeline_reconcile
 
     registry = workspace_root / "objects.json"
@@ -198,14 +288,8 @@ def collect_candidates(
     configs_by_id = {}
     invalid_object_ids: set[str] = set()
     for item in raw_objects:
-        raw_id = (
-            str(item.get("object_id") or "").strip()
-            if isinstance(item, dict)
-            else ""
-        )
-        try:
-            config = ObjectConfig.from_json(item, workspace_root)
-        except (KeyError, TypeError, ValueError):
+        raw_id, config = _parse_registered_config(item, workspace_root)
+        if config is None:
             if raw_id:
                 invalid_object_ids.add(raw_id)
             continue
@@ -333,27 +417,10 @@ def main(
             object_ids=args.object_ids,
         )
         if args.apply:
-            from .pipeline_reconcile import reconcile_video
-
             def repair(candidate: ProjectionCandidate):
-                if candidate.context is not None:
-                    return reconcile_video(
-                        candidate.context,
-                        candidate.video_id,
-                        read_only=True,
-                    )
-                intent, current = reserve_repair_intent(
-                    object_id=candidate.object_id,
-                    video_id=candidate.video_id,
-                    source_identity=candidate.source_identity,
-                    snapshot=candidate.snapshot,
-                    database_url=database_url,
-                )
-                if current is not None or intent is None:
-                    return current
-                return apply_intent(
-                    intent,
-                    candidate.snapshot,
+                return apply_candidate(
+                    candidate,
+                    workspace_root=args.workspace.resolve(),
                     database_url=database_url,
                 )
         else:
