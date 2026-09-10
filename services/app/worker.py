@@ -670,24 +670,23 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
 
 
 def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
-    from server.dataset import Filters, export
+    from server.dataset import (
+        _safe_dataset_name,
+        export_snapshot_atomic,
+        validate_snapshot,
+    )
     from server.config import settings
     from server.workspace import workspace
 
-    settings.workspace_root = Path("/workspace")
+    settings.workspace_root = Path(os.environ.get("MST_WORKSPACE", "/workspace"))
     workspace.load()
     payload = job["payload"]
     ctx = workspace.context(payload["object_id"])
     ctx.ensure_loaded()
-    name = Path(str(payload["name"])).name
+    name = _safe_dataset_name(str(payload["name"]))
     out_dir = ctx.output_root / "_datasets" / name
-    raw_filters = payload.get("filters") or {}
-    filters = Filters(
-        flags=raw_filters.get("flags") or {},
-        video_ids=raw_filters.get("video_ids") or [],
-        reviewed_only=bool(raw_filters.get("reviewed_only")),
-        include_empty=bool(raw_filters.get("include_empty")),
-    )
+    snapshot = payload.get("snapshot")
+    validate_snapshot(snapshot, object_id=ctx.object_id)
 
     def progress(current: int, total: int) -> None:
         if not queue.update_progress(
@@ -697,20 +696,30 @@ def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
         ):
             raise Cancelled("cancelamento solicitado")
 
-    result = export(
+    def before_publish() -> None:
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {"message": "publicando dataset"},
+        ):
+            raise Cancelled("lease perdido antes da publicacao do dataset")
+
+    result = export_snapshot_atomic(
         ctx,
-        filters,
+        snapshot,
         out_dir=out_dir,
         fmt=payload["format"],
         task=payload["task"],
         val_fraction=float(payload.get("val_fraction", 0.2)),
         test_fraction=float(payload.get("test_fraction", 0)),
         workspace_root=workspace.root,
+        owner=f"{job['id']}:{token}",
         on_progress=progress,
+        before_publish=before_publish,
     )
     store = MinioBlobStore.from_env()
     if store is not None:
-        prefix = f"{ctx.object_id}/{name}"
+        prefix = f"{ctx.object_id}/{name}/generations/{snapshot['snapshot_id']}"
         stored = 0
         for path in out_dir.rglob("*"):
             if not path.is_file():

@@ -48,9 +48,12 @@ async def preview(
     if request.task not in TASKS:
         raise HTTPException(422, f"tarefa deve ser uma de {TASKS}")
     filters = request.to_filters()
-    return await asyncio.to_thread(
-        dataset_module.preview, ctx, filters, workspace.root, task=request.task
-    )
+    try:
+        return await asyncio.to_thread(
+            dataset_module.preview, ctx, filters, workspace.root, task=request.task
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 class ExportIn(BaseModel):
@@ -80,13 +83,51 @@ async def export(
 
     stamp = iso().replace(":", "-").split(".")[0]
     name = payload.name or f"{ctx.object_id}-{payload.task}-{payload.format}-{stamp}"
+    if (
+        Path(name).name != name
+        or name in {"", ".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HTTPException(422, "nome de dataset invalido")
     # Dentro do output_root: os frames vivem lá, e o hardlink só é grátis dentro
     # do mesmo filesystem.
     out_dir = ctx.output_root / "_datasets" / name
-    if out_dir.exists():
-        raise HTTPException(409, f"já existe um dataset chamado '{name}'")
-
     filters = payload.filters.to_filters()
+    try:
+        snapshot = await asyncio.to_thread(
+            dataset_module.build_snapshot,
+            ctx,
+            filters,
+            workspace.root,
+            task=payload.task,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    snapshot = dataset_module.bind_export_spec(
+        snapshot,
+        fmt=payload.format,
+        val_fraction=payload.val_fraction,
+        test_fraction=payload.test_fraction,
+    )
+    if not snapshot["segments"]:
+        raise HTTPException(422, "nenhum segmento casa com o filtro")
+    if not snapshot.get("export_allowed", True):
+        reasons = snapshot.get("blocking_reasons") or []
+        raise HTTPException(
+            422,
+            f"exportacao bloqueada: {reasons[0] if reasons else 'snapshot incompleto'}",
+        )
+    try:
+        await asyncio.to_thread(
+            dataset_module.reserve_dataset_target,
+            ctx.output_root / "_datasets",
+            name,
+            snapshot["snapshot_id"],
+        )
+    except dataset_module.DatasetTargetConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
     if durable_jobs.enabled():
         job_id = await asyncio.to_thread(
             durable_jobs.create,
@@ -104,11 +145,13 @@ async def export(
                     "reviewed_only": filters.reviewed_only,
                     "include_empty": filters.include_empty,
                 },
+                "snapshot": snapshot,
                 "client_id": client_id,
                 "user": user.user_id,
                 "message": f"exportando {payload.task} {payload.format}",
             },
             priority=70,
+            idempotency_key=f"dataset-export:{ctx.object_id}:{name}",
         )
         return {"job_id": job_id, "name": name, "out_dir": out_dir.as_posix()}
 
@@ -127,15 +170,16 @@ async def export(
 
         try:
             result = await asyncio.to_thread(
-                dataset_module.export,
+                dataset_module.export_snapshot_atomic,
                 ctx,
-                filters,
+                snapshot,
                 out_dir=out_dir,
                 fmt=payload.format,
                 task=payload.task,
                 val_fraction=payload.val_fraction,
                 test_fraction=payload.test_fraction,
                 workspace_root=workspace.root,
+                owner=job.job_id,
                 on_progress=on_progress,
             )
         except ValueError as exc:
@@ -205,6 +249,7 @@ async def delete_dataset(
     if not target.is_relative_to(root) or not target.is_dir():
         raise HTTPException(404, "dataset não encontrado")
     shutil.rmtree(target, ignore_errors=True)
+    dataset_module.release_dataset_target(root, name)
     return {"deleted": name}
 
 
