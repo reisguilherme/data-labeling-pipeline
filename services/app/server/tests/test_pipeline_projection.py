@@ -81,6 +81,72 @@ class PipelineProjectionUnitTests(unittest.TestCase):
         self.assertIn("[REDACTED]", sanitized)
         self.assertLessEqual(len(sanitized), 1000)
 
+    def test_quoted_secrets_with_spaces_are_fully_redacted(self) -> None:
+        sanitized = sanitize_error(
+            "connection failed password='secret with spaces' "
+            'token="another secret value" host=postgres'
+        )
+
+        self.assertNotIn("secret with spaces", sanitized)
+        self.assertNotIn("another secret value", sanitized)
+        self.assertNotIn("with spaces", sanitized)
+        self.assertNotIn("secret value", sanitized)
+        self.assertEqual(sanitized.count("[REDACTED]"), 2)
+
+    def test_every_transaction_sets_finite_database_timeouts(self) -> None:
+        class Cursor:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, query, _params=None):
+                self.queries.append(" ".join(str(query).split()))
+                return self
+
+            def fetchone(self):
+                return (
+                    1,
+                    "boom",
+                    "video-1",
+                    "annotation_saved",
+                    {"revision": 1},
+                    "pending",
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+
+        class Connection:
+            def __init__(self) -> None:
+                self.test_cursor = Cursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self):
+                return self.test_cursor
+
+        connection = Connection()
+        reserve_intent(
+            object_id="boom",
+            video_id="video-1",
+            event_kind="annotation_saved",
+            source_identity={"revision": 1},
+            connect=lambda: connection,
+        )
+
+        self.assertIn("SET LOCAL lock_timeout", connection.test_cursor.queries[0])
+        self.assertIn("SET LOCAL statement_timeout", connection.test_cursor.queries[1])
+
     def test_reservation_rejects_empty_identifiers_before_database_access(self) -> None:
         with self.assertRaisesRegex(ValueError, "object_id"):
             reserve_intent(

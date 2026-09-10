@@ -1,6 +1,6 @@
 BEGIN;
 
-CREATE TABLE video_pipeline_projection_events (
+CREATE TABLE IF NOT EXISTS video_pipeline_projection_events (
     event_seq bigserial PRIMARY KEY,
     object_id text NOT NULL CHECK (object_id <> ''),
     video_id text NOT NULL CHECK (video_id <> ''),
@@ -13,18 +13,30 @@ CREATE TABLE video_pipeline_projection_events (
     last_error text,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    applied_at timestamptz,
-    UNIQUE (object_id, video_id, event_kind, source_digest)
+    applied_at timestamptz
 );
 
-CREATE INDEX video_pipeline_projection_events_pending_idx
+-- The first draft of this migration used an unconditional UNIQUE constraint.
+-- Drop it when replaying after a crash between DDL commit and migration-marker
+-- publication.  Superseded identities must be reservable again (A -> B -> A).
+ALTER TABLE video_pipeline_projection_events
+    DROP CONSTRAINT IF EXISTS
+    video_pipeline_projection_eve_object_id_video_id_event_kind_key;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+    video_pipeline_projection_events_active_identity_idx
+    ON video_pipeline_projection_events
+        (object_id, video_id, event_kind, source_digest)
+    WHERE status <> 'superseded';
+
+CREATE INDEX IF NOT EXISTS video_pipeline_projection_events_pending_idx
     ON video_pipeline_projection_events (event_seq)
     WHERE status = 'pending';
 
-CREATE INDEX video_pipeline_projection_events_video_idx
+CREATE INDEX IF NOT EXISTS video_pipeline_projection_events_video_idx
     ON video_pipeline_projection_events (object_id, video_id, event_seq DESC);
 
-CREATE TABLE video_pipeline_projection (
+CREATE TABLE IF NOT EXISTS video_pipeline_projection (
     object_id text NOT NULL CHECK (object_id <> ''),
     video_id text NOT NULL CHECK (video_id <> ''),
     event_seq bigint NOT NULL
@@ -36,7 +48,7 @@ CREATE TABLE video_pipeline_projection (
     PRIMARY KEY (object_id, video_id)
 );
 
-CREATE INDEX video_pipeline_projection_event_idx
+CREATE INDEX IF NOT EXISTS video_pipeline_projection_event_idx
     ON video_pipeline_projection (event_seq);
 
 COMMIT;

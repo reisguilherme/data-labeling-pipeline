@@ -22,13 +22,22 @@ from typing import Any, Literal, Protocol, TypeAlias
 ProjectionStatus: TypeAlias = Literal["pending", "applied", "superseded"]
 
 _CONNECT_TIMEOUT_SECONDS = 5
+_LOCK_TIMEOUT_MILLISECONDS = 5_000
+_STATEMENT_TIMEOUT_MILLISECONDS = 15_000
 _MAX_ERROR_LENGTH = 1000
 _URI_CREDENTIALS = re.compile(
     r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)([^\s/@]+)(@)"
 )
 _BEARER_TOKEN = re.compile(r"(?i)(\bBearer\s+)([^\s,;]+)")
 _ASSIGNED_SECRET = re.compile(
-    r"(?i)(\b(?:password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)([^\s,;&]+)"
+    r'''(?ix)
+    (\b(?:password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)
+    (?:
+        "(?:\\.|[^"\\])*"
+        | '(?:\\.|[^'\\])*'
+        | [^\s,;&]+
+    )
+    '''
 )
 _JSON_SECRET = re.compile(
     r'(?i)(["\'](?:password|passwd|token|secret|api[_-]?key)["\']\s*:\s*["\'])(.*?)(["\'])'
@@ -144,6 +153,21 @@ def _open_connection(
     return psycopg.connect(url, connect_timeout=_CONNECT_TIMEOUT_SECONDS)
 
 
+def _configure_transaction(cursor: Any) -> None:
+    """Bound database waits so projection maintenance cannot hang a request."""
+
+    cursor.execute(
+        f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT_MILLISECONDS}ms'"
+    )
+    cursor.execute(
+        f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT_MILLISECONDS}ms'"
+    )
+
+
+def _video_lock_key(object_id: str, video_id: str) -> str:
+    return f"{object_id}\x1f{video_id}"
+
+
 def _intent_from_row(row: tuple[Any, ...]) -> ProjectionIntent:
     return ProjectionIntent(
         event_seq=int(row[0]),
@@ -200,12 +224,14 @@ def reserve_intent(
         return None
     with connection:
         with connection.cursor() as cursor:
+            _configure_transaction(cursor)
             cursor.execute(
                 f"""
                 INSERT INTO video_pipeline_projection_events
                     (object_id, video_id, event_kind, source_identity, source_digest)
                 VALUES (%s, %s, %s, %s::jsonb, %s)
                 ON CONFLICT (object_id, video_id, event_kind, source_digest)
+                WHERE status <> 'superseded'
                 DO UPDATE SET updated_at = video_pipeline_projection_events.updated_at
                 RETURNING {_INTENT_COLUMNS}
                 """,
@@ -238,6 +264,23 @@ def apply_intent(
         return None
     with connection:
         with connection.cursor() as cursor:
+            _configure_transaction(cursor)
+            cursor.execute(
+                """
+                SELECT object_id, video_id
+                  FROM video_pipeline_projection_events
+                 WHERE event_seq = %s
+                """,
+                (event_seq,),
+            )
+            identity = cursor.fetchone()
+            if identity is None:
+                raise LookupError(f"projection intent {event_seq} nao existe")
+            object_id, video_id = identity
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (_video_lock_key(str(object_id), str(video_id)),),
+            )
             cursor.execute(
                 """
                 SELECT object_id, video_id, source_identity, source_digest
@@ -333,6 +376,7 @@ def fail_intent(
         return None
     with connection:
         with connection.cursor() as cursor:
+            _configure_transaction(cursor)
             cursor.execute(
                 f"""
                 UPDATE video_pipeline_projection_events
@@ -378,6 +422,7 @@ def get_many(
         return {}
     with connection:
         with connection.cursor() as cursor:
+            _configure_transaction(cursor)
             cursor.execute(
                 f"""
                 SELECT {_RECORD_COLUMNS}
@@ -409,12 +454,13 @@ def pending_intents(
         return []
     with connection:
         with connection.cursor() as cursor:
+            _configure_transaction(cursor)
             cursor.execute(
                 f"""
                 SELECT {_INTENT_COLUMNS}
                   FROM video_pipeline_projection_events
-                 WHERE status = 'pending' AND event_seq > %s
-                 ORDER BY event_seq
+                 WHERE status = 'pending'
+                 ORDER BY (event_seq <= %s), event_seq
                  LIMIT %s
                 """,
                 (after_event_seq, limit),
