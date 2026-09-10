@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 
 from PIL import Image
 
 from pipeline_core.masks import encode_binary_png
 from pipeline_core.masks import MaskValidationError, inspect_binary_png
-from pipeline_core.storage import MinioBlobStore, object_key_for
+from pipeline_core.sam3_runs import mask_object_key
+from pipeline_core.storage import MinioBlobStore
 
 
 class MaskSetValidationError(RuntimeError):
     """A run cannot be completed because its canonical mask set is incomplete."""
+
+
+_STORE_FROM_ENV = object()
 
 
 def _as_image(mask, threshold: float) -> Image.Image:
@@ -33,6 +38,7 @@ def save_mask_png(
     frame_idx: int,
     mask,
     threshold: float = 0.0,
+    blob_store=_STORE_FROM_ENV,
 ) -> Path:
     """Grava uma máscara 1-bit de forma atômica e devolve o caminho final."""
     target = out_dir / "masks" / str(obj_id) / f"{frame_idx:06d}.png"
@@ -44,10 +50,14 @@ def save_mask_png(
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, target)
-    store = MinioBlobStore.from_env()
-    workspace = os.environ.get("MST_WORKSPACE")
-    if store is not None and workspace:
-        store.put_file("masks", object_key_for(Path(workspace), target), target)
+    store = (
+        MinioBlobStore.from_env()
+        if blob_store is _STORE_FROM_ENV
+        else blob_store
+    )
+    if store is not None:
+        checksum = hashlib.sha256(payload).hexdigest()
+        store.put_file_if_absent("masks", mask_object_key(checksum), target)
     return target
 
 

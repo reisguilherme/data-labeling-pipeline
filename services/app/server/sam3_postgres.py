@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+
+
+def _model_identity(
+    model_id: str | None,
+    model_sha256: str | None,
+    sam3_commit: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    return model_id, model_sha256, sam3_commit
+
+
+def _model_key(identity: tuple[str | None, str | None, str | None]) -> str:
+    canonical = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()[:24]
 
 
 class _OwnedPostgresLease:
@@ -20,7 +35,12 @@ class _OwnedPostgresLease:
         self.item = queue._item(row)
 
     def finish(
-        self, *, state: str, result: dict | None, error: str | None
+        self,
+        *,
+        state: str,
+        result: dict | None,
+        error: str | None,
+        export_root: str | Path | None = None,
     ):
         found = self._queue._finish_cursor(
             self._connection,
@@ -30,6 +50,7 @@ class _OwnedPostgresLease:
             result=result,
             error=error,
             fenced=True,
+            export_root=export_root,
         )
         if found is not None:
             self.object_id, self.item = found
@@ -44,7 +65,12 @@ class _AsyncOwnedPostgresLease:
         self.item = lease.item
 
     async def finish(
-        self, *, state: str, result: dict | None, error: str | None
+        self,
+        *,
+        state: str,
+        result: dict | None,
+        error: str | None,
+        export_root: str | Path | None = None,
     ):
         loop = asyncio.get_running_loop()
         found = await loop.run_in_executor(
@@ -54,6 +80,7 @@ class _AsyncOwnedPostgresLease:
                 state=state,
                 result=result,
                 error=error,
+                export_root=export_root,
             ),
         )
         self.object_id = self._lease.object_id
@@ -84,6 +111,13 @@ class PostgresSam3Queue:
             export_root=payload.get("export_root", ""),
             segments=list(payload.get("segments") or []),
             annotation_revision=int(payload.get("annotation_revision") or 0),
+            run_id=str(
+                payload.get("run_id")
+                or uuid.uuid5(uuid.NAMESPACE_URL, f"sam3-postgres:{row[0]}").hex
+            ),
+            model_id=payload.get("model_id"),
+            model_sha256=payload.get("model_sha256"),
+            sam3_commit=payload.get("sam3_commit"),
             state=row[2],
             attempts=int(row[3]),
             force=bool(payload.get("force")),
@@ -101,9 +135,10 @@ class PostgresSam3Queue:
         )
 
     @staticmethod
-    def _select() -> str:
-        return """
-            SELECT id, payload, state::text, attempts, created_at, lease_token,
+    def _select(*, latest_by_video: bool = False) -> str:
+        distinct = "DISTINCT ON (payload->>'relpath') " if latest_by_video else ""
+        return f"""
+            SELECT {distinct}id, payload, state::text, attempts, created_at, lease_token,
                    lease_expires_at, cancel_requested, progress, worker_id,
                    started_at, finished_at, result, error
               FROM jobs
@@ -124,10 +159,18 @@ class PostgresSam3Queue:
         user: str | None,
         annotation_revision: int = 0,
         force: bool = False,
+        model_id: str | None = None,
+        model_sha256: str | None = None,
+        sam3_commit: str | None = None,
     ):
         if type(annotation_revision) is not int or annotation_revision < 0:
             raise ValueError("annotation_revision invalida")
-        key = f"sam3:{object_id}:{video_id}:r{annotation_revision}"
+        requested_model = _model_identity(model_id, model_sha256, sam3_commit)
+        run_id = uuid.uuid4().hex
+        key = (
+            f"sam3:{object_id}:{video_id}:r{annotation_revision}:"
+            f"m{_model_key(requested_model)}:g{run_id}"
+        )
         payload = {
             "object_id": object_id,
             "video_id": video_id,
@@ -136,6 +179,10 @@ class PostgresSam3Queue:
             "export_root": export_root,
             "segments": segments,
             "annotation_revision": annotation_revision,
+            "run_id": run_id,
+            "model_id": model_id,
+            "model_sha256": model_sha256,
+            "sam3_commit": sam3_commit,
             "user": user,
             "force": force,
         }
@@ -172,18 +219,11 @@ class PostgresSam3Queue:
             if (
                 latest is not None
                 and latest.annotation_revision == annotation_revision
+                and latest.model_identity == requested_model
                 and (latest.active or (latest.state == "done" and not force))
             ):
                 return latest
 
-            cursor.execute(self._select() + " WHERE idempotency_key = %s", (key,))
-            existing = cursor.fetchone()
-            if existing is None and annotation_revision == 0 and latest_row is not None:
-                # Jobs created before revision fencing omitted the revision;
-                # _item maps those to zero, so they remain safely reusable.
-                existing = latest_row
-            if existing and (existing[2] in ("queued", "leased", "running") or (existing[2] == "done" and not force)):
-                return self._item(existing)
             # A newer annotation must never silently share an active job with
             # an older export. Queued work can be cancelled immediately;
             # leased work receives the normal cooperative cancellation flag.
@@ -201,7 +241,7 @@ class PostgresSam3Queue:
                          WHEN COALESCE(payload->>'annotation_revision', '') ~ '^[0-9]+$'
                          THEN (payload->>'annotation_revision')::bigint
                          ELSE 0
-                       END < %s
+                       END <= %s
                    AND state IN ('queued','leased','running')
                 """,
                 (object_id, relpath, annotation_revision),
@@ -212,13 +252,6 @@ class PostgresSam3Queue:
                                  idempotency_key, progress, attempts, max_attempts)
                 VALUES ('sam3_propagation', 'gpu', 'queued', 50, %s::jsonb,
                         %s, %s::jsonb, 0, 3)
-                ON CONFLICT (idempotency_key) DO UPDATE
-                    SET state = 'queued', payload = EXCLUDED.payload,
-                        progress = EXCLUDED.progress, attempts = 0,
-                        result = NULL, error = NULL, worker_id = NULL,
-                        lease_token = NULL, lease_expires_at = NULL,
-                        cancel_requested = FALSE, started_at = NULL,
-                        finished_at = NULL, updated_at = now()
                 RETURNING id, payload, state::text, attempts, created_at,
                           lease_token, lease_expires_at, cancel_requested,
                           progress, worker_id, started_at, finished_at, result, error
@@ -259,8 +292,10 @@ class PostgresSam3Queue:
     def list(self, object_id: str):
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
-                self._select()
-                + " WHERE kind = 'sam3_propagation' AND payload->>'object_id' = %s ORDER BY priority, created_at",
+                self._select(latest_by_video=True)
+                + """ WHERE kind = 'sam3_propagation'
+                           AND payload->>'object_id' = %s
+                       ORDER BY payload->>'relpath', created_at DESC""",
                 (object_id,),
             )
             return [self._item(row) for row in cursor.fetchall()]
@@ -493,6 +528,7 @@ class PostgresSam3Queue:
         result: dict | None,
         error: str | None,
         fenced: bool,
+        export_root: str | Path | None = None,
     ):
         terminal = state if state in ("done", "error", "cancelled") else "error"
         live_guard = "" if fenced else """
@@ -557,6 +593,7 @@ class PostgresSam3Queue:
                 object_id=str(job_payload.get("object_id") or ""),
                 relpath=str(job_payload.get("relpath") or ""),
                 result=result,
+                export_root=export_root or job_payload.get("export_root"),
             )
         if not row:
             return None

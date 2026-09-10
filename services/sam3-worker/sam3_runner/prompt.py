@@ -13,6 +13,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from pipeline_core.sam3_runs import (
+    Sam3GenerationError,
+    effective_prompt_override_path,
+)
+
 SCHEMA_VERSION = 1
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
@@ -139,8 +144,13 @@ def load_prompt(segment_dir: Path) -> Prompt:
     # A caixa inicial pode ter sido ajustada na tela de controle do SAM3. O
     # override troca SÓ as caixas — nunca o frame do prompt, a contagem de
     # frames ou as dimensões, que descrevem o segmento em disco.
-    override = segment_dir / "_sam3" / "prompt_override.json"
-    if override.exists():
+    try:
+        override = effective_prompt_override_path(
+            segment_dir, migrate_legacy=True
+        )
+    except Sam3GenerationError as exc:
+        raise PromptError(str(exc)) from exc
+    if override is not None:
         try:
             raw_override = override.read_bytes()
             ajustadas = _parse_objects(json.loads(raw_override.decode("utf-8")), override)

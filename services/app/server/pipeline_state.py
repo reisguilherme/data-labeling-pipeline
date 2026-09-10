@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pipeline_core.masks import MaskValidationError, inspect_binary_png
+from pipeline_core.sam3_runs import (
+    Sam3GenerationError,
+    active_segment_output,
+    effective_prompt_override_path,
+    load_current_manifest,
+    resolve_export_root,
+    resolve_segment_dir,
+)
 
 
 @dataclass(frozen=True)
@@ -96,13 +104,7 @@ def _export_root(entry: dict, output_root: Path) -> Path | None:
     raw = export.get("root")
     if not raw:
         return None
-    candidate = Path(str(raw))
-    if candidate.exists():
-        return candidate
-    # Metadados importados podem carregar o caminho absoluto do host antigo.
-    # O nome final do diretorio de video permanece estavel no rehome.
-    fallback = output_root / candidate.name
-    return fallback if fallback.exists() else candidate
+    return resolve_export_root(output_root, str(raw))
 
 
 _SCHEMA_VERSION = 1
@@ -170,9 +172,51 @@ def _inspect_pipeline_entry(
 
     export = entry.get("export") or {}
     segments = export.get("segments") or []
-    root = _export_root(entry, output_root)
+    try:
+        root = _export_root(entry, output_root)
+    except Sam3GenerationError as exc:
+        return classify_pipeline(
+            annotation_status,
+            sam3_state,
+            0,
+            0,
+            False,
+            inconsistencies=(str(exc),),
+            validation_status="invalid",
+        )
     if root is None or not segments:
         return classify_pipeline(annotation_status, sam3_state, 0, 0, False)
+    try:
+        generation = load_current_manifest(root)
+    except Sam3GenerationError as exc:
+        return classify_pipeline(
+            annotation_status,
+            sam3_state,
+            0,
+            0,
+            False,
+            inconsistencies=(str(exc),),
+            validation_status="invalid",
+        )
+    if generation is not None:
+        current_revision = entry.get("annotation_revision", 0)
+        generation_revision = generation.get("annotation_revision")
+        if (
+            type(current_revision) is not int
+            or type(generation_revision) is not int
+            or generation_revision != current_revision
+        ):
+            return classify_pipeline(
+                annotation_status,
+                sam3_state,
+                0,
+                0,
+                False,
+                inconsistencies=(
+                    "annotation_revision da geracao SAM3 diverge da anotacao atual",
+                ),
+                validation_status="invalid",
+            )
 
     expected_frames = 0
     reviewed_frames = 0
@@ -184,8 +228,16 @@ def _inspect_pipeline_entry(
     expected_masks: list[_ExpectedMask] = []
 
     for segment_name in segments:
-        segment = root / str(segment_name)
-        out = segment / "_sam3"
+        try:
+            segment = resolve_segment_dir(root, segment_name)
+        except Sam3GenerationError as exc:
+            inconsistencies.append(f"{segment_name}: {exc}")
+            continue
+        try:
+            out = active_segment_output(segment)
+        except Sam3GenerationError as exc:
+            inconsistencies.append(f"{segment_name}: {exc}")
+            continue
         run_path = out / "run.json"
         prompt_path = segment / "prompt.json"
         run = _read_json(run_path)
@@ -254,15 +306,25 @@ def _inspect_pipeline_entry(
             audit_required = True
 
         expected_frames += frame_count
-        review = _read_json(out / "mask_review.json") or {}
-        frames = review.get("frames") or {}
-        if isinstance(frames, dict):
-            for frame in range(frame_count):
-                reviewed = frames.get(str(frame)) or {}
-                if reviewed.get("status") in {"ok", "edited"}:
-                    reviewed_frames += 1
-                    if reviewed.get("status") == "edited":
-                        edited_frames += 1
+        review_path = out / "mask_review.json"
+        review = _read_json(review_path) if review_path.exists() else {
+            "schema_version": _SCHEMA_VERSION,
+            "frames": {},
+        }
+        if (
+            review is None
+            or review.get("schema_version") != _SCHEMA_VERSION
+            or not isinstance(review.get("frames"), dict)
+        ):
+            inconsistencies.append(f"{segment_name}: mask_review.json invalido")
+            continue
+        frames = review["frames"]
+        for frame in range(frame_count):
+            reviewed = frames.get(str(frame)) or {}
+            if reviewed.get("status") in {"ok", "edited"}:
+                reviewed_frames += 1
+                if reviewed.get("status") == "edited":
+                    edited_frames += 1
 
         frames_written = _schema_int(run.get("frames_written"))
         if "frames_written" not in run:
@@ -283,8 +345,12 @@ def _inspect_pipeline_entry(
 
         effective_objects = prompt.get("objects")
         override_supplies_objects = False
-        override_path = out / "prompt_override.json"
-        if override_path.exists():
+        try:
+            override_path = effective_prompt_override_path(segment)
+        except Sam3GenerationError as exc:
+            inconsistencies.append(f"{segment_name}: {exc}")
+            continue
+        if override_path is not None:
             override = _read_json(override_path)
             if override is None:
                 inconsistencies.append(f"{segment_name}: prompt_override.json invalido")

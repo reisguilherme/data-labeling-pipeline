@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -12,30 +11,49 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
 
-from .. import durable_jobs, review as review_module
+from .. import review as review_module
 from ..deps import current_client, current_user, get_object
 from ..locks import locks
 from ..mask_api import decode_mask_edits, serialize_frame_state
 from ..review import SegmentPaths
 from ..sam3_run_index import index_revision, index_revisions
 from ..users import User
+from ..video_fence import async_video_fence, video_fence
 from ..workspace import ObjectContext, workspace
 from pipeline_core.masks import MaskValidationError
 from pipeline_core.review_store import FileMaskReviewStore, RevisionConflict
+from pipeline_core.sam3_runs import (
+    Sam3GenerationError,
+    load_current_manifest,
+    resolve_export_root,
+    resolve_segment_dir,
+)
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["review"])
-_local_review_locks_guard = threading.Lock()
-_local_review_locks: dict[tuple[str, str], threading.Lock] = {}
 
 
 def _export_version(root: Path) -> str:
-    """Token de cache que muda a cada publicação, inclusive no mesmo revision."""
+    """Fence both the exported frames and the active immutable SAM3 run."""
     marker = root / ".export-owner.json"
     target = marker if marker.is_file() and not marker.is_symlink() else root
     try:
         stat = target.stat()
     except OSError as exc:
         raise HTTPException(409, "export indisponivel durante publicacao") from exc
+    try:
+        generation = load_current_manifest(root)
+    except Sam3GenerationError as exc:
+        raise HTTPException(409, f"geracao SAM3 indisponivel: {exc}") from exc
+    generation_identity = (
+        "legacy"
+        if generation is None
+        else ":".join(
+            (
+                str(generation.get("generation_id") or ""),
+                str(generation.get("manifest_sha256") or ""),
+            )
+        )
+    )
     identity = ":".join(
         str(value)
         for value in (
@@ -43,6 +61,7 @@ def _export_version(root: Path) -> str:
             getattr(stat, "st_ino", 0),
             stat.st_mtime_ns,
             stat.st_size,
+            generation_identity,
         )
     )
     return hashlib.blake2s(identity.encode("ascii"), digest_size=12).hexdigest()
@@ -64,21 +83,7 @@ def _locked_export(
     expected_version: str,
 ) -> Iterator[tuple[Path, list[str], object]]:
     """Compartilha o fence do publisher e resolve o export só após adquiri-lo."""
-    if durable_jobs.enabled():
-        manager = durable_jobs.video_advisory_lock(ctx.object_id, video_id)
-    else:
-        key = (ctx.object_id, video_id)
-        with _local_review_locks_guard:
-            local = _local_review_locks.setdefault(key, threading.Lock())
-
-        @contextmanager
-        def local_manager():
-            with local:
-                yield
-
-        manager = local_manager()
-
-    with manager:
+    with video_fence(ctx.object_id, video_id):
         root, segments, video = _export_root(ctx, video_id)
         _require_lock(ctx, video_id, client_id)
         _require_export_version(root, expected_version)
@@ -94,18 +99,26 @@ def _export_root(ctx: ObjectContext, video_id: str) -> tuple[Path, list[str], ob
     if not export or not export.get("segments"):
         raise HTTPException(409, "este vídeo ainda não foi exportado")
 
-    root = Path(export["root"])
-    if not root.is_dir():
-        # O caminho pode ter sido gravado antes de o workspace mudar de lugar.
-        # Recalcular a partir do registro é mais confiável que confiar nele.
-        candidate = ctx.output_root / root.name
-        if candidate.is_dir():
-            root = candidate
-        else:
+    try:
+        root = resolve_export_root(ctx.output_root, export["root"])
+    except Sam3GenerationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    try:
+        generation = load_current_manifest(root)
+    except Sam3GenerationError as exc:
+        raise HTTPException(409, f"geracao SAM3 indisponivel: {exc}") from exc
+    if generation is not None:
+        generation_revision = generation.get("annotation_revision")
+        current_revision = entry.get("annotation_revision", 0)
+        if (
+            type(generation_revision) is not int
+            or type(current_revision) is not int
+            or generation_revision != current_revision
+        ):
             raise HTTPException(
                 409,
-                f"a pasta do export não existe ({root}). Rode "
-                "tools/rehome_workspace.py se o workspace mudou de lugar.",
+                "geracao SAM3 pertence a outra revisao da anotacao; "
+                "aguarde ou reprocesse",
             )
     return root, list(export["segments"]), video
 
@@ -115,7 +128,10 @@ def _segment_paths(root: Path, segments: list[str], segment: str) -> SegmentPath
     # dispensa qualquer sanitização de caminho.
     if segment not in segments:
         raise HTTPException(404, f"segmento '{segment}' não pertence a este vídeo")
-    return SegmentPaths(root / segment)
+    try:
+        return SegmentPaths(resolve_segment_dir(root, segment))
+    except Sam3GenerationError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _frame_count(paths: SegmentPaths) -> int:
@@ -163,14 +179,15 @@ async def segment_frame(
     SAM3 realmente consumiu e o que vai para o dataset. Revisar contra outra
     imagem que não a anotada seria revisar a coisa errada.
     """
-    root, segments, _ = _export_root(ctx, video_id)
-    paths = _segment_paths(root, segments, segment)
-    path = paths.frame_path(frame)
-    if not path.exists():
-        raise HTTPException(404, "frame não existe neste segmento")
-    current_version = _export_version(root)
-    if version is not None and version != current_version:
-        raise HTTPException(409, "o trecho foi republicado; recarregue a revisao")
+    async with async_video_fence(ctx.object_id, video_id):
+        root, segments, _ = _export_root(ctx, video_id)
+        paths = _segment_paths(root, segments, segment)
+        path = paths.frame_path(frame)
+        if not path.exists():
+            raise HTTPException(404, "frame não existe neste segmento")
+        current_version = _export_version(root)
+        if version is not None and version != current_version:
+            raise HTTPException(409, "o trecho foi republicado; recarregue a revisao")
     return FileResponse(
         path,
         media_type="image/jpeg",
@@ -192,9 +209,10 @@ async def segment_frame(
 @router.get("/videos/{video_id}/review")
 async def video_review(video_id: str, ctx: ObjectContext = Depends(get_object)) -> dict:
     """Progresso do vídeo inteiro, sem carregar as caixas."""
-    root, segments, video = _export_root(ctx, video_id)
-    names = review_module.class_names(workspace.root) if workspace.root else []
-    progress = review_module.progress_for(root, segments, names)
+    async with async_video_fence(ctx.object_id, video_id):
+        root, segments, video = _export_root(ctx, video_id)
+        names = review_module.class_names(workspace.root) if workspace.root else []
+        progress = review_module.progress_for(root, segments, names)
     return {
         "video_id": video_id,
         "name": video.name,
@@ -214,12 +232,13 @@ async def segment_review(
     Payload único em vez de uma chamada por frame: são poucos KB mesmo no
     segmento de 799 frames, e a navegação frame a frame precisa ser instantânea.
     """
-    root, segments, video = _export_root(ctx, video_id)
-    paths = _segment_paths(root, segments, segment)
-    names = review_module.class_names(workspace.root) if workspace.root else []
-    state = review_module.segment_state(paths, _frame_count(paths), names)
-
-    prompt = review_module.prompt_contract(paths)
+    async with async_video_fence(ctx.object_id, video_id):
+        root, segments, video = _export_root(ctx, video_id)
+        paths = _segment_paths(root, segments, segment)
+        names = review_module.class_names(workspace.root) if workspace.root else []
+        state = review_module.segment_state(paths, _frame_count(paths), names)
+        prompt = review_module.prompt_contract(paths)
+        export_version = _export_version(root)
 
     return {
         "video_id": video_id,
@@ -228,7 +247,7 @@ async def segment_review(
         "segments": segments,
         "classes": names,
         "label": ctx.label,
-        "export_version": _export_version(root),
+        "export_version": export_version,
         "prompt": prompt,
         **state,
     }
@@ -275,15 +294,16 @@ async def mask_review_state(
     export_version: str | None = None,
     ctx: ObjectContext = Depends(get_object),
 ) -> dict:
-    root, segments, _ = _export_root(ctx, video_id)
-    if export_version is not None:
-        _require_export_version(root, export_version)
-    paths = _segment_paths(root, segments, segment)
-    if not (0 <= frame < _frame_count(paths)):
-        raise HTTPException(404, "frame não existe neste segmento")
-    if not (paths.out_dir / "masks").is_dir():
-        raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
-    state = _mask_store(paths).get_frame(frame)
+    async with async_video_fence(ctx.object_id, video_id):
+        root, segments, _ = _export_root(ctx, video_id)
+        if export_version is not None:
+            _require_export_version(root, export_version)
+        paths = _segment_paths(root, segments, segment)
+        if not (0 <= frame < _frame_count(paths)):
+            raise HTTPException(404, "frame não existe neste segmento")
+        if not (paths.out_dir / "masks").is_dir():
+            raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
+        state = _mask_store(paths).get_frame(frame)
     return serialize_frame_state(
         state,
         mask_url=lambda obj_id: _mask_url(ctx, video_id, segment, frame, obj_id),
@@ -300,17 +320,18 @@ async def mask_review_image(
     sha256: str | None = None,
     ctx: ObjectContext = Depends(get_object),
 ):
-    root, segments, _ = _export_root(ctx, video_id)
-    paths = _segment_paths(root, segments, segment)
-    state = _mask_store(paths).get_frame(frame)
-    instance = next((item for item in state.instances if item.obj_id == obj_id), None)
-    if instance is None or not instance.path.exists():
-        raise HTTPException(404, "máscara não encontrada")
-    versioned = revision is not None or sha256 is not None
-    if versioned and (
-        revision != state.revision or sha256 != instance.info.sha256
-    ):
-        raise HTTPException(409, "a mascara mudou; recarregue o frame")
+    async with async_video_fence(ctx.object_id, video_id):
+        root, segments, _ = _export_root(ctx, video_id)
+        paths = _segment_paths(root, segments, segment)
+        state = _mask_store(paths).get_frame(frame)
+        instance = next((item for item in state.instances if item.obj_id == obj_id), None)
+        if instance is None or not instance.path.exists():
+            raise HTTPException(404, "máscara não encontrada")
+        versioned = revision is not None or sha256 is not None
+        if versioned and (
+            revision != state.revision or sha256 != instance.info.sha256
+        ):
+            raise HTTPException(409, "a mascara mudou; recarregue o frame")
     return FileResponse(
         instance.path,
         media_type="image/png",

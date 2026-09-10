@@ -25,6 +25,12 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from pipeline_core.sam3_runs import (
+    active_segment_output,
+    effective_prompt_override_path,
+    legacy_segment_output,
+)
+
 from .videos import iso
 
 SCHEMA_VERSION = 1
@@ -110,7 +116,12 @@ class SegmentPaths:
 
     @property
     def out_dir(self) -> Path:
-        return self.segment_dir / "_sam3"
+        return active_segment_output(self.segment_dir)
+
+    @property
+    def control_dir(self) -> Path:
+        """Mutable prompt/preview control files, never a published generation."""
+        return legacy_segment_output(self.segment_dir)
 
     @property
     def labels_dir(self) -> Path:
@@ -152,8 +163,10 @@ def prompt_contract(paths: SegmentPaths) -> dict:
         return {}
 
     objects = raw.get("objects") or []
-    override_path = paths.out_dir / "prompt_override.json"
-    if override_path.exists():
+    override_path = effective_prompt_override_path(
+        paths.segment_dir, migrate_legacy=True
+    )
+    if override_path is not None:
         try:
             override = json.loads(override_path.read_text(encoding="utf-8"))
             if isinstance(override.get("objects"), list):

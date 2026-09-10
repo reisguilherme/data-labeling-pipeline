@@ -18,6 +18,7 @@ from .config import VERSION, RunnerConfig
 from .marker import ObjectReport, RunReport
 from .mask_io import save_mask_png, validate_mask_set
 from .prompt import Prompt
+from pipeline_core.storage import MinioBlobStore
 
 log = logging.getLogger("sam3_runner.segment")
 
@@ -26,17 +27,18 @@ class PropagationCancelled(RuntimeError):
     """Cooperative stop requested at a completed frame boundary."""
 
 
-def _write_labels(prompt: Prompt, rows: dict[int, list[str]]) -> int:
+def _write_labels(prompt: Prompt, rows: dict[int, list[str]], out_dir: Path) -> int:
     """Um .txt por frame do segmento — inclusive os vazios.
 
     O Ultralytics trata arquivo vazio e arquivo ausente igual (fundo), mas para
     QUEM LÊ O DATASET os dois casos são indistinguíveis de "ainda não
     processado". O arquivo vazio é a afirmação explícita: processado, nada aqui.
     """
-    prompt.labels_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir = out_dir / "labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for index in range(prompt.frame_count):
-        path = prompt.labels_dir / f"{index:06d}.txt"
+        path = labels_dir / f"{index:06d}.txt"
         lines = rows.get(index, [])
         path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         written += 1
@@ -50,10 +52,12 @@ def run_segment(
     classes: ClassMap,
     *,
     on_frame: Callable[[int], bool | None] | None = None,
+    output_dir: Path | None = None,
 ) -> RunReport:
-    """Roda o SAM3 num segmento e grava `_sam3/labels/*.txt` + `_sam3/run.json`."""
+    """Run one segment, writing only to the caller-owned unpublished directory."""
     import torch
 
+    out_dir = output_dir or prompt.out_dir
     started = time.monotonic()
     class_index = classes.ensure(prompt.labels())
     reports = {
@@ -79,6 +83,7 @@ def run_segment(
 
     rows: dict[int, list[str]] = {}
     observed_masks: set[tuple[int, int]] = set()
+    blob_store = MinioBlobStore.from_env()
 
     kwargs = model.init_state_kwargs(predictor, cfg)
     report.params = {**report.params, "init_state_kwargs": sorted(kwargs)}
@@ -121,11 +126,12 @@ def run_segment(
                     # Mascara canonica vem antes dos filtros de bbox: vazia,
                     # pequena ou degenerada continuam sendo resultados validos.
                     save_mask_png(
-                        prompt.out_dir,
+                        out_dir,
                         obj_id=obj_id,
                         frame_idx=frame_idx,
                         mask=masks[position],
                         threshold=cfg.mask_threshold,
+                        blob_store=blob_store,
                     )
                     observed_masks.add((obj_id, frame_idx))
                     box = bbox_from_mask(masks[position], cfg.mask_threshold)
@@ -176,17 +182,18 @@ def run_segment(
             for frame_idx in range(prompt.frame_count):
                 if (obj_id, frame_idx) not in observed_masks:
                     save_mask_png(
-                        prompt.out_dir,
+                        out_dir,
                         obj_id=obj_id,
                         frame_idx=frame_idx,
                         mask=empty,
                         threshold=cfg.mask_threshold,
+                        blob_store=blob_store,
                     )
 
-        report.frames_written = _write_labels(prompt, rows)
+        report.frames_written = _write_labels(prompt, rows, out_dir)
         report.frames_with_objects = sum(1 for value in rows.values() if value)
         report.artifacts = validate_mask_set(
-            prompt.out_dir,
+            out_dir,
             obj_ids=list(reports),
             frame_count=prompt.frame_count,
             image_size=(prompt.image_width, prompt.image_height),
@@ -213,7 +220,7 @@ def run_segment(
     report.finished_at = marker.iso()
     report.duration_sec = round(time.monotonic() - started, 2)
     report.objects = list(reports.values())
-    marker.write(prompt.marker_path, report)
+    marker.write(out_dir / "run.json", report)
     return report
 
 
@@ -236,9 +243,11 @@ def _explain(exc: Exception, prompt: Prompt, cfg: RunnerConfig) -> str:
     return f"{type(exc).__name__}: {text}"
 
 
-def should_skip(prompt: Prompt, cfg: RunnerConfig) -> bool:
+def should_skip(
+    prompt: Prompt, cfg: RunnerConfig, *, output_dir: Path | None = None
+) -> bool:
     return marker.is_complete(
-        prompt.marker_path,
+        (output_dir or prompt.out_dir) / "run.json",
         prompt_digest=prompt.digest,
         frame_count=prompt.frame_count,
         params=cfg.params(),

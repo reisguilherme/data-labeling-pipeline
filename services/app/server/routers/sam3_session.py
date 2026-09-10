@@ -18,7 +18,11 @@ from ..sam3_session import COMMAND_WAIT, sessions
 from ..users import User
 from ..workspace import ObjectContext
 from .review import _export_root, _segment_paths
-from .sam3 import require_worker
+from .sam3 import require_worker, sam3_video_fence
+from pipeline_core.sam3_runs import (
+    effective_prompt_override_path,
+    prompt_override_tombstone_path,
+)
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["sam3-session"])
 worker_router = APIRouter(prefix="/api/sam3/session", tags=["sam3-session"])
@@ -144,9 +148,6 @@ async def save_override(
 
     from ..videos import iso
 
-    root, segments, _ = _export_root(ctx, video_id)
-    paths = _segment_paths(root, segments, payload.segment)
-
     boxes = []
     for position, box in enumerate(payload.boxes, start=1):
         normalized = box.get("normalized")
@@ -171,14 +172,26 @@ async def save_override(
         "at": iso(),
         "note": "caixa inicial ajustada na tela de controle; o prompt.json da triagem fica intacto",
     }
-    target = paths.out_dir / "prompt_override.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name("prompt_override.json.tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(document, ensure_ascii=False, indent=2))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, target)
+    async with sam3_video_fence(ctx.object_id, video_id):
+        root, segments, video = _export_root(ctx, video_id)
+        paths = _segment_paths(root, segments, payload.segment)
+        target = paths.control_dir / "prompt_override.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name("prompt_override.json.tmp")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(document, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        prompt_override_tombstone_path(paths.segment_dir).unlink(missing_ok=True)
+        # Any in-flight propagation was computed from the previous prompt.
+        # Cooperative cancellation prevents a retry of that generation from
+        # livelocking against the newly written override. The operator's
+        # subsequent Propagar action creates a fresh run_id.
+        from ..sam3 import queue as sam3_queue
+
+        sam3_queue.bind(ctx.object_id, ctx.output_root)
+        await asyncio.to_thread(sam3_queue.cancel, ctx.object_id, video.relpath)
     return document
 
 
@@ -190,11 +203,26 @@ async def clear_override(
     _: User = Depends(current_user),
 ) -> dict:
     """Descarta o ajuste: volta a valer a caixa que a triagem marcou."""
-    root, segments, _ = _export_root(ctx, video_id)
-    paths = _segment_paths(root, segments, segment)
-    target = paths.out_dir / "prompt_override.json"
-    existed = target.exists()
-    target.unlink(missing_ok=True)
+    async with sam3_video_fence(ctx.object_id, video_id):
+        root, segments, video = _export_root(ctx, video_id)
+        paths = _segment_paths(root, segments, segment)
+        target = paths.control_dir / "prompt_override.json"
+        existed = effective_prompt_override_path(paths.segment_dir) is not None
+        tombstone = prompt_override_tombstone_path(paths.segment_dir)
+        tombstone.parent.mkdir(parents=True, exist_ok=True)
+        temporary = tombstone.with_name(f".{tombstone.name}.tmp")
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("cleared\n")
+            handle.flush()
+            import os
+
+            os.fsync(handle.fileno())
+        os.replace(temporary, tombstone)
+        target.unlink(missing_ok=True)
+        from ..sam3 import queue as sam3_queue
+
+        sam3_queue.bind(ctx.object_id, ctx.output_root)
+        await asyncio.to_thread(sam3_queue.cancel, ctx.object_id, video.relpath)
     return {"cleared": existed}
 
 
@@ -205,9 +233,9 @@ async def preview_image(
     """Serve a máscara que o runner escreveu no disco compartilhado."""
     root, segments, _ = _export_root(ctx, video_id)
     paths = _segment_paths(root, segments, segment)
-    target = (paths.out_dir / "_preview" / name).resolve()
+    target = (paths.control_dir / "_preview" / name).resolve()
     # `name` vem da URL: confina antes de servir.
-    if not target.is_relative_to((paths.out_dir / "_preview").resolve()):
+    if not target.is_relative_to((paths.control_dir / "_preview").resolve()):
         raise HTTPException(400, "caminho inválido")
     if not target.exists():
         raise HTTPException(404, "prévia não encontrada")

@@ -138,6 +138,64 @@ class FileMaskReviewStoreTests(unittest.TestCase):
         manifest = json.loads(self.store.manifest_path.read_text())
         self.assertEqual(manifest["frames"]["0"]["instances"][0]["path"], "masks/1/000000.png")
 
+    def test_manifest_cannot_read_a_mask_outside_the_generation(self) -> None:
+        outside = self.out_dir.parent / "outside.png"
+        outside.write_bytes(mask_at((10, 10), 9, 9))
+        self.store.manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frames": {
+                        "0": {
+                            "revision": 1,
+                            "status": "edited",
+                            "instances": [
+                                {
+                                    "obj_id": 1,
+                                    "label": "boom",
+                                    "path": "../../outside.png",
+                                }
+                            ],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "caminho"):
+            self.store.get_frame(0)
+
+    def test_manifest_checksum_is_revalidated_against_immutable_bytes(self) -> None:
+        edited = self.out_dir / "reviews" / "000000" / "rev_000001" / "1.png"
+        edited.parent.mkdir(parents=True)
+        edited.write_bytes(mask_at((10, 10), 5, 5))
+        self.store.manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frames": {
+                        "0": {
+                            "revision": 1,
+                            "status": "edited",
+                            "instances": [
+                                {
+                                    "obj_id": 1,
+                                    "label": "boom",
+                                    "path": "reviews/000000/rev_000001/1.png",
+                                    "sha256": "f" * 64,
+                                }
+                            ],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            self.store.get_frame(0)
+
     def test_database_hook_runs_before_manifest_commit(self) -> None:
         observed = []
 
@@ -169,6 +227,21 @@ class FileMaskReviewStoreTests(unittest.TestCase):
             )
 
         self.assertFalse(self.store.manifest_path.exists())
+
+    def test_corrupt_existing_manifest_fails_closed_and_is_not_replaced(self) -> None:
+        corrupt = b'{"schema_version": 1, "frames": '
+        self.store.manifest_path.write_bytes(corrupt)
+
+        with self.assertRaises(ValueError):
+            self.store.save_frame(
+                0,
+                expected_revision=0,
+                status="ok",
+                instances=[],
+                user="guilherme",
+            )
+
+        self.assertEqual(self.store.manifest_path.read_bytes(), corrupt)
 
     def test_batch_saves_original_and_edited_frames_after_validating_all_revisions(self) -> None:
         second_raw = self.out_dir / "masks" / "1" / "000001.png"

@@ -10,10 +10,18 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 
+from pipeline_core.model_registry import ModelRegistry
+from pipeline_core.sam3_runs import (
+    Sam3GenerationError,
+    resolve_export_root,
+    staging_segment_output,
+)
+
 from ..deps import current_user, get_object
 from ..sam3 import DEFAULT_LEASE_SECONDS, queue
 from ..sam3_worker_status import worker_status
 from ..users import User
+from ..video_fence import async_video_fence
 from ..videos import iso
 from ..workspace import ObjectContext, workspace
 
@@ -22,6 +30,10 @@ router = APIRouter(prefix="/api/objects/{object_id}", tags=["sam3"])
 
 # Global: o runner drena todos os objetos com um único loop.
 worker_router = APIRouter(prefix="/api/sam3", tags=["sam3-worker"])
+
+# Kept as a public alias because the session router and compatibility tests
+# import this name directly.
+sam3_video_fence = async_video_fence
 
 
 def _bind(ctx: ObjectContext) -> None:
@@ -35,6 +47,26 @@ def _bind(ctx: ObjectContext) -> None:
 
 class EnqueueIn(BaseModel):
     force: bool = False
+
+
+def _selected_model_identity(object_id: str) -> dict[str, str | None]:
+    configured = os.environ.get("SAM3_MODELS_CONFIG")
+    candidates = [Path(configured)] if configured else []
+    candidates.extend(
+        [Path("/registry/models.local.yaml"), Path("/registry/models.yaml")]
+    )
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise HTTPException(503, "registro de modelos SAM3 nao encontrado")
+    try:
+        spec = ModelRegistry.load(path).select(object_id)
+    except (OSError, ValueError, KeyError) as exc:
+        raise HTTPException(503, f"registro SAM3 invalido: {exc}") from exc
+    return {
+        "model_id": spec.model_id,
+        "model_sha256": spec.sha256,
+        "sam3_commit": spec.sam3_commit,
+    }
 
 
 @router.post("/videos/{video_id}/sam3", status_code=202)
@@ -56,6 +88,7 @@ async def enqueue(
             409, "exporte o vídeo antes: o SAM3 consome os frames e o prompt.json do export"
         )
 
+    model_identity = _selected_model_identity(ctx.object_id)
     item = await asyncio.to_thread(
         queue.enqueue,
         ctx.object_id,
@@ -67,6 +100,7 @@ async def enqueue(
         user=user.user_id,
         annotation_revision=int(entry.get("annotation_revision") or 0),
         force=bool(payload.force if payload else False),
+        **model_identity,
     )
     return item.public()
 
@@ -154,14 +188,14 @@ def _resolve_export_root(object_id: str, export_root: str) -> str:
     que não existe aqui também não existiria lá. Recalcular a partir do registro
     é mais confiável que confiar no que foi gravado meses atrás.
     """
-    if Path(export_root).is_dir():
-        return export_root
     try:
         cfg = workspace.get(object_id)
     except KeyError:
-        return export_root
-    candidate = cfg.output_root / Path(export_root.replace("\\", "/")).name
-    return str(candidate) if candidate.is_dir() else export_root
+        raise HTTPException(409, f"objeto desconhecido no job SAM3: {object_id}")
+    try:
+        return str(resolve_export_root(cfg.output_root, export_root))
+    except Sam3GenerationError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @worker_router.get("/next")
@@ -214,9 +248,30 @@ async def next_job(
             "force": item.force,
             "attempt": item.attempts,
             "annotation_revision": item.annotation_revision,
+            "run_id": item.run_id,
+            "model": (
+                {
+                    "model_id": item.model_id,
+                    "checkpoint_sha256": item.model_sha256,
+                    "sam3_commit": item.sam3_commit,
+                }
+                if item.model_id and item.model_sha256 and item.sam3_commit
+                else None
+            ),
             "export_root": export_root,
             "segments": [
-                {"segment": segment, "dir": str(Path(export_root) / segment)}
+                {
+                    "segment": segment,
+                    "dir": str(Path(export_root) / segment),
+                    "staging_dir": str(
+                        staging_segment_output(
+                            Path(export_root),
+                            item.run_id,
+                            item.lease_id or "",
+                            segment,
+                        )
+                    ),
+                }
                 for segment in item.segments
             ],
             "lease_seconds": lease,
@@ -288,22 +343,9 @@ async def _finish_done_result(
     ctx,
     durable: bool,
 ) -> dict:
-    from contextlib import asynccontextmanager
-
-    from .. import durable_jobs
-
-    @asynccontextmanager
-    async def video_fence():
-        if not durable:
-            yield
-            return
-        async with durable_jobs.video_advisory_lock_async(
-            object_id, leased_item.video_id
-        ):
+    async with sam3_video_fence(object_id, leased_item.video_id):
+        if durable:
             await asyncio.to_thread(ctx.store.load)
-            yield
-
-    async with video_fence():
         async with queue.owned_lease_async(lease_id) as owned:
             if owned is None:
                 raise HTTPException(409, "lease inválido ou expirado")
@@ -330,6 +372,29 @@ async def _finish_done_result(
                     raise HTTPException(409, "lease inválido ou expirado")
                 return {"ok": True, "state": found[1].state, "stale": True}
 
+            from pipeline_core import sam3_runs
+
+            resolved_export_root = Path(
+                _resolve_export_root(object_id, item.export_root)
+            )
+            try:
+                published_result = await asyncio.to_thread(
+                    sam3_runs.publish_generation,
+                    export_root=resolved_export_root,
+                    segments=list(item.segments),
+                    generation_id=item.run_id,
+                    attempt_id=lease_id,
+                    annotation_revision=item.annotation_revision,
+                    expected_model={
+                        "model_id": item.model_id,
+                        "checkpoint_sha256": item.model_sha256,
+                        "sam3_commit": item.sam3_commit,
+                    },
+                    worker_result=payload.result or {},
+                )
+            except sam3_runs.Sam3GenerationError as exc:
+                raise HTTPException(409, str(exc)) from exc
+
             def apply(doc: dict) -> None:
                 current = doc["videos"].get(item.relpath)
                 if not _matches_annotation_revision(
@@ -338,11 +403,14 @@ async def _finish_done_result(
                     raise HTTPException(
                         409, "anotacao mudou durante o processamento"
                     )
-                _write_sam3_result(current, payload.result)
+                _write_sam3_result(current, published_result)
 
             await ctx.store.mutate(apply)
             found = await owned.finish(
-                state="done", result=payload.result, error=payload.error
+                state="done",
+                result=published_result,
+                error=payload.error,
+                export_root=resolved_export_root,
             )
             if found is None:
                 raise HTTPException(409, "lease inválido ou expirado")

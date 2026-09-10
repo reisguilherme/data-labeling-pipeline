@@ -25,6 +25,7 @@ import os
 import secrets
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -53,6 +54,10 @@ class QueueItem:
     export_root: str
     segments: list[str] = field(default_factory=list)
     annotation_revision: int = 0
+    run_id: str = ""
+    model_id: str | None = None
+    model_sha256: str | None = None
+    sam3_commit: str | None = None
     state: str = "queued"
     attempts: int = 0
     force: bool = False
@@ -78,6 +83,10 @@ class QueueItem:
     def active(self) -> bool:
         return self.state in ("queued", "leased", "running")
 
+    @property
+    def model_identity(self) -> tuple[str | None, str | None, str | None]:
+        return (self.model_id, self.model_sha256, self.sam3_commit)
+
     def note(self, state: str, **extra) -> None:
         self.history.append({"at": iso(), "state": state, **extra})
         del self.history[:-_HISTORY_LIMIT]
@@ -91,6 +100,7 @@ class QueueItem:
             "error": self.error,
             "segments": len(self.segments),
             "annotation_revision": self.annotation_revision,
+            "run_id": self.run_id,
             "finished_at": self.finished_at,
         }
 
@@ -105,7 +115,12 @@ class _OwnedFileLease:
         self.item = item
 
     async def finish(
-        self, *, state: str, result: dict | None, error: str | None
+        self,
+        *,
+        state: str,
+        result: dict | None,
+        error: str | None,
+        export_root: str | Path | None = None,
     ) -> tuple[str, QueueItem] | None:
         return self._queue.finish(
             self.item.lease_id or "", state=state, result=result, error=error
@@ -150,6 +165,13 @@ class Sam3Queue:
                 export_root=raw.get("export_root", ""),
                 segments=list(raw.get("segments") or []),
                 annotation_revision=int(raw.get("annotation_revision") or 0),
+                run_id=str(raw.get("run_id") or uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"sam3-file:{path}:{relpath}:{raw.get('enqueued_at', '')}",
+                ).hex),
+                model_id=raw.get("model_id"),
+                model_sha256=raw.get("model_sha256"),
+                sam3_commit=raw.get("sam3_commit"),
                 state=raw.get("state", "queued"),
                 attempts=int(raw.get("attempts") or 0),
                 force=bool(raw.get("force")),
@@ -251,9 +273,13 @@ class Sam3Queue:
         user: str | None,
         annotation_revision: int = 0,
         force: bool = False,
+        model_id: str | None = None,
+        model_sha256: str | None = None,
+        sam3_commit: str | None = None,
     ) -> QueueItem:
         if type(annotation_revision) is not int or annotation_revision < 0:
             raise ValueError("annotation_revision invalida")
+        requested_model = (model_id, model_sha256, sam3_commit)
         with self._state_changed:
             self._expire(object_id)
             items = self._by_object.setdefault(object_id, {})
@@ -261,7 +287,13 @@ class Sam3Queue:
             while (
                 existing is not None
                 and existing.completion_reserved
-                and existing.annotation_revision < annotation_revision
+                and (
+                    existing.annotation_revision < annotation_revision
+                    or (
+                        existing.annotation_revision == annotation_revision
+                        and existing.model_identity != requested_model
+                    )
+                )
             ):
                 self._state_changed.wait()
                 existing = items.get(relpath)
@@ -276,12 +308,14 @@ class Sam3Queue:
             if (
                 existing is not None
                 and existing.annotation_revision == annotation_revision
+                and existing.model_identity == requested_model
                 and existing.active
             ):
                 return existing
             if (
                 existing is not None
                 and existing.annotation_revision == annotation_revision
+                and existing.model_identity == requested_model
                 and existing.state == "done"
                 and not force
             ):
@@ -294,6 +328,10 @@ class Sam3Queue:
                 export_root=export_root,
                 segments=segments,
                 annotation_revision=annotation_revision,
+                run_id=uuid.uuid4().hex,
+                model_id=model_id,
+                model_sha256=model_sha256,
+                sam3_commit=sam3_commit,
                 state="queued",
                 force=force,
                 enqueued_at=iso(),

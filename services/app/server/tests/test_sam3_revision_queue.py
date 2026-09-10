@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
+
 from server.routers import sam3 as sam3_router
 from server.sam3 import Sam3Queue
 from server.sam3_postgres import PostgresSam3Queue
@@ -89,7 +91,7 @@ class Sam3RevisionQueueTests(unittest.TestCase):
             "segments": ["seg_00"],
             "annotation_revision": 4,
         }
-        cursor = _Cursor([None, None, _row(payload)])
+        cursor = _Cursor([None, _row(payload)])
         queue = PostgresSam3Queue("postgresql://unused")
         queue._connect = MagicMock(return_value=_Connection(cursor))
 
@@ -110,7 +112,13 @@ class Sam3RevisionQueueTests(unittest.TestCase):
         self.assertIn("cancel_requested", flattened)
         self.assertIn("payload->>'object_id'", flattened)
         params = [params for _, params in cursor.calls]
-        self.assertTrue(any("sam3:boom:video-1:r4" in tuple(map(str, value or ())) for value in params))
+        self.assertTrue(
+            any(
+                "sam3:boom:video-1:r4" in str(item)
+                for value in params
+                for item in (value or ())
+            )
+        )
 
     def test_postgres_reader_accepts_legacy_payload_without_revision(self) -> None:
         item = PostgresSam3Queue._item(
@@ -233,6 +241,169 @@ class Sam3RevisionQueueTests(unittest.TestCase):
         self.assertIs(first, same)
         self.assertEqual(newer.annotation_revision, 2)
         self.assertIs(queue.get("boom", "clip.mp4"), newer)
+
+    def test_force_rerun_gets_a_new_immutable_generation_identity(self) -> None:
+        queue = Sam3Queue()
+        queue.bind("boom", Path(tempfile.mkdtemp()))
+        first = self._enqueue_file(queue, 4)
+        _, leased = queue.take("worker", 180)
+        queue.finish(leased.lease_id, state="done", result={"ok": True}, error=None)
+
+        rerun = queue.enqueue(
+            "boom",
+            video_id="v",
+            relpath="clip.mp4",
+            name="clip",
+            export_root="/x",
+            segments=["seg_00"],
+            user="ana",
+            annotation_revision=4,
+            force=True,
+        )
+
+        self.assertRegex(getattr(first, "run_id", ""), r"^[a-f0-9]{32}$")
+        self.assertRegex(getattr(rerun, "run_id", ""), r"^[a-f0-9]{32}$")
+        self.assertNotEqual(first.run_id, rerun.run_id)
+
+    def test_file_queue_model_change_never_reuses_active_generation(self) -> None:
+        queue = Sam3Queue()
+        queue.bind("boom", Path(tempfile.mkdtemp()))
+        first = queue.enqueue(
+            "boom",
+            video_id="v",
+            relpath="clip.mp4",
+            name="clip",
+            export_root="/x",
+            segments=["seg_00"],
+            user="ana",
+            annotation_revision=4,
+            model_id="model-old",
+            model_sha256="a" * 64,
+            sam3_commit="b" * 40,
+        )
+        replacement = queue.enqueue(
+            "boom",
+            video_id="v",
+            relpath="clip.mp4",
+            name="clip",
+            export_root="/x",
+            segments=["seg_00"],
+            user="ana",
+            annotation_revision=4,
+            model_id="model-new",
+            model_sha256="c" * 64,
+            sam3_commit="d" * 40,
+        )
+
+        self.assertEqual(replacement.model_id, "model-new")
+        self.assertNotEqual(replacement.run_id, first.run_id)
+
+    def test_postgres_model_change_cancels_active_job_and_uses_new_key(self) -> None:
+        old_payload = {
+            "object_id": "boom",
+            "video_id": "video-1",
+            "relpath": "clip.mp4",
+            "annotation_revision": 4,
+            "model_id": "model-old",
+            "model_sha256": "a" * 64,
+            "sam3_commit": "b" * 40,
+        }
+        new_payload = {
+            **old_payload,
+            "model_id": "model-new",
+            "model_sha256": "c" * 64,
+            "sam3_commit": "d" * 40,
+        }
+        cursor = _Cursor([_row(old_payload, "running"), _row(new_payload)])
+        queue = PostgresSam3Queue("postgresql://unused")
+        queue._connect = MagicMock(return_value=_Connection(cursor))
+
+        item = queue.enqueue(
+            "boom",
+            video_id="video-1",
+            relpath="clip.mp4",
+            name="clip",
+            export_root="/dataset/clip",
+            segments=["seg_00"],
+            user="ana",
+            annotation_revision=4,
+            model_id="model-new",
+            model_sha256="c" * 64,
+            sam3_commit="d" * 40,
+        )
+
+        self.assertEqual(item.model_id, "model-new")
+        statements = "\n".join(statement for statement, _ in cursor.calls)
+        self.assertIn("cancel_requested", statements)
+        key = next(
+            str(value)
+            for _, params in cursor.calls
+            for value in (params or ())
+            if str(value).startswith("sam3:boom:video-1:r4:")
+        )
+        self.assertRegex(key, r":m[0-9a-f]{24}:g[0-9a-f]{32}$")
+
+    def test_postgres_switching_back_to_an_old_model_creates_a_fresh_execution(self) -> None:
+        latest_payload = {
+            "object_id": "boom",
+            "video_id": "video-1",
+            "relpath": "clip.mp4",
+            "annotation_revision": 4,
+            "run_id": "b" * 32,
+            "model_id": "model-b",
+            "model_sha256": "b" * 64,
+            "sam3_commit": "c" * 40,
+        }
+        returned_payload = {
+            **latest_payload,
+            "run_id": "a" * 32,
+            "model_id": "model-a",
+            "model_sha256": "a" * 64,
+        }
+        cursor = _Cursor([_row(latest_payload, "done"), _row(returned_payload)])
+        queue = PostgresSam3Queue("postgresql://unused")
+        queue._connect = MagicMock(return_value=_Connection(cursor))
+
+        item = queue.enqueue(
+            "boom",
+            video_id="video-1",
+            relpath="clip.mp4",
+            name="clip",
+            export_root="/dataset/clip",
+            segments=["seg_00"],
+            user="ana",
+            annotation_revision=4,
+            model_id="model-a",
+            model_sha256="a" * 64,
+            sam3_commit="c" * 40,
+        )
+
+        self.assertEqual(item.model_id, "model-a")
+        statements = "\n".join(statement for statement, _ in cursor.calls)
+        self.assertNotIn("WHERE idempotency_key = %s", statements)
+        inserted_key = next(
+            str(value)
+            for statement, params in cursor.calls
+            if "INSERT INTO jobs" in statement
+            for value in (params or ())
+            if str(value).startswith("sam3:boom:video-1:r4:")
+        )
+        self.assertRegex(inserted_key, r":m[0-9a-f]{24}:g[0-9a-f]{32}$")
+
+    def test_postgres_operator_list_returns_only_the_latest_run_per_video(self) -> None:
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchall.return_value = []
+        queue = PostgresSam3Queue("postgresql://unused")
+        queue._connect = MagicMock(return_value=connection)
+
+        self.assertEqual(queue.list("boom"), [])
+
+        statement = cursor.execute.call_args.args[0]
+        self.assertIn("DISTINCT ON", statement)
+        self.assertIn("created_at DESC", statement)
 
     def test_file_queue_never_replaces_a_newer_revision_with_an_older_one(self) -> None:
         queue = Sam3Queue()
@@ -373,7 +544,10 @@ class Sam3RevisionQueueTests(unittest.TestCase):
                 self.assertIsNotNone(owned)
                 connection.commit.assert_not_called()
                 found = owned.finish(
-                    state="done", result={"runner_version": "test"}, error=None
+                    state="done",
+                    result={"runner_version": "test"},
+                    error=None,
+                    export_root="/workspace/new/export",
                 )
                 self.assertEqual(found[1].state, "done")
                 connection.commit.assert_not_called()
@@ -381,6 +555,9 @@ class Sam3RevisionQueueTests(unittest.TestCase):
         connection.commit.assert_called_once_with()
         connection.rollback.assert_not_called()
         index.assert_called_once()
+        self.assertEqual(
+            index.call_args.kwargs["export_root"], "/workspace/new/export"
+        )
         self.assertIn("lease_expires_at > now()", cursor.execute.call_args_list[0].args[0])
         self.assertIn(
             "kind = 'sam3_propagation'", cursor.execute.call_args_list[0].args[0]
@@ -448,7 +625,15 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
             store=SimpleNamespace(entry=lambda _relpath: entry),
         )
         item = SimpleNamespace(public=lambda: {"state": "queued"})
-        with patch.object(sam3_router.queue, "bind"), patch.object(
+        with patch.object(
+            sam3_router,
+            "_selected_model_identity",
+            return_value={
+                "model_id": "model-1",
+                "model_sha256": "a" * 64,
+                "sam3_commit": "b" * 40,
+            },
+        ), patch.object(sam3_router.queue, "bind"), patch.object(
             sam3_router.queue, "enqueue", return_value=item
         ) as enqueue:
             await sam3_router.enqueue(
@@ -459,6 +644,29 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(enqueue.call_args.kwargs["annotation_revision"], 9)
+
+    def test_enqueue_fails_closed_when_model_registry_is_unavailable(self) -> None:
+        with patch.object(Path, "is_file", return_value=False):
+            with self.assertRaises(HTTPException) as raised:
+                sam3_router._selected_model_identity("boom")
+
+        self.assertEqual(raised.exception.status_code, 503)
+
+    def test_worker_rejects_an_existing_export_outside_registered_output_root(self) -> None:
+        output_root = Path(tempfile.mkdtemp()) / "dataset"
+        output_root.mkdir()
+        outside = Path(tempfile.mkdtemp()) / "foreign-export"
+        outside.mkdir()
+
+        with patch.object(
+            sam3_router.workspace,
+            "get",
+            return_value=SimpleNamespace(output_root=output_root),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                sam3_router._resolve_export_root("boom", str(outside))
+
+        self.assertEqual(raised.exception.status_code, 409)
 
     async def test_stale_worker_result_is_cancelled_without_touching_new_revision(self) -> None:
         class Store:
@@ -497,7 +705,12 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(sam3_router, "queue", queue), patch.object(
             sam3_router.workspace, "context", return_value=ctx
-        ), patch("server.durable_jobs.enabled", return_value=False):
+        ), patch("server.durable_jobs.enabled", return_value=False), patch.object(
+            sam3_router, "_resolve_export_root", return_value="/x"
+        ), patch(
+            "pipeline_core.sam3_runs.publish_generation",
+            side_effect=lambda **kwargs: kwargs["worker_result"],
+        ) as publish:
             response = await sam3_router.result(
                 lease_id,
                 sam3_router.ResultIn(state="done", result={"runner_version": "x"}),
@@ -508,6 +721,7 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["state"], "cancelled")
         self.assertNotIn("sam3", store.entry("clip.mp4"))
         self.assertEqual(queue.get("boom", "clip.mp4").state, "cancelled")
+        publish.assert_not_called()
 
     async def test_annotation_persistence_failure_keeps_lease_retriable(self) -> None:
         class Store:
@@ -553,7 +767,12 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(sam3_router, "queue", queue), patch.object(
             sam3_router.workspace, "context", return_value=ctx
-        ), patch("server.durable_jobs.enabled", return_value=False):
+        ), patch("server.durable_jobs.enabled", return_value=False), patch.object(
+            sam3_router, "_resolve_export_root", return_value="/x"
+        ), patch(
+            "pipeline_core.sam3_runs.publish_generation",
+            side_effect=lambda **kwargs: kwargs["worker_result"],
+        ):
             with self.assertRaisesRegex(OSError, "flush failed"):
                 await sam3_router.result(
                     lease_id,
@@ -624,7 +843,12 @@ class Sam3RevisionRouterTests(unittest.IsolatedAsyncioTestCase):
                 ctx = SimpleNamespace(store=store, ensure_loaded=lambda: None)
                 with patch.object(sam3_router, "queue", queue), patch.object(
                     sam3_router.workspace, "context", return_value=ctx
-                ), patch("server.durable_jobs.enabled", return_value=False):
+                ), patch("server.durable_jobs.enabled", return_value=False), patch.object(
+                    sam3_router, "_resolve_export_root", return_value="/x"
+                ), patch(
+                    "pipeline_core.sam3_runs.publish_generation",
+                    side_effect=lambda **kwargs: kwargs["worker_result"],
+                ):
                     response = await sam3_router.result(
                         leased.lease_id,
                         sam3_router.ResultIn(

@@ -69,15 +69,64 @@ class FileMaskReviewStore:
             return {"schema_version": SCHEMA_VERSION, "frames": {}}
         try:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {"schema_version": SCHEMA_VERSION, "frames": {}}
-        data.setdefault("frames", {})
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"manifesto de revisao ilegivel: {self.manifest_path}"
+            ) from exc
+        if (
+            not isinstance(data, dict)
+            or data.get("schema_version") != SCHEMA_VERSION
+            or not isinstance(data.get("frames"), dict)
+        ):
+            raise ValueError(
+                f"manifesto de revisao invalido: {self.manifest_path}"
+            )
         return data
+
+    def _mask_path(self, value: str | Path) -> Path:
+        relative = Path(value)
+        if relative.is_absolute() or not relative.parts or any(
+            part in ("", ".", "..") for part in relative.parts
+        ):
+            raise ValueError(f"caminho de mascara invalido: {value!r}")
+        if self.out_dir.is_symlink() or not self.out_dir.is_dir():
+            raise ValueError(f"raiz de mascaras insegura: {self.out_dir}")
+        target = self.out_dir / relative
+        current = self.out_dir
+        for part in relative.parts:
+            if current.is_symlink():
+                raise ValueError(f"symlink proibido em mascara: {current}")
+            current = current / part
+        if current.is_symlink():
+            raise ValueError(f"symlink proibido em mascara: {current}")
+        if not target.resolve(strict=False).is_relative_to(self.out_dir.resolve(strict=True)):
+            raise ValueError(f"mascara fora da geracao: {target}")
+        return target
+
+    def _instance_from_manifest(self, item: dict) -> MaskInstance:
+        path = self._mask_path(str(item.get("path") or ""))
+        info = inspect_binary_png(path.read_bytes(), expected_size=self.image_size)
+        if item.get("sha256") is not None and item.get("sha256") != info.sha256:
+            raise ValueError(f"checksum da revisao diverge: {path}")
+        if item.get("area_pixels") is not None and int(item["area_pixels"]) != info.area_pixels:
+            raise ValueError(f"area da revisao diverge: {path}")
+        if item.get("bbox_normalized") is not None and tuple(
+            item["bbox_normalized"]
+        ) != tuple(info.bbox_normalized or ()):
+            raise ValueError(f"bbox da revisao diverge: {path}")
+        return MaskInstance(
+            obj_id=int(item["obj_id"]),
+            label=item.get("label") or "",
+            path=path,
+            info=info,
+        )
 
     def _raw_instances(self, frame: int) -> tuple[MaskInstance, ...]:
         found = []
         for obj_id, label in sorted(self.labels.items()):
-            path = self.out_dir / "masks" / str(obj_id) / f"{frame:06d}.png"
+            path = self._mask_path(
+                Path("masks") / str(obj_id) / f"{frame:06d}.png"
+            )
             if not path.exists():
                 continue
             found.append(
@@ -98,17 +147,7 @@ class FileMaskReviewStore:
         if status == "edited":
             loaded = []
             for item in entry.get("instances") or []:
-                path = self.out_dir / item["path"]
-                loaded.append(
-                    MaskInstance(
-                        obj_id=int(item["obj_id"]),
-                        label=item.get("label") or "",
-                        path=path,
-                        info=inspect_binary_png(
-                            path.read_bytes(), expected_size=self.image_size
-                        ),
-                    )
-                )
+                loaded.append(self._instance_from_manifest(item))
             instances = tuple(loaded)
         else:
             instances = self._raw_instances(frame)

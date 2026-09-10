@@ -29,6 +29,18 @@ class QueueError(RuntimeError):
     pass
 
 
+def select_model_spec(registry, object_id: str, pinned_model_id: str | None = None):
+    """Resolve a queued job by its pinned ID; assignments only guide new work."""
+    if not pinned_model_id:
+        return registry.select(object_id)
+    try:
+        return registry.models[pinned_model_id]
+    except KeyError as exc:
+        raise QueueError(
+            f"modelo fixado no job nao existe mais no registro: {pinned_model_id}"
+        ) from exc
+
+
 class LeaseLost(RuntimeError):
     """O lease expirou ou foi para outro worker: PARE de processar.
 
@@ -212,6 +224,21 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
     from .marker import read as read_marker
     from .segment import PropagationCancelled, run_segment, should_skip
 
+    actual_model = {
+        "model_id": cfg.model_id,
+        "checkpoint_sha256": cfg.model_sha256,
+        "sam3_commit": cfg.sam3_commit,
+    }
+    pinned_model = job.get("model")
+    if pinned_model and any(
+        pinned_model.get(field) != actual_model.get(field)
+        for field in actual_model
+    ):
+        raise QueueError(
+            "modelo carregado diverge da identidade fixada no job: "
+            f"esperado={pinned_model!r} carregado={actual_model!r}"
+        )
+
     lease_id = job["lease_id"]
     segments = job.get("segments") or []
     total_segments = len(segments)
@@ -239,6 +266,7 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
             {
                 "segment": segment["segment"],
                 "dir": segment["dir"],
+                "staging_dir": segment["staging_dir"],
                 "status": run.get("status"),
                 "prompt_digest": run.get("prompt_digest"),
                 "frame_count": run.get("frame_count"),
@@ -250,6 +278,7 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
                     "format": artifacts.get("format"),
                     "files": artifacts.get("files"),
                     "empty": artifacts.get("empty"),
+                    "checksums": artifacts.get("checksums") or {},
                 },
                 "error": run.get("error"),
             }
@@ -287,8 +316,19 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
         # O marcador é POR SEGMENTO, e é isso que faz o retry ser barato: um job
         # reentregue depois de uma queda retoma no segmento que faltou, em vez de
         # refazer os onze anteriores.
-            if not job.get("force") and should_skip(prompt, cfg):
-                cached = read_marker(prompt.marker_path)
+            staging_value = segment.get("staging_dir")
+            if not staging_value:
+                errors.append(
+                    f"{segment['segment']}: servidor nao forneceu staging imutavel"
+                )
+                failed += 1
+                continue
+            staging_dir = Path(staging_value)
+
+            if not job.get("force") and should_skip(
+                prompt, cfg, output_dir=staging_dir
+            ):
+                cached = read_marker(staging_dir / "run.json")
                 if cached:
                     remember(segment, cached)
                 skipped += 1
@@ -308,7 +348,12 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
             try:
                 with autocast_context():
                     report = run_segment(
-                        predictor, prompt, cfg, classes, on_frame=note_frame
+                        predictor,
+                        prompt,
+                        cfg,
+                        classes,
+                        on_frame=note_frame,
+                        output_dir=staging_dir,
                     )
             except PropagationCancelled:
                 log.info(
@@ -337,6 +382,9 @@ def process_job(client: Client, job: dict, cfg: RunnerConfig, predictor, classes
             progress.update({"segments_done": index, "frames_done": frames_done})
 
         result = {
+            "run_id": job.get("run_id"),
+            "annotation_revision": int(job.get("annotation_revision") or 0),
+            "model": actual_model,
             "runner_version": cfg.params()["runner_version"],
             "segments_total": total_segments,
             "segments_done": done,
@@ -378,19 +426,23 @@ def serve(cfg: RunnerConfig, *, once: bool = False) -> int:
             f"registro SAM3 ausente: {cfg.models_config}. "
             "Crie config/models.local.yaml com o checkpoint finetunado."
         )
-    registry = ModelRegistry.load(cfg.models_config)
     predictor = None
-    loaded_model_id: str | None = None
+    loaded_model_identity: tuple[str, str, str] | None = None
 
-    def predictor_for(object_id: str):
-        nonlocal predictor, loaded_model_id
-        spec = registry.select(object_id)
+    def predictor_for(object_id: str, pinned_model_id: str | None = None):
+        nonlocal predictor, loaded_model_identity
+        # Reload the tiny declarative registry between jobs. Updating a
+        # checkpoint under the same model_id must not keep the prior weights
+        # alive merely because this long-running worker cached the predictor.
+        registry = ModelRegistry.load(cfg.models_config)
+        spec = select_model_spec(registry, object_id, pinned_model_id)
+        model_identity = (spec.model_id, spec.sha256, spec.sam3_commit)
         image_commit = os.environ.get("SAM3_COMMIT")
         if image_commit and spec.sam3_commit != image_commit:
             raise RuntimeError(
                 f"modelo {spec.model_id} exige SAM3 {spec.sam3_commit}, imagem usa {image_commit}"
             )
-        if predictor is not None and loaded_model_id == spec.model_id:
+        if predictor is not None and loaded_model_identity == model_identity:
             return predictor
         checkpoint = registry.resolve_checkpoint(spec.model_id, cache_dir=cfg.model_cache)
         blob_store = MinioBlobStore.from_env()
@@ -407,7 +459,7 @@ def serve(cfg: RunnerConfig, *, once: bool = False) -> int:
             free_vram()
         log.info("carregando modelo registrado %s", spec.model_id)
         predictor = build_predictor(spec, checkpoint)
-        loaded_model_id = spec.model_id
+        loaded_model_identity = model_identity
         cfg.model_id = spec.model_id
         cfg.model_sha256 = spec.sha256
         cfg.sam3_commit = spec.sam3_commit
@@ -482,7 +534,9 @@ def serve(cfg: RunnerConfig, *, once: bool = False) -> int:
         try:
             object_id = str(job.get("object_id") or "")
             with StatusHeartbeat(client, "loading", "preparando modelo para propagação"):
-                predictor = predictor_for(object_id)
+                predictor = predictor_for(
+                    object_id, str((job.get("model") or {}).get("model_id") or "") or None
+                )
             process_job(client, job, cfg, predictor, classes)
         except LeaseLost as exc:
             log.warning("%s — abandonando o job", exc)

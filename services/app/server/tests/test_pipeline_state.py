@@ -13,6 +13,115 @@ from pipeline_core.masks import encode_binary_png
 
 
 class PipelineStateTests(unittest.TestCase):
+    def test_pipeline_rejects_export_root_outside_object_output(self) -> None:
+        from server.pipeline_state import inspect_pipeline_entry
+
+        output_root = Path(tempfile.mkdtemp()) / "dataset"
+        output_root.mkdir()
+        outside = Path(tempfile.mkdtemp()) / "foreign-export"
+        outside.mkdir()
+        entry = {
+            "status": "done",
+            "export": {"root": str(outside), "segments": ["seg_00"]},
+        }
+
+        snapshot = inspect_pipeline_entry(entry, sam3=None, output_root=output_root)
+
+        self.assertEqual((snapshot.stage, snapshot.status), ("sam3", "invalid"))
+        self.assertTrue(any("fora" in item for item in snapshot.inconsistencies))
+
+    def test_pipeline_marks_a_corrupt_mask_review_manifest_invalid(self) -> None:
+        from server.pipeline_state import inspect_pipeline_entry
+
+        output_root = Path(tempfile.mkdtemp())
+        segment = output_root / "video" / "seg_00"
+        out = segment / "_sam3"
+        out.mkdir(parents=True)
+        (segment / "prompt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frame_count": 1,
+                    "image_width": 8,
+                    "image_height": 6,
+                    "objects": [{"obj_id": 1, "label": "boom"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "done",
+                    "frame_count": 1,
+                    "frames_written": 1,
+                    "objects": [{"obj_id": 1}],
+                    "artifacts": {
+                        "format": "png-1bit-v1",
+                        "files": 1,
+                        "checksums": {"masks/1/000000.png": "a" * 64},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out / "mask_review.json").write_bytes(b'{"frames":')
+        entry = {
+            "status": "done",
+            "export": {
+                "root": str(output_root / "video"),
+                "segments": ["seg_00"],
+            },
+        }
+
+        snapshot = inspect_pipeline_entry(
+            entry, sam3={"state": "done"}, output_root=output_root
+        )
+
+        self.assertEqual((snapshot.stage, snapshot.status), ("sam3", "invalid"))
+        self.assertTrue(
+            any("mask_review.json" in item for item in snapshot.inconsistencies)
+        )
+
+    def test_pipeline_rejects_generation_from_a_different_annotation_revision(self) -> None:
+        from server.pipeline_state import inspect_pipeline_entry
+
+        root = Path(tempfile.mkdtemp())
+        export_root = root / "video"
+        segment = export_root / "seg_00"
+        published = export_root / "_sam3" / "runs" / "generation-old" / "seg_00"
+        segment.mkdir(parents=True)
+        published.mkdir(parents=True)
+        (export_root / "_sam3" / "current.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "generation_id": "generation-old",
+                    "annotation_revision": 3,
+                    "segments": {
+                        "seg_00": {
+                            "path": "runs/generation-old/seg_00",
+                            "prompt_digest": "d" * 64,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        entry = {
+            "status": "done",
+            "annotation_revision": 4,
+            "export": {"root": str(export_root), "segments": ["seg_00"]},
+        }
+
+        snapshot = inspect_pipeline_entry(entry, sam3=None, output_root=root)
+
+        self.assertEqual((snapshot.stage, snapshot.status), ("sam3", "invalid"))
+        self.assertTrue(
+            any("annotation_revision" in item for item in snapshot.inconsistencies)
+        )
+
     def test_only_fully_reviewed_valid_sam3_video_is_completed(self) -> None:
         from server.pipeline_state import classify_pipeline
 
