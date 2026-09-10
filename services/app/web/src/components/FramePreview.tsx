@@ -97,14 +97,14 @@ export function FramePreview({ videoId }: { videoId: string }) {
     automaticRecoveryRef.current = null;
     recoverySucceededRef.current = null;
     recoveryRequestRef.current += 1;
+    // O fallback full -> small vale somente para esta identidade. Ao trocar de
+    // frame com o player pausado, a preferencia segue "full" e por isso precisa
+    // ser aplicada explicitamente aqui.
+    setRequestedTier(preferredTier);
     setMissing(false);
     setRecoveryError(null);
     setLoading(true);
-  }, [videoId, frame]);
-
-  useEffect(() => {
-    setRequestedTier(preferredTier);
-  }, [preferredTier]);
+  }, [videoId, frame, preferredTier]);
 
   useEffect(() => {
     if (

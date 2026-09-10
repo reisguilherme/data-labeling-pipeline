@@ -6,6 +6,7 @@ import { MaskEditor } from "../components/MaskEditor";
 import { ReviewStrip } from "../components/ReviewStrip";
 import { Button, Kbd, Spinner } from "../components/ui";
 import { cx } from "../lib/format";
+import { installNavigationGuard } from "../lib/routes";
 import { useLibrary } from "../store/library";
 import { useReview } from "../store/review";
 
@@ -13,6 +14,7 @@ import { useReview } from "../store/review";
 // atrás. Sem isto, cada seta espera um download.
 const PREFETCH_AHEAD = 8;
 const PREFETCH_BEHIND = 2;
+const DISCARD_REVIEW_MESSAGE = "Há revisões ainda não salvas. Descartar?";
 
 export function ReviewView({
   video,
@@ -53,6 +55,7 @@ export function ReviewView({
   const [toolControlsTarget, setToolControlsTarget] = useState<HTMLElement | null>(null);
   const [adjustmentControlsTarget, setAdjustmentControlsTarget] = useState<HTMLElement | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+  const pendingReviewRef = useRef(false);
 
   const stagedReviewed = useMemo(() => {
     const reviewed = new Set(frames.filter((frame) => frame.status).map((frame) => frame.frame));
@@ -121,9 +124,19 @@ export function ReviewView({
   const hasPendingReview = Object.keys(drafts).length > 0 || [...visited].some(
     (frame) => !maskStates[frame]?.status,
   );
+  pendingReviewRef.current = hasPendingReview;
   const canLeaveReview = useCallback(
-    () => !hasPendingReview || window.confirm("Há revisões ainda não salvas. Descartar?"),
+    () => !hasPendingReview || window.confirm(DISCARD_REVIEW_MESSAGE),
     [hasPendingReview],
+  );
+
+  // Sidebar, logo, voltar e logout compartilham uma unica protecao. A ref
+  // acompanha o render atual sem reinstalar o guard a cada frame visitado.
+  useEffect(
+    () => installNavigationGuard(
+      () => !pendingReviewRef.current || window.confirm(DISCARD_REVIEW_MESSAGE),
+    ),
+    [],
   );
 
   useEffect(() => {
@@ -226,18 +239,19 @@ export function ReviewView({
           return;
         case "Escape":
           event.preventDefault();
-          if (canLeaveReview()) onBack();
+          onBack();
           return;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canLeaveReview, current, maskUnavailable, onBack]);
+  }, [current, maskUnavailable, onBack]);
 
   const saveSegment = useCallback(async () => {
     setCommitError(null);
     if (maskUnavailable) {
       await useReview.getState().confirmRest();
+      pendingReviewRef.current = false;
       void refreshPipeline();
       onBack();
       return;
@@ -275,6 +289,9 @@ export function ReviewView({
         );
       }
       const progress = await api.videoReview(video.video_id);
+      // setState so aparece no proximo render; a ref precisa ser zerada antes
+      // da navegacao pos-save para o guard nao pedir descarte outra vez.
+      pendingReviewRef.current = false;
       setVisited(new Set());
       setDrafts({});
       void refreshPipeline();
@@ -352,7 +369,7 @@ export function ReviewView({
   return (
     <div className="flex h-full flex-col">
       <header className="flex shrink-0 items-center gap-3 border-b border-zinc-800 px-4 py-2.5">
-        <Button variant="ghost" onClick={() => canLeaveReview() && onBack()}>
+        <Button variant="ghost" onClick={onBack}>
           ← biblioteca
         </Button>
         <h1 className="max-w-md truncate text-sm font-medium text-zinc-100">{video.name}</h1>
@@ -362,7 +379,13 @@ export function ReviewView({
             aria-label="Intervalo para revisar"
             value={segment ?? ""}
             onChange={(event) => {
-              if (canLeaveReview()) void open(video.video_id, event.target.value);
+              if (canLeaveReview()) {
+                pendingReviewRef.current = false;
+                setDrafts({});
+                setVisited(new Set());
+                setCommitError(null);
+                void open(video.video_id, event.target.value);
+              }
             }}
             className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
           >

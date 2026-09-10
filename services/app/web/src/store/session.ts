@@ -98,8 +98,10 @@ export const useSession = create<SessionState>((set, get) => ({
   },
 
   logout: async () => {
-    sessionGeneration += 1;
     await api.logout();
+    // Uma falha no POST deve preservar integralmente a sessao e os editores.
+    // A geracao so muda depois que o servidor confirmou o logout.
+    sessionGeneration += 1;
     useLibrary.getState().reset();
     setObject(null);
     set({ user: null, activeObject: null, error: null });

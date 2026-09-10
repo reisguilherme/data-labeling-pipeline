@@ -83,6 +83,19 @@ Ao terminar a extracao de frames, o worker CPU confirma o resultado diretamente
 na API interna antes de concluir o job. A navegacao ou o fechamento da tela nao
 interrompem a promocao do video nem o enfileiramento do SAM3.
 
+A API e o `sam3-worker` usam um protocolo unico de publicacao: cada job fixa a
+identidade do modelo e da revisao, recebe um diretorio de staging imutavel e
+devolve checksums antes de o servidor publicar a nova geracao. Por isso toda
+atualizacao de codigo deve reconstruir e recriar `app`, `worker` e
+`sam3-worker` juntos. O worker GPU permanece com exatamente uma replica; a fila
+PostgreSQL serializa os jobs recebidos de todos os usuarios sem carregar duas
+copias do modelo na VRAM.
+
+```powershell
+docker compose build app worker sam3-worker
+docker compose up -d --no-deps --force-recreate app worker sam3-worker
+```
+
 ## Operacao da interface
 
 A aplicacao usa URLs estaveis, que podem ser salvas como favoritos:

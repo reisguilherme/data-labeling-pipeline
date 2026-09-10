@@ -133,26 +133,32 @@ branch aprovada tiver sido enviada ao remoto). Nao substitua nem apague `.env`,
 `compose.override.yml`, `config/models.local.yaml`, `secrets/`, `data/`,
 `models/` ou `backups/`.
 
-Para a versao que torna a conclusao da exportacao independente do navegador,
-reconstrua e recrie apenas a API e o worker CPU:
+Reconstrua e recrie os tres processos de aplicacao. A API e o worker GPU agora
+compartilham o protocolo de geracoes SAM3 imutaveis: o job fixa modelo/revisao,
+o runner escreve somente no staging recebido e devolve checksums para a API
+validar antes da publicacao. Misturar uma API nova com um `sam3-worker` antigo
+pode deixar jobs sem publicacao, portanto eles devem ser atualizados juntos.
+Isso nao multiplica o uso de VRAM: `sam3-worker` continua singleton e recebe
+pela fila os jobs de todos os usuarios.
 
 ```bash
 git pull --ff-only
-docker compose build app worker
-docker compose up -d --no-deps --force-recreate app worker
+docker compose build app worker sam3-worker
+docker compose up -d --no-deps --force-recreate app worker sam3-worker
 docker compose ps
-docker compose logs --since 10m app worker
+docker compose logs --since 10m app worker sam3-worker
 ```
 
 Para a versao com projecao operacional, mantenha PostgreSQL ativo, mas app e
-workers parados. Depois do backup e do `git pull --ff-only`, construa a imagem e
-inicie app/worker para aplicar as migrations aditivas 005/006. So entao rode o
+workers parados. Depois do backup e do `git pull --ff-only`, construa as imagens
+e inicie app/worker/sam3-worker para aplicar as migrations aditivas 005/006 e
+manter o protocolo GPU sincronizado. So entao rode o
 dry-run. O reconciliador apenas verifica schema e marcadores, sem executar
 migration; se a 006 nao tiver rodado, ele falha com orientacao e sem escrita:
 
 ```bash
-docker compose build app worker
-docker compose up -d --no-deps --force-recreate app worker
+docker compose build app worker sam3-worker
+docker compose up -d --no-deps --force-recreate app worker sam3-worker
 ./scripts/reconcile-pipeline-projection.sh --limit 100
 ```
 
@@ -172,11 +178,12 @@ interpretado como video removido.
 
 Repita ate `resume_token` ser `null`; reexecutar e seguro. O apply grava somente
 nas tres tabelas aditivas de projecao. Nao grava anotacoes, revisoes, mascaras,
-midia, registro de objetos, MinIO ou outros indices. Depois, recrie app/worker e
-acompanhe os logs como no bloco anterior.
+midia, registro de objetos, MinIO ou outros indices. Depois, recrie
+app/worker/sam3-worker e acompanhe os logs como no bloco anterior.
 
-Rollback e por codigo: volte ao commit/imagem anterior e recrie app e worker,
-sem remover as migrations 005/006 e sem apagar suas tabelas. As linhas de
+Rollback e por codigo: volte ao commit/imagem anterior e recrie app, worker e
+sam3-worker da mesma versao, sem remover as migrations 005/006 e sem apagar
+suas tabelas. As linhas de
 projecao sao derivadas e inertes para o codigo antigo. O backup feito antes do
 rollout ja inclui o banco inteiro, portanto nao copie essas linhas separadamente;
 uma restauracao do `pg_dump` as recupera junto com o restante do PostgreSQL.

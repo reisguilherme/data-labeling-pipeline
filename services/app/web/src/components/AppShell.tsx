@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AppRoute } from "../lib/routes";
-import { navigate } from "../lib/routes";
+import { CONFIRMED_NAVIGATION, confirmNavigation, navigate } from "../lib/routes";
 import { useLibrary } from "../store/library";
 import { useSession } from "../store/session";
 import { PipelineSidebar } from "./PipelineSidebar";
@@ -83,11 +83,12 @@ export function AppShell({
             disabled={loggingOut}
             title={logoutError ?? undefined}
             onClick={async () => {
+              if (!confirmNavigation()) return;
               setLoggingOut(true);
               setLogoutError(null);
               try {
                 await logout();
-                navigate({ page: "objects" }, true);
+                navigate({ page: "objects" }, true, CONFIRMED_NAVIGATION);
               } catch (error) {
                 setLogoutError((error as Error).message);
                 setLoggingOut(false);

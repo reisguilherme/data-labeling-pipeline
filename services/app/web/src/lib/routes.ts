@@ -13,6 +13,15 @@ export type AppRoute =
 type NavigationGuard = () => boolean;
 let navigationGuard: NavigationGuard | null = null;
 
+/**
+ * Token explicito para uma navegacao cuja confirmacao ja aconteceu.
+ *
+ * Fluxos assincronos consultam o guard, aguardam o ACK do backend e usam este
+ * token para navegar sem apresentar uma segunda confirmacao.
+ */
+export const CONFIRMED_NAVIGATION = Symbol("confirmed-navigation");
+export type NavigationBypass = typeof CONFIRMED_NAVIGATION;
+
 const OPERATION_STAGES = new Set<OperationsStage>([
   "overview",
   "triage",
@@ -72,8 +81,16 @@ export function installNavigationGuard(guard: NavigationGuard): () => void {
   };
 }
 
-export function navigate(route: AppRoute | string, replace = false): boolean {
-  if (navigationGuard && !navigationGuard()) return false;
+export function confirmNavigation(): boolean {
+  return !navigationGuard || navigationGuard();
+}
+
+export function navigate(
+  route: AppRoute | string,
+  replace = false,
+  bypass?: NavigationBypass,
+): boolean {
+  if (bypass !== CONFIRMED_NAVIGATION && !confirmNavigation()) return false;
   const path = typeof route === "string" ? route : routePath(route);
   window.history[replace ? "replaceState" : "pushState"]({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));

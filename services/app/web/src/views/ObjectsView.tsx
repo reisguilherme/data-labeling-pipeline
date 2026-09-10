@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, watchJob } from "../api/client";
 import type { ObjectInfo } from "../api/types";
 import { Button, Spinner } from "../components/ui";
-import { navigate } from "../lib/routes";
+import { CONFIRMED_NAVIGATION, confirmNavigation, navigate } from "../lib/routes";
 import { useSession } from "../store/session";
 
 type Tab = "active" | "archived";
@@ -106,11 +106,12 @@ export function ObjectsView({ onOpen }: { onOpen: (objectId: string) => void }) 
             type="button"
             disabled={loggingOut}
             onClick={async () => {
+              if (!confirmNavigation()) return;
               setLoggingOut(true);
               setError(null);
               try {
                 await logout();
-                navigate({ page: "objects" }, true);
+                navigate({ page: "objects" }, true, CONFIRMED_NAVIGATION);
               } catch (exc) {
                 if (mountedRef.current) setError((exc as Error).message);
               } finally {
