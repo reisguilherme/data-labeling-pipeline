@@ -25,7 +25,7 @@ import os
 import re
 import shutil
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -1513,6 +1513,7 @@ def export_snapshot_atomic(
     owner: str,
     on_progress=None,
     before_publish=None,
+    publication_fence=None,
 ) -> dict:
     """Generate in an isolated directory and publish with one directory rename."""
     validate_snapshot(snapshot, object_id=ctx.object_id)
@@ -1570,15 +1571,17 @@ def export_snapshot_atomic(
         _validate_published_artifacts(staging, manifest)
         if before_publish is not None:
             before_publish()
-        try:
-            os.replace(staging, out_dir)
-        except OSError:
-            concurrent = _published_manifest(out_dir, snapshot["snapshot_id"])
-            if concurrent is None:
-                raise
-            _validate_published_artifacts(out_dir, concurrent)
-            shutil.rmtree(staging, ignore_errors=True)
-            return _result_from_manifest(out_dir, concurrent)
+        fence = publication_fence() if publication_fence is not None else nullcontext()
+        with fence:
+            try:
+                os.replace(staging, out_dir)
+            except OSError:
+                concurrent = _published_manifest(out_dir, snapshot["snapshot_id"])
+                if concurrent is None:
+                    raise
+                _validate_published_artifacts(out_dir, concurrent)
+                shutil.rmtree(staging, ignore_errors=True)
+                return _result_from_manifest(out_dir, concurrent)
         result["out_dir"] = out_dir.as_posix()
         return result
     except Exception:

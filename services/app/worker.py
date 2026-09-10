@@ -672,8 +672,11 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
 
 
 def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    from server import durable_jobs
     from server.dataset import (
+        _published_manifest,
         _safe_dataset_name,
+        _validate_published_artifacts,
         export_snapshot_atomic,
         validate_snapshot,
     )
@@ -706,6 +709,17 @@ def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
         ):
             raise Cancelled("lease perdido antes da publicacao do dataset")
 
+    @contextmanager
+    def publication_fence():
+        with durable_jobs.owned_job_lease(str(job["id"]), token) as owned:
+            if (
+                owned is None
+                or owned.get("kind") != "dataset_export"
+                or owned.get("object_id") != ctx.object_id
+            ):
+                raise Cancelled("lease perdido no commit do dataset")
+            yield
+
     result = export_snapshot_atomic(
         ctx,
         snapshot,
@@ -718,20 +732,57 @@ def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
         owner=f"{job['id']}:{token}",
         on_progress=progress,
         before_publish=before_publish,
+        publication_fence=publication_fence,
     )
     store = MinioBlobStore.from_env()
     if store is not None:
         prefix = f"{ctx.object_id}/{name}/generations/{snapshot['snapshot_id']}"
         stored = 0
-        for path in out_dir.rglob("*"):
-            if not path.is_file():
-                continue
+        manifest_path = out_dir / "dataset_manifest.json"
+        manifest = _published_manifest(out_dir, snapshot["snapshot_id"])
+        if manifest is None:
+            raise RuntimeError("dataset publicado sem manifesto")
+        _validate_published_artifacts(out_dir, manifest)
+        artifacts = sorted(
+            path
+            for path in out_dir.rglob("*")
+            if path.is_file() and path != manifest_path
+        )
+        total_files = len(artifacts) + 1
+        for index, path in enumerate(artifacts):
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {
+                    "current": index,
+                    "total": total_files,
+                    "message": "sincronizando dataset",
+                },
+            ):
+                raise Cancelled("lease perdido durante upload do dataset")
             store.put_file(
                 "datasets",
                 f"{prefix}/{path.relative_to(out_dir).as_posix()}",
                 path,
             )
             stored += 1
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {
+                "current": len(artifacts),
+                "total": total_files,
+                "message": "publicando manifesto do dataset",
+            },
+        ):
+            raise Cancelled("lease perdido antes do manifesto do dataset")
+        with publication_fence():
+            store.put_file(
+                "datasets",
+                f"{prefix}/dataset_manifest.json",
+                manifest_path,
+            )
+        stored += 1
         result["minio_prefix"] = f"datasets/{prefix}"
         result["minio_files"] = stored
     return result
