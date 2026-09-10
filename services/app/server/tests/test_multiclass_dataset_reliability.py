@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -141,6 +143,51 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
             test_fraction=0,
         )
 
+    def _install_legacy_published_override(self, ctx) -> Path:
+        """Model the short-lived layout that embedded an override in a run."""
+
+        export_root = ctx.output_root / "video"
+        segment = export_root / "seg_00"
+        source = segment / "_sam3"
+        published = export_root / "_sam3" / "runs" / "legacy-run" / "seg_00"
+        published.parent.mkdir(parents=True)
+        shutil.copytree(source, published)
+        override = {
+            "objects": [
+                {
+                    "obj_id": 1,
+                    "label": ctx.label,
+                    "normalized": [0.25, 0.25, 0.75, 0.75],
+                }
+            ]
+        }
+        override_payload = json.dumps(override).encode("utf-8")
+        (published / "prompt_override.json").write_bytes(override_payload)
+        prompt_payload = (segment / "prompt.json").read_bytes()
+        prompt_digest = hashlib.sha256(prompt_payload + override_payload).hexdigest()
+        marker_path = published / "run.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["prompt_digest"] = prompt_digest
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        control = export_root / "_sam3"
+        (control / "current.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "generation_id": "legacy-run",
+                    "annotation_revision": 9,
+                    "segments": {
+                        "seg_00": {
+                            "path": "runs/legacy-run/seg_00",
+                            "prompt_digest": prompt_digest,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return segment / "_sam3" / "prompt_override.json"
+
     def test_global_snapshot_freezes_all_object_runs_revisions_masks_and_split(self) -> None:
         builder = getattr(multiclass, "build_multiclass_snapshot", None)
         self.assertTrue(callable(builder), "build_multiclass_snapshot ausente")
@@ -222,6 +269,29 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
 
         self.assertEqual(result["frames"], 20)
         self.assertEqual(result["snapshot_id"], "a" * 64)
+
+    def test_real_preview_reads_a_legacy_published_override_without_migrating_it(self) -> None:
+        migrated = self._install_legacy_published_override(self.contexts[0])
+        self.assertFalse(migrated.exists())
+
+        with patch.object(
+            multiclass,
+            "_eligible_ids",
+            side_effect=lambda ctx, _: ["shared-video-id"]
+            if ctx.object_id == "boom"
+            else [],
+        ):
+            result = multiclass.preview_multiclass(
+                self.contexts,
+                [],
+                flags={},
+                include_empty=False,
+                task="detection",
+                workspace_root=self.root,
+            )
+
+        self.assertEqual(result["frames"], 1)
+        self.assertFalse(migrated.exists(), "preview escreveu estado de migracao")
 
     def test_unselected_class_does_not_read_or_block_on_its_live_annotations(self) -> None:
         original = dataset.build_snapshot
@@ -454,7 +524,7 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
             )
         self.assertTrue(replay["replayed"])
 
-    def test_new_lease_removes_only_staging_from_the_same_job(self) -> None:
+    def test_expired_lease_never_removes_the_active_retry_staging(self) -> None:
         snapshot = self._bound_snapshot()
         target = self.root / "_datasets" / "lease-global"
         staging_root = self.root / "_datasets" / ".staging"
@@ -468,20 +538,116 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
             owner_key = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:16]
             return staging_root / f"{name_key}-{snapshot_key}-{job_key}-{owner_key}"
 
-        abandoned = stage_for("job-1:expired-lease")
+        active_retry = stage_for("job-1:new-lease")
         unrelated = stage_for("job-2:valid-lease")
-        abandoned.mkdir()
+        active_retry.mkdir()
         unrelated.mkdir()
-        (abandoned / "partial.txt").write_text("partial", encoding="utf-8")
-        (unrelated / "partial.txt").write_text("active", encoding="utf-8")
+        (active_retry / "partial.txt").write_text("active", encoding="utf-8")
+        (unrelated / "partial.txt").write_text("unrelated", encoding="utf-8")
+
+        def observe_before_failure(*args, **kwargs):
+            self.assertTrue(
+                active_retry.exists(),
+                "uma tentativa antiga apagou o staging do retry ativo",
+            )
+            raise RuntimeError("stop after observing staging")
+
+        with patch.object(
+            multiclass, "export_multiclass", side_effect=observe_before_failure
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after observing staging"):
+                multiclass.export_multiclass_snapshot_atomic(
+                    self.root,
+                    snapshot,
+                    out_dir=target,
+                    fmt="yolo",
+                    task="detection",
+                    val_fraction=0,
+                    test_fraction=0,
+                    owner="job-1:expired-lease",
+                )
+
+        self.assertTrue(active_retry.exists())
+        self.assertTrue(unrelated.exists())
+
+    def test_stale_publication_fence_rejects_before_owned_staging_cleanup(self) -> None:
+        snapshot = self._bound_snapshot()
+        target = self.root / "_datasets" / "lease-fenced-global"
+        staging_root = self.root / "_datasets" / ".staging"
+        staging_root.mkdir(parents=True)
+        name_key = hashlib.sha256(target.name.encode("utf-8")).hexdigest()[:16]
+        snapshot_key = snapshot["snapshot_id"][:16]
+        job_key = hashlib.sha256(b"job-1").hexdigest()[:16]
+        active_retry = staging_root / (
+            f"{name_key}-{snapshot_key}-{job_key}-active-retry"
+        )
+        active_retry.mkdir()
+        (active_retry / "partial.txt").write_text("active", encoding="utf-8")
+
+        @contextmanager
+        def stale_lease():
+            raise RuntimeError("lease expirado")
+            yield
+
+        with patch.object(
+            multiclass,
+            "export_multiclass",
+            side_effect=AssertionError("lease expirada iniciou exportacao"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease expirado"):
+                multiclass.export_multiclass_snapshot_atomic(
+                    self.root,
+                    snapshot,
+                    out_dir=target,
+                    fmt="yolo",
+                    task="detection",
+                    val_fraction=0,
+                    test_fraction=0,
+                    owner="job-1:expired-lease",
+                    publication_fence=stale_lease,
+                )
+
+        self.assertTrue(active_retry.exists())
+
+    def test_current_lease_cleans_only_a_bounded_owned_staging_set(self) -> None:
+        snapshot = self._bound_snapshot()
+        target = self.root / "_datasets" / "bounded-cleanup-global"
+        staging_root = self.root / "_datasets" / ".staging"
+        staging_root.mkdir(parents=True)
+        name_key = hashlib.sha256(target.name.encode("utf-8")).hexdigest()[:16]
+        snapshot_key = snapshot["snapshot_id"][:16]
+        job_key = hashlib.sha256(b"job-1").hexdigest()[:16]
+        prefix = f"{name_key}-{snapshot_key}-{job_key}-"
+        owned = []
+        for index in range(10):
+            path = staging_root / f"{prefix}old-{index:02d}"
+            path.mkdir()
+            owned.append(path)
+        unrelated = staging_root / "another-job-active"
+        unrelated.mkdir()
+        published = self.root / "_datasets" / "already-published"
+        published.mkdir()
+        (published / "sentinel.txt").write_text("published", encoding="utf-8")
+
+        @contextmanager
+        def current_lease():
+            yield
 
         def inspect_cleanup(*args, **kwargs):
-            self.assertFalse(abandoned.exists())
+            self.assertEqual(sum(path.exists() for path in owned), 2)
             self.assertTrue(unrelated.exists())
-            raise RuntimeError("stop after observing cleanup")
+            self.assertEqual(
+                (published / "sentinel.txt").read_text(encoding="utf-8"),
+                "published",
+            )
+            raise RuntimeError("stop after bounded cleanup")
 
-        with patch.object(multiclass, "export_multiclass", side_effect=inspect_cleanup):
-            with self.assertRaisesRegex(RuntimeError, "stop after observing cleanup"):
+        with patch.object(
+            multiclass,
+            "export_multiclass",
+            side_effect=inspect_cleanup,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bounded cleanup"):
                 multiclass.export_multiclass_snapshot_atomic(
                     self.root,
                     snapshot,
@@ -491,9 +657,42 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
                     val_fraction=0,
                     test_fraction=0,
                     owner="job-1:new-lease",
+                    publication_fence=current_lease,
                 )
 
         self.assertTrue(unrelated.exists())
+        self.assertTrue((published / "sentinel.txt").exists())
+
+    def test_global_part_owns_frozen_frame_bytes_before_the_final_merge(self) -> None:
+        snapshot = self._bound_snapshot()
+        target = self.root / "_datasets" / "frozen-gap"
+        source = self.contexts[0].output_root / "video" / "seg_00" / "000000.jpg"
+        original = source.read_bytes()
+        original_export = dataset.export
+        mutated = False
+
+        def mutate_after_inner_export(*args, **kwargs):
+            nonlocal mutated
+            result = original_export(*args, **kwargs)
+            if not mutated:
+                source.write_bytes(b"changed-after-inner-export")
+                mutated = True
+            return result
+
+        with patch.object(dataset, "export", side_effect=mutate_after_inner_export):
+            multiclass.export_multiclass_snapshot_atomic(
+                self.root,
+                snapshot,
+                out_dir=target,
+                fmt="yolo",
+                task="detection",
+                val_fraction=0,
+                test_fraction=0,
+                owner="job-1",
+            )
+
+        image = next((target / "images" / "train").glob("boom__*.jpg"))
+        self.assertEqual(image.read_bytes(), original)
 
     def test_atomic_global_replay_accepts_new_observational_timestamps(self) -> None:
         snapshot = self._bound_snapshot()
@@ -613,6 +812,35 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
 
         self.assertFalse(target.exists())
 
+    def test_authoritative_publication_fence_wraps_the_irreversible_rename(self) -> None:
+        snapshot = self._bound_snapshot()
+        target = self.root / "_datasets" / "atomic-fence-global"
+        fence_entries = 0
+
+        @contextmanager
+        def cancellation_won():
+            nonlocal fence_entries
+            fence_entries += 1
+            if fence_entries == 2:
+                raise RuntimeError("cancelamento venceu antes do rename")
+            yield
+
+        with self.assertRaisesRegex(RuntimeError, "cancelamento venceu"):
+            multiclass.export_multiclass_snapshot_atomic(
+                self.root,
+                snapshot,
+                out_dir=target,
+                fmt="yolo",
+                task="detection",
+                val_fraction=0,
+                test_fraction=0,
+                owner="job-1:lease-1",
+                publication_fence=cancellation_won,
+            )
+
+        self.assertEqual(fence_entries, 2)
+        self.assertFalse(target.exists())
+
     def test_global_post_enqueues_bound_snapshot_with_target_idempotency(self) -> None:
         snapshot = self._bound_snapshot()
         request = dataset_router.GlobalExportIn(
@@ -659,10 +887,10 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
         self.assertEqual(create.call_args.kwargs["payload"]["snapshot"], snapshot)
         self.assertEqual(
             create.call_args.kwargs["idempotency_key"],
-            "dataset-export-global:nightly-global",
+            f"dataset-export-global:nightly-global:{snapshot['snapshot_id']}",
         )
 
-    def test_global_post_releases_a_new_reservation_when_job_creation_fails(self) -> None:
+    def test_ambiguous_job_commit_keeps_snapshot_reservation_and_retry_identity(self) -> None:
         snapshot = self._bound_snapshot()
         request = dataset_router.GlobalExportIn(
             object_ids=["boom"],
@@ -672,6 +900,17 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
             val_fraction=0,
             test_fraction=0,
         )
+
+        persisted: dict = {}
+        attempts = 0
+
+        def persisted_then_failed(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            persisted.update(kwargs)
+            if attempts == 1:
+                raise RuntimeError("connection lost after commit")
+            return "persisted-job"
 
         with patch.object(dataset_router.workspace, "root", self.root), patch.object(
             dataset_router, "_global_contexts", return_value=self.contexts[:1]
@@ -684,9 +923,9 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
         ), patch.object(
             dataset_router.durable_jobs,
             "create",
-            side_effect=RuntimeError("database unavailable"),
+            side_effect=persisted_then_failed,
         ):
-            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            with self.assertRaisesRegex(RuntimeError, "connection lost after commit"):
                 asyncio.run(
                     dataset_router.global_export(
                         request,
@@ -694,13 +933,32 @@ class GlobalDatasetSnapshotTests(unittest.TestCase):
                         client_id="client-1",
                     )
                 )
+            retry = asyncio.run(
+                dataset_router.global_export(
+                    request,
+                    user=SimpleNamespace(user_id="gui"),
+                    client_id="client-1",
+                )
+            )
 
-        reserved = dataset.reserve_dataset_target(
+        self.assertEqual(retry["job_id"], "persisted-job")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(
+            persisted["idempotency_key"],
+            f"dataset-export-global:failed-global:{snapshot['snapshot_id']}",
+        )
+        with self.assertRaises(dataset.DatasetTargetConflict):
+            dataset.reserve_dataset_target(
+                self.root / "_datasets",
+                "failed-global",
+                "b" * 64,
+            )
+        replay = dataset.reserve_dataset_target(
             self.root / "_datasets",
             "failed-global",
-            "b" * 64,
+            snapshot["snapshot_id"],
         )
-        self.assertEqual(reserved, self.root / "_datasets" / "failed-global")
+        self.assertEqual(replay, self.root / "_datasets" / "failed-global")
 
     def test_snapshot_reads_prompt_override_without_migrating_legacy_state(self) -> None:
         segment = self.contexts[0].output_root / "video" / "seg_00"

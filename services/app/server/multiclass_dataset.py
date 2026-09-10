@@ -6,13 +6,17 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 
 GLOBAL_SNAPSHOT_SCHEMA_VERSION = 1
+_STAGING_SCAN_LIMIT = 256
+_STAGING_DELETE_LIMIT = 8
 
 
 def _stable_multiclass_snapshot(snapshot: dict) -> dict:
@@ -735,6 +739,35 @@ def export_multiclass(
         raise
 
 
+def _cleanup_owned_staging_attempts(
+    staging_root: Path,
+    *,
+    attempt_prefix: str,
+) -> int:
+    """Remove a bounded number of attempts while an authoritative lease is held."""
+
+    removed = 0
+    scanned = 0
+    for previous in staging_root.iterdir():
+        if scanned >= _STAGING_SCAN_LIMIT or removed >= _STAGING_DELETE_LIMIT:
+            break
+        scanned += 1
+        if not previous.name.startswith(attempt_prefix):
+            continue
+        is_junction = getattr(previous, "is_junction", lambda: False)()
+        if previous.is_symlink() or is_junction or not previous.is_dir():
+            raise ValueError("staging global de dataset invalido")
+        try:
+            previous.resolve().relative_to(staging_root.resolve())
+        except (OSError, ValueError) as exc:
+            raise ValueError("staging global de dataset fora da raiz") from exc
+        if previous.resolve().parent != staging_root.resolve():
+            raise ValueError("staging global de dataset invalido")
+        shutil.rmtree(previous)
+        removed += 1
+    return removed
+
+
 def export_multiclass_snapshot_atomic(
     workspace_root: Path,
     snapshot: dict,
@@ -747,6 +780,7 @@ def export_multiclass_snapshot_atomic(
     owner: str,
     on_progress=None,
     before_publish=None,
+    publication_fence=None,
 ) -> dict:
     """Generate one frozen global dataset and publish it with one rename."""
     from .dataset import (
@@ -814,17 +848,18 @@ def export_multiclass_snapshot_atomic(
     job_key = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
     name_key = hashlib.sha256(out_dir.name.encode("utf-8")).hexdigest()[:16]
     attempt_prefix = f"{name_key}-{snapshot['snapshot_id'][:16]}-{job_key}-"
-    staging = staging_root / f"{attempt_prefix}{owner_key}"
-    for previous in list(staging_root.iterdir()):
-        if previous == staging or not previous.name.startswith(attempt_prefix):
-            continue
-        if previous.is_symlink() or not previous.is_dir():
-            raise ValueError("staging global de dataset invalido")
-        shutil.rmtree(previous)
-    if staging.exists():
-        if staging.is_symlink() or not staging.is_dir():
-            raise ValueError("staging global de dataset invalido")
-        shutil.rmtree(staging)
+    staging = staging_root / (
+        f"{attempt_prefix}{owner_key}-{uuid.uuid4().hex[:12]}"
+    )
+    # An attempt may clean predecessors only while its current database lease
+    # is locked. Without that authoritative fence, leaving garbage behind is
+    # safer than letting a stale process delete an active retry.
+    if publication_fence is not None:
+        with publication_fence():
+            _cleanup_owned_staging_attempts(
+                staging_root,
+                attempt_prefix=attempt_prefix,
+            )
 
     try:
         result = export_multiclass(
@@ -848,16 +883,18 @@ def export_multiclass_snapshot_atomic(
         _validate_published_artifacts(staging, manifest)
         if before_publish is not None:
             before_publish()
-        try:
-            os.replace(staging, out_dir)
-        except OSError:
-            concurrent = _published_manifest(out_dir, snapshot["snapshot_id"])
-            if concurrent is None:
-                raise
-            validate_manifest(concurrent)
-            _validate_published_artifacts(out_dir, concurrent)
-            shutil.rmtree(staging, ignore_errors=True)
-            return _result_from_manifest(out_dir, concurrent)
+        fence = publication_fence() if publication_fence is not None else nullcontext()
+        with fence:
+            try:
+                os.replace(staging, out_dir)
+            except OSError:
+                concurrent = _published_manifest(out_dir, snapshot["snapshot_id"])
+                if concurrent is None:
+                    raise
+                validate_manifest(concurrent)
+                _validate_published_artifacts(out_dir, concurrent)
+                shutil.rmtree(staging, ignore_errors=True)
+                return _result_from_manifest(out_dir, concurrent)
         result["out_dir"] = out_dir.as_posix()
         return result
     except Exception:

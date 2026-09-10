@@ -9,8 +9,9 @@ quase idênticos: separá-los entre treino e validação faz a métrica medir
 memorização, não generalização. O split é determinístico (hash do nome), então
 reexportar dá exatamente o mesmo recorte.
 
-**Hardlink em vez de cópia.** Os frames são 4K; o acervo tem ~10 mil. Copiar
-duplicaria dezenas de GB para nada. Cai para cópia se o filesystem recusar.
+**Snapshots publicados possuem os próprios bytes.** Exportações congeladas
+copiam os frames para que uma edição posterior na origem não altere um dataset
+já publicado. Exportações legadas sem snapshot ainda tentam hardlink primeiro.
 
 **A revisão humana ganha do SAM3.** É o mesmo merge de server/review.py: onde
 houver correção, ela vale; no resto, vale o bruto.
@@ -50,7 +51,6 @@ from .review import (
     corners_to_yolo,
     effective_boxes,
     load_review,
-    prompt_contract,
 )
 from .videos import iso
 
@@ -236,6 +236,60 @@ def _effective_prompt_identity(
         _sha256_bytes(raw_override) if raw_override is not None else None,
         _sha256_bytes(effective),
     )
+
+
+def _read_only_prompt_contract(
+    paths: SegmentPaths | _FrozenSegmentPaths,
+) -> dict:
+    """Read the effective prompt without performing legacy control migration."""
+
+    from pipeline_core.sam3_runs import effective_prompt_override_path
+
+    prompt_path = paths.segment_dir / "prompt.json"
+    try:
+        raw = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    objects = raw.get("objects") or []
+    override_path = effective_prompt_override_path(
+        paths.segment_dir,
+        migrate_legacy=False,
+    )
+    if override_path is not None:
+        try:
+            override = json.loads(override_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            override = {}
+        if isinstance(override, dict) and isinstance(override.get("objects"), list):
+            objects = override["objects"]
+
+    normalized_objects = []
+    for position, item in enumerate(objects, start=1):
+        if not isinstance(item, dict):
+            continue
+        box = item.get("box_normalized") or item.get("normalized")
+        if not isinstance(box, list) or len(box) != 4:
+            continue
+        normalized_objects.append(
+            {
+                "obj_id": int(item.get("obj_id") or position),
+                "label": item.get("label") or "",
+                "normalized": [float(value) for value in box],
+            }
+        )
+
+    return {
+        "image_width": raw.get("image_width"),
+        "image_height": raw.get("image_height"),
+        "source_start_frame": raw.get("source_start_frame"),
+        "frame_idx": int(raw.get("prompt_frame_idx") or 0),
+        "flags": raw.get("flags") or {},
+        "label": normalized_objects[0]["label"] if normalized_objects else None,
+        "objects": normalized_objects,
+    }
 
 
 def _relative_child(path: Path, root: Path, *, description: str) -> str:
@@ -667,7 +721,7 @@ def collect(ctx, filters: Filters, workspace_root: Path | None) -> list[Candidat
                 continue
 
             media = entry.get("media") or {}
-            prompt = prompt_contract(paths)
+            prompt = _read_only_prompt_contract(paths)
             labels = {
                 int(item["obj_id"]): item.get("label") or ""
                 for item in prompt.get("objects") or []
@@ -765,6 +819,23 @@ def _link_or_copy(source: Path, destination: Path) -> None:
         os.link(source, destination)
     except OSError:
         shutil.copy2(source, destination)
+
+
+def _materialize_image(
+    source: Path,
+    destination: Path,
+    *,
+    immutable: bool,
+) -> None:
+    """Own snapshot bytes; only legacy live exports may share an inode."""
+
+    if not immutable:
+        _link_or_copy(source, destination)
+        return
+    if destination.exists():
+        raise FileExistsError(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
 
 
 def _candidates_from_snapshot(ctx, snapshot: dict) -> list[Candidate]:
@@ -1015,7 +1086,11 @@ def export(
             per_split[split] = per_split.get(split, 0) + 1
 
             if fmt == "yolo":
-                _link_or_copy(image_path, out_dir / "images" / split / f"{stem}.jpg")
+                _materialize_image(
+                    image_path,
+                    out_dir / "images" / split / f"{stem}.jpg",
+                    immutable=snapshot is not None,
+                )
                 lines = []
                 if task == "segmentation" and mask_state is not None:
                     for instance in mask_state.instances:
@@ -1063,7 +1138,11 @@ def export(
                     "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
                 )
             else:
-                _link_or_copy(image_path, out_dir / split / f"{stem}.jpg")
+                _materialize_image(
+                    image_path,
+                    out_dir / split / f"{stem}.jpg",
+                    immutable=snapshot is not None,
+                )
                 bucket = coco.setdefault(
                     split,
                     {
@@ -1377,21 +1456,22 @@ def dataset_target_job_reservation(
     name: str,
     snapshot_id: str,
 ):
-    """Keep target reservation and durable-job creation in one critical section."""
+    """Serialize reservation and durable-job creation, failing closed.
+
+    A database commit can succeed even when its acknowledgement is lost.  In
+    that ambiguous state removing the reservation would let a different
+    snapshot claim the same target while the first durable job still exists.
+    Retry of the same snapshot is idempotent; explicit deletion releases it.
+    """
 
     name = _safe_dataset_name(name)
     with _dataset_reservation_lock(datasets_root):
-        out_dir, created = _reserve_dataset_target_locked(
+        out_dir, _ = _reserve_dataset_target_locked(
             datasets_root,
             name,
             snapshot_id,
         )
-        try:
-            yield out_dir
-        except BaseException:
-            if created:
-                _reservation_path(datasets_root, name).unlink(missing_ok=True)
-            raise
+        yield out_dir
 
 
 def release_dataset_target(datasets_root: Path, name: str) -> None:

@@ -415,7 +415,9 @@ async def global_export(
                 object_id="global",
                 priority=70,
                 payload=job_payload,
-                idempotency_key=f"dataset-export-global:{name}",
+                idempotency_key=(
+                    f"dataset-export-global:{name}:{snapshot['snapshot_id']}"
+                ),
             )
 
     try:

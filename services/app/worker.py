@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -736,6 +737,7 @@ def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
 
 
 def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    from server import durable_jobs
     from server.dataset import _safe_dataset_name
     from server.config import settings
     from server.multiclass_dataset import (
@@ -766,6 +768,13 @@ def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) ->
         ):
             raise Cancelled("lease perdido antes da publicacao do dataset global")
 
+    @contextmanager
+    def publication_fence():
+        with durable_jobs.owned_job_lease(str(job["id"]), token) as owned:
+            if owned is None or owned.get("kind") != "dataset_export_global":
+                raise Cancelled("lease perdido no commit do dataset global")
+            yield
+
     result = export_multiclass_snapshot_atomic(
         root,
         snapshot,
@@ -777,26 +786,31 @@ def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) ->
         owner=f"{job['id']}:{token}",
         on_progress=progress,
         before_publish=before_publish,
+        publication_fence=publication_fence,
     )
     store = MinioBlobStore.from_env()
     if store is not None:
         prefix = f"global/{name}/generations/{snapshot['snapshot_id']}"
         stored = 0
-        files = sorted(path for path in out_dir.rglob("*") if path.is_file())
         manifest_path = out_dir / "dataset_manifest.json"
         if not manifest_path.is_file():
             raise RuntimeError("dataset global publicado sem manifesto")
         # The manifest is the generation commit marker for MinIO readers.  A
         # failed upload may leave immutable blobs behind, but never a manifest
         # that advertises an incomplete generation.
-        files = [path for path in files if path != manifest_path] + [manifest_path]
-        for index, path in enumerate(files):
+        artifacts = sorted(
+            path
+            for path in out_dir.rglob("*")
+            if path.is_file() and path != manifest_path
+        )
+        total_files = len(artifacts) + 1
+        for index, path in enumerate(artifacts):
             if not queue.update_progress(
                 str(job["id"]),
                 token,
                 {
                     "current": index,
-                    "total": len(files),
+                    "total": total_files,
                     "message": "sincronizando dataset global",
                 },
             ):
@@ -809,6 +823,26 @@ def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) ->
                 path,
             )
             stored += 1
+        if not queue.update_progress(
+            str(job["id"]),
+            token,
+            {
+                "current": len(artifacts),
+                "total": total_files,
+                "message": "publicando manifesto do dataset global",
+            },
+        ):
+            raise Cancelled("lease perdido antes do manifesto do dataset global")
+        # The database row remains locked through the irreversible commit-marker
+        # PUT. A cancellation already committed wins the lock and prevents this
+        # upload; one arriving afterwards observes the publication as first.
+        with publication_fence():
+            store.put_file(
+                "datasets",
+                f"{prefix}/dataset_manifest.json",
+                manifest_path,
+            )
+        stored += 1
         result["minio_prefix"] = f"datasets/{prefix}"
         result["minio_files"] = stored
     return result

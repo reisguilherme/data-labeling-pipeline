@@ -397,16 +397,20 @@ class DatasetSnapshotTests(unittest.TestCase):
 
     def test_export_rechecks_source_frame_after_generation(self) -> None:
         snapshot = self._snapshot()
-        original_link = dataset._link_or_copy
+        original_materialize = dataset._materialize_image
 
-        def mutate_after_link(source: Path, destination: Path) -> None:
-            original_link(source, destination)
+        def mutate_after_materialize(
+            source: Path, destination: Path, *, immutable: bool
+        ) -> None:
+            original_materialize(source, destination, immutable=immutable)
             stat = source.stat()
             source.touch()
             if source.stat().st_mtime_ns == stat.st_mtime_ns:
                 source.write_bytes(source.read_bytes() + b"changed")
 
-        with patch.object(dataset, "_link_or_copy", side_effect=mutate_after_link):
+        with patch.object(
+            dataset, "_materialize_image", side_effect=mutate_after_materialize
+        ):
             with self.assertRaisesRegex(ValueError, "frame selecionado mudou"):
                 dataset.export(
                     self.ctx,
