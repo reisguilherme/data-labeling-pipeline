@@ -262,6 +262,117 @@ def reserve_intent(
     return _intent_from_row(row)
 
 
+def reserve_repair_intent(
+    *,
+    object_id: str,
+    video_id: str,
+    source_identity: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    database_url: str | None = None,
+    connect: ConnectArg = None,
+) -> tuple[ProjectionIntent | None, ProjectionRecord | None]:
+    """Atomically reserve a repair newer than every active event for a video.
+
+    If the current projection already matches both canonical identity and
+    derived snapshot and no newer active intent exists, the current record is
+    returned without allocating an event.  Concurrent/retried repairs reuse a
+    single pending event.
+    """
+
+    object_id = _validate_identifier("object_id", object_id)
+    video_id = _validate_identifier("video_id", video_id)
+    identity_json = _canonical_json(source_identity, field="source_identity")
+    snapshot_json = _canonical_json(snapshot, field="snapshot")
+    source_digest = _source_digest(identity_json)
+    event_kind = "projection_repair"
+    connection = _open_connection(database_url, connect)
+    if connection is None:
+        return None, None
+
+    with connection:
+        with connection.cursor() as cursor:
+            _configure_transaction(cursor)
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (_video_lock_key(object_id, video_id),),
+            )
+            cursor.execute(
+                f"""
+                SELECT {_RECORD_COLUMNS}
+                  FROM video_pipeline_projection
+                 WHERE object_id = %s AND video_id = %s
+                 FOR UPDATE
+                """,
+                (object_id, video_id),
+            )
+            current_row = cursor.fetchone()
+            current = _record_from_row(current_row) if current_row else None
+            cursor.execute(
+                f"""
+                SELECT {_INTENT_COLUMNS}
+                  FROM video_pipeline_projection_events
+                 WHERE object_id = %s AND video_id = %s
+                   AND status <> 'superseded'
+                 ORDER BY event_seq DESC
+                 LIMIT 1
+                 FOR UPDATE
+                """,
+                (object_id, video_id),
+            )
+            latest_row = cursor.fetchone()
+            latest = _intent_from_row(latest_row) if latest_row else None
+
+            current_matches = bool(
+                current is not None
+                and _canonical_json(
+                    current.source_identity, field="current source_identity"
+                )
+                == identity_json
+                and _canonical_json(current.snapshot, field="current snapshot")
+                == snapshot_json
+            )
+            if current_matches and (
+                latest is None or latest.event_seq <= current.event_seq
+            ):
+                return None, current
+            if (
+                latest is not None
+                and latest.status == "pending"
+                and latest.event_kind == event_kind
+                and _canonical_json(
+                    latest.source_identity, field="repair source_identity"
+                )
+                == identity_json
+            ):
+                return latest, None
+
+            # An applied repair with this deterministic key may point at a
+            # manually corrupted snapshot, or an older pending repair may have
+            # been overtaken by another mutation.  Retire it under the same
+            # per-video lock before allocating the new monotonic event.
+            cursor.execute(
+                """
+                UPDATE video_pipeline_projection_events
+                   SET status = 'superseded', updated_at = now()
+                 WHERE object_id = %s AND video_id = %s
+                   AND event_kind = %s AND source_digest = %s
+                   AND status <> 'superseded'
+                """,
+                (object_id, video_id, event_kind, source_digest),
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO video_pipeline_projection_events
+                    (object_id, video_id, event_kind, source_identity, source_digest)
+                VALUES (%s, %s, %s, %s::jsonb, %s)
+                RETURNING {_INTENT_COLUMNS}
+                """,
+                (object_id, video_id, event_kind, identity_json, source_digest),
+            )
+            row = cursor.fetchone()
+    return _intent_from_row(row), None
+
+
 def _event_seq(intent: ProjectionIntent | int) -> int:
     value = intent.event_seq if isinstance(intent, ProjectionIntent) else intent
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

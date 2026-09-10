@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +86,79 @@ def _json_digest(value: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def mask_review_manifest_identity(path: Path) -> dict:
+_REVIEW_SHA256 = re.compile(r"[0-9a-f]{64}")
+_REVIEW_FRAME_KEY = re.compile(r"(?:0|[1-9][0-9]{0,11})")
+
+
+def _review_instance_valid(item: object, *, frame: int, revision: int) -> bool:
+    if not isinstance(item, dict):
+        return False
+    obj_id = item.get("obj_id")
+    label = item.get("label")
+    relative = item.get("path")
+    checksum = item.get("sha256")
+    area = item.get("area_pixels")
+    bbox = item.get("bbox_normalized")
+    if (
+        type(obj_id) is not int
+        or obj_id <= 0
+        or not isinstance(label, str)
+        or not label
+        or not isinstance(relative, str)
+        or not isinstance(checksum, str)
+        or _REVIEW_SHA256.fullmatch(checksum) is None
+        or type(area) is not int
+        or area < 0
+    ):
+        return False
+
+    raw_path = f"masks/{obj_id}/{frame:06d}.png"
+    match = re.fullmatch(
+        rf"reviews/{frame:06d}/rev_([0-9]{{6,12}})/{obj_id}\.png", relative
+    )
+    if relative != raw_path and (
+        match is None
+        or int(match.group(1)) <= 0
+        or int(match.group(1)) > revision
+    ):
+        return False
+
+    if area == 0:
+        return bbox is None
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return False
+    coordinates: list[float] = []
+    for value in bbox:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        coordinate = float(value)
+        if not math.isfinite(coordinate) or coordinate < 0 or coordinate > 1:
+            return False
+        coordinates.append(coordinate)
+    x1, y1, x2, y2 = coordinates
+    return x1 < x2 and y1 < y2
+
+
+def _review_obj_ids(value: object) -> list[int] | None:
+    if not isinstance(value, list):
+        return None
+    result: list[int] = []
+    for item in value:
+        if type(item) is not int or item <= 0:
+            return None
+        result.append(item)
+    if result != sorted(set(result)):
+        return None
+    return result
+
+
+def mask_review_manifest_identity(
+    path: Path,
+    *,
+    expected_frames: int | None = None,
+    expected_obj_ids: set[int] | None = None,
+    expected_obj_labels: dict[int, str] | None = None,
+) -> dict:
     """Return a deterministic, bounded identity for ``mask_review.json``.
 
     Timestamps and filesystem metadata are deliberately excluded.  The
@@ -127,7 +201,7 @@ def mask_review_manifest_identity(path: Path) -> dict:
         }
     try:
         value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return {
             "state": "invalid",
             "sha256": hashlib.sha256(raw).hexdigest(),
@@ -143,7 +217,7 @@ def mask_review_manifest_identity(path: Path) -> dict:
         }
     try:
         digest = _json_digest(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {
             "state": "invalid",
             "sha256": hashlib.sha256(raw).hexdigest(),
@@ -167,11 +241,19 @@ def mask_review_manifest_identity(path: Path) -> dict:
     for frame, entry in frames.items():
         if (
             not isinstance(frame, str)
-            or not frame.isdigit()
-            or int(frame) < 0
+            or _REVIEW_FRAME_KEY.fullmatch(frame) is None
             or not isinstance(entry, dict)
+            or not isinstance(entry.get("status"), str)
             or entry.get("status") not in STATUSES
         ):
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
+        frame_number = int(frame)
+        if expected_frames is not None and not 0 <= frame_number < expected_frames:
             return {
                 "state": "invalid",
                 "sha256": digest,
@@ -190,6 +272,93 @@ def mask_review_manifest_identity(path: Path) -> dict:
             }
         else:
             revisions.append(revision)
+
+        if "by" in entry and entry.get("by") is not None and not isinstance(
+            entry.get("by"), str
+        ):
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
+        if "history" in entry and not isinstance(entry.get("history"), list):
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
+
+        if entry.get("status") == "edited":
+            instances = entry.get("instances")
+            deleted = _review_obj_ids(entry.get("deleted_obj_ids"))
+            retained = (
+                _review_obj_ids(entry.get("retain_obj_ids"))
+                if "retain_obj_ids" in entry
+                else []
+            )
+            if (
+                not isinstance(instances, list)
+                or deleted is None
+                or retained is None
+                or revision is None
+                or any(
+                    not _review_instance_valid(
+                        item, frame=frame_number, revision=revision
+                    )
+                    for item in instances
+                )
+            ):
+                return {
+                    "state": "invalid",
+                    "sha256": digest,
+                    "max_revision": max(revisions, default=0),
+                    "reviewed_frames": reviewed,
+                }
+            instance_ids = [item["obj_id"] for item in instances]
+            if (
+                instance_ids != sorted(set(instance_ids))
+                or set(instance_ids) & set(deleted)
+                or set(retained) & set(deleted)
+                or not set(retained).issubset(instance_ids)
+                or (
+                    expected_obj_ids is not None
+                    and set(instance_ids) | set(deleted) != expected_obj_ids
+                )
+                or (
+                    expected_obj_ids is not None
+                    and not set(instance_ids).issubset(expected_obj_ids)
+                )
+                or (
+                    expected_obj_labels is not None
+                    and any(
+                        expected_obj_labels.get(item["obj_id"]) != item["label"]
+                        for item in instances
+                    )
+                )
+            ):
+                return {
+                    "state": "invalid",
+                    "sha256": digest,
+                    "max_revision": max(revisions, default=0),
+                    "reviewed_frames": reviewed,
+                }
+            # retain_obj_ids belongs to the write request, not the persisted
+            # effective manifest.  Old manifests that leaked it remain
+            # auditable but can never be projected as completed.
+            if "retain_obj_ids" in entry:
+                legacy = True
+        elif any(
+            field in entry
+            for field in ("instances", "deleted_obj_ids", "retain_obj_ids")
+        ):
+            return {
+                "state": "invalid",
+                "sha256": digest,
+                "max_revision": max(revisions, default=0),
+                "reviewed_frames": reviewed,
+            }
         reviewed += 1
 
     return {

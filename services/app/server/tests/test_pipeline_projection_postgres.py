@@ -12,6 +12,7 @@ from server.pipeline_projection import (
     get_many,
     pending_intents,
     reserve_intent,
+    reserve_repair_intent,
 )
 
 
@@ -163,6 +164,97 @@ class PipelineProjectionPostgresTests(unittest.TestCase):
         self.assertGreater(second_a.event_seq, b.event_seq)
         self.assertEqual(current.event_seq, second_a.event_seq)
         self.assertEqual(current.snapshot["identity"], "a-restored")
+
+    def test_repair_is_newer_than_an_unpublished_pending_mutation(self) -> None:
+        source_a = {"identity": "a"}
+        snapshot_a = {"pipeline_stage": "completed", "complete": True}
+        applied_a = reserve_intent(
+            object_id="boom", video_id="video-1", event_kind="reconcile",
+            source_identity=source_a, connect=self._connect,
+        )
+        apply_intent(applied_a, snapshot_a, connect=self._connect)
+        pending_b = reserve_intent(
+            object_id="boom", video_id="video-1", event_kind="mutation",
+            source_identity={"identity": "b"}, connect=self._connect,
+        )
+
+        repair, current = reserve_repair_intent(
+            object_id="boom", video_id="video-1", source_identity=source_a,
+            snapshot=snapshot_a, connect=self._connect,
+        )
+
+        self.assertIsNone(current)
+        self.assertGreater(repair.event_seq, pending_b.event_seq)
+        repaired = apply_intent(repair, snapshot_a, connect=self._connect)
+        self.assertEqual(repaired.source_identity, source_a)
+        with self._connect() as connection:
+            state_b = connection.execute(
+                "SELECT status FROM video_pipeline_projection_events WHERE event_seq=%s",
+                (pending_b.event_seq,),
+            ).fetchone()[0]
+        self.assertEqual(state_b, "superseded")
+
+    def test_repair_rewrites_corrupt_snapshot_then_becomes_idempotent(self) -> None:
+        source = {"identity": "a"}
+        expected = {"pipeline_stage": "completed", "complete": True}
+        original = reserve_intent(
+            object_id="boom", video_id="video-1", event_kind="reconcile",
+            source_identity=source, connect=self._connect,
+        )
+        apply_intent(original, expected, connect=self._connect)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE video_pipeline_projection SET snapshot=%s::jsonb "
+                "WHERE object_id='boom' AND video_id='video-1'",
+                ('{"complete":false,"pipeline_stage":"broken"}',),
+            )
+
+        repair, current = reserve_repair_intent(
+            object_id="boom", video_id="video-1", source_identity=source,
+            snapshot=expected, connect=self._connect,
+        )
+        self.assertIsNone(current)
+        self.assertGreater(repair.event_seq, original.event_seq)
+        fixed = apply_intent(repair, expected, connect=self._connect)
+
+        retry, unchanged = reserve_repair_intent(
+            object_id="boom", video_id="video-1", source_identity=source,
+            snapshot=expected, connect=self._connect,
+        )
+        self.assertIsNone(retry)
+        self.assertEqual(unchanged.event_seq, fixed.event_seq)
+        with self._connect() as connection:
+            count = connection.execute(
+                "SELECT count(*) FROM video_pipeline_projection_events "
+                "WHERE object_id='boom' AND video_id='video-1'"
+            ).fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_concurrent_repair_reservations_reuse_one_pending_event(self) -> None:
+        source = {"identity": "a"}
+        snapshot = {"pipeline_stage": "review", "complete": False}
+        barrier = threading.Barrier(2)
+        results = []
+
+        def reserve() -> None:
+            barrier.wait(timeout=5)
+            results.append(
+                reserve_repair_intent(
+                    object_id="boom", video_id="video-1",
+                    source_identity=source, snapshot=snapshot,
+                    connect=self._connect,
+                )[0]
+            )
+
+        threads = [threading.Thread(target=reserve) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item is not None for item in results))
+        self.assertEqual(results[0].event_seq, results[1].event_seq)
 
     def test_failed_intent_never_persists_unterminated_json_secret_tails(self) -> None:
         intent = reserve_intent(

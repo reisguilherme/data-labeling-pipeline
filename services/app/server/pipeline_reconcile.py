@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 
 from .pipeline_projection import (
     ProjectionIntent,
     ProjectionRecord,
     apply_intent,
     fail_intent,
-    reserve_intent,
+    reserve_repair_intent,
 )
 from .pipeline_state import PipelineSnapshot, PipelineSource, derive_pipeline_source
 from .sam3 import queue as sam3_queue
 from .video_fence import video_fence
+from .workspace import workspace
 
 
 def _terminal_source(
@@ -44,22 +46,6 @@ def _terminal_source(
     )
 
 
-def _same_pending_intent(
-    intent: ProjectionIntent | None,
-    *,
-    object_id: str,
-    video_id: str,
-    source_identity: dict[str, Any],
-) -> bool:
-    return bool(
-        intent is not None
-        and intent.status == "pending"
-        and intent.object_id == object_id
-        and intent.video_id == video_id
-        and intent.source_identity == source_identity
-    )
-
-
 def _record_failure(intent: ProjectionIntent | None, error: Exception) -> None:
     if intent is None:
         return
@@ -71,17 +57,29 @@ def _record_failure(intent: ProjectionIntent | None, error: Exception) -> None:
         pass
 
 
+def _authoritative_archived(ctx, object_id: str) -> bool:
+    """Reload object lifecycle metadata without constructing/scanning a context."""
+
+    config = getattr(ctx, "config", None)
+    if workspace.ready:
+        # Workspace.get refreshes only objects.json and invalidates stale cached
+        # contexts.  It deliberately does not scan the video's media root.
+        config = workspace.get(object_id)
+    return bool(getattr(config, "archived", False))
+
+
 def reconcile_video(
     ctx,
     video_id: str,
     *,
     intent: ProjectionIntent | None = None,
+    publication_fence: Callable[[], AbstractContextManager] | None = None,
 ) -> ProjectionRecord | None:
     """Rebuild and conditionally apply one video's projection.
 
-    A matching pending intent is resumed directly.  If canonical metadata has
-    changed since that intent was reserved, a new monotonic intent is reserved
-    and the store's conditional apply supersedes the stale event.
+    A caller-provided intent is only an event-kind hint.  The store always
+    revalidates the current active event for the freshly derived identity;
+    this is what makes a cached A intent safe after an A -> B -> A cycle.
     """
 
     object_id = str(getattr(ctx, "object_id", "") or "").strip()
@@ -95,15 +93,13 @@ def reconcile_video(
     ):
         raise ValueError("intent pertence a outro objeto ou video")
 
-    selected: ProjectionIntent | None = intent
+    selected: ProjectionIntent | None = None
     try:
         # The source read and event allocation must share the same fence as
         # canonical writers.  Otherwise an old read could reserve a newer
         # event_seq while another process is publishing newer metadata.
         with video_fence(object_id, video_id):
-            archived = bool(
-                getattr(getattr(ctx, "config", None), "archived", False)
-            )
+            archived = _authoritative_archived(ctx, object_id)
             if archived:
                 source = _terminal_source(
                     object_id=object_id,
@@ -132,26 +128,21 @@ def reconcile_video(
                     sam3 = sam3_queue.public(object_id, video.relpath)
                     source = derive_pipeline_source(entry, sam3, ctx.output_root)
 
-            if not _same_pending_intent(
-                intent,
-                object_id=object_id,
-                video_id=video_id,
-                source_identity=source.identity,
-            ):
-                # A stale caller-provided intent belongs to the old canonical
-                # identity.  If reserving the replacement fails, leave that old
-                # event untouched instead of attributing the database failure to
-                # unrelated source metadata.
-                selected = None
-                selected = reserve_intent(
+            commit_guard = publication_fence() if publication_fence else nullcontext()
+            # Writers use the same outer order: video -> publication/job ->
+            # projection.  The guard revalidates ownership at commit time.
+            with commit_guard:
+                selected, current = reserve_repair_intent(
                     object_id=object_id,
                     video_id=video_id,
-                    event_kind="reconcile",
                     source_identity=source.identity,
+                    snapshot=source.snapshot_dict,
                 )
-            if selected is None:
-                return None
-            return apply_intent(selected, source.snapshot_dict)
+                if current is not None:
+                    return current
+                if selected is None:
+                    return None
+                return apply_intent(selected, source.snapshot_dict)
     except Exception as exc:
         _record_failure(selected, exc)
         raise

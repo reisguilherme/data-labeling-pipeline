@@ -6,13 +6,15 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import contextmanager
+import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import server.pipeline_state as pipeline_state
+import server.pipeline_projection as projection_store
 from server.pipeline_projection import ProjectionIntent, ProjectionRecord
 
 try:
@@ -305,6 +307,81 @@ class PipelineSourceIdentityTests(unittest.TestCase):
         self.assertEqual(source.snapshot.validation_status, "invalid")
         self.assertFalse(source.snapshot_dict["complete"])
 
+    def test_edited_review_requires_a_complete_effective_instance_manifest(self) -> None:
+        malformed = copy.deepcopy(self.fixture.review)
+        malformed["frames"]["0"] = {
+            "revision": 1,
+            "status": "edited",
+            "instances": [{"obj_id": 1}],
+            "deleted_obj_ids": [],
+        }
+        _write_json(self.fixture.active_output / "mask_review.json", malformed)
+
+        source = _derive(self.fixture.entry, self.sam3, self.fixture.output_root)
+
+        self.assertEqual(
+            source.identity["segments"][0]["mask_review"]["state"], "invalid"
+        )
+        self.assertEqual(source.snapshot.validation_status, "invalid")
+        self.assertFalse(source.snapshot_dict["complete"])
+
+    def test_edited_review_effective_manifest_field_matrix_is_fail_closed(self) -> None:
+        valid_instance = {
+            "obj_id": 1,
+            "label": "boom",
+            "path": "masks/1/000000.png",
+            "sha256": "a" * 64,
+            "area_pixels": 1,
+            "bbox_normalized": [0.1, 0.1, 0.2, 0.2],
+        }
+
+        def review_with(instance=None, *, deleted=None, retained_marker=False):
+            frame = {
+                "revision": 1,
+                "status": "edited",
+                "instances": [copy.deepcopy(instance or valid_instance)],
+                "deleted_obj_ids": [] if deleted is None else deleted,
+            }
+            if retained_marker:
+                frame["retain_obj_ids"] = [1]
+            return {"schema_version": 1, "frames": {"0": frame}}
+
+        baseline = review_with()
+        _write_json(self.fixture.active_output / "mask_review.json", baseline)
+        valid = _derive(self.fixture.entry, self.sam3, self.fixture.output_root)
+        self.assertEqual(valid.snapshot.stage, "completed")
+
+        unknown = {**valid_instance, "obj_id": 2, "path": "masks/2/000000.png"}
+        cases = {
+            "instances": {"schema_version": 1, "frames": {"0": {
+                "revision": 1, "status": "edited", "instances": {},
+                "deleted_obj_ids": [],
+            }}},
+            "obj_id": review_with(unknown),
+            "label": review_with({**valid_instance, "label": []}),
+            "wrong-label": review_with({**valid_instance, "label": "microfone"}),
+            "path": review_with({**valid_instance, "path": "../mask.png"}),
+            "checksum": review_with({**valid_instance, "sha256": "bad"}),
+            "area": review_with({**valid_instance, "area_pixels": True}),
+            "bbox": review_with({**valid_instance, "bbox_normalized": [0, 0, 2, 1]}),
+            "deleted": review_with(deleted={}),
+            "retain-overlap": review_with(retained_marker=True),
+        }
+        for name, manifest in cases.items():
+            with self.subTest(field=name):
+                _write_json(
+                    self.fixture.active_output / "mask_review.json", manifest
+                )
+                source = _derive(
+                    self.fixture.entry, self.sam3, self.fixture.output_root
+                )
+                self.assertNotEqual(source.snapshot.stage, "completed")
+                self.assertFalse(source.snapshot_dict["complete"])
+                self.assertIn(
+                    source.identity["segments"][0]["mask_review"]["state"],
+                    {"invalid", "legacy"},
+                )
+
     def test_unsafe_generation_identifier_fails_closed_without_escaping_derivation(self) -> None:
         _write_json(
             self.fixture.export_root / "_sam3" / "current.json",
@@ -347,6 +424,73 @@ class PipelineSourceIdentityTests(unittest.TestCase):
 
         self.assertEqual(source.snapshot.stage, "completed")
 
+    def test_source_derivation_does_not_reread_control_json_without_bounds(self) -> None:
+        with patch.object(
+            Path,
+            "read_text",
+            side_effect=AssertionError("leitura JSON integral sem limite"),
+        ), patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("leitura integral sem limite"),
+        ):
+            source = _derive(
+                self.fixture.entry, self.sam3, self.fixture.output_root
+            )
+
+        self.assertEqual(source.snapshot.stage, "completed")
+        self.assertEqual(source.snapshot.validation_status, "manifest")
+
+    def test_malformed_control_value_matrix_always_fails_closed(self) -> None:
+        cases = (
+            ("entry-array", lambda fixture, entry, sam3: ([{}], sam3)),
+            (
+                "annotation-status-array",
+                lambda fixture, entry, sam3: ({**entry, "status": []}, sam3),
+            ),
+            (
+                "export-array",
+                lambda fixture, entry, sam3: ({**entry, "export": [{}]}, sam3),
+            ),
+            (
+                "segments-object",
+                lambda fixture, entry, sam3: (
+                    {**entry, "export": {**entry["export"], "segments": {}}},
+                    sam3,
+                ),
+            ),
+            ("sam3-array", lambda fixture, entry, sam3: (entry, [{}])),
+            (
+                "sam3-state-array",
+                lambda fixture, entry, sam3: (entry, {**sam3, "state": []}),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                fixture = _CanonicalVideo(Path(tempfile.mkdtemp()))
+                entry, sam3 = mutate(
+                    fixture, copy.deepcopy(fixture.entry), copy.deepcopy(self.sam3)
+                )
+                try:
+                    source = _derive(entry, sam3, fixture.output_root)
+                except Exception as exc:  # noqa: BLE001 - fail-closed contract
+                    self.fail(f"{name} escapou da derivacao: {exc}")
+                self.assertEqual(source.snapshot.validation_status, "invalid")
+                self.assertFalse(source.snapshot_dict["complete"])
+
+        fixture = _CanonicalVideo(Path(tempfile.mkdtemp()))
+        malformed_review = copy.deepcopy(fixture.review)
+        malformed_review["frames"] = {
+            "9" * 5_000: {"revision": 1, "status": "ok"}
+        }
+        _write_json(fixture.active_output / "mask_review.json", malformed_review)
+        try:
+            source = _derive(fixture.entry, self.sam3, fixture.output_root)
+        except Exception as exc:  # noqa: BLE001 - fail-closed contract
+            self.fail(f"review frame hostil escapou da derivacao: {exc}")
+        self.assertEqual(source.snapshot.validation_status, "invalid")
+        self.assertFalse(source.snapshot_dict["complete"])
+
 
 class _Store:
     def __init__(self, relpath: str, entry: dict) -> None:
@@ -372,13 +516,18 @@ class _Index:
         return None
 
 
-def _intent(identity: dict, *, event_seq: int = 11) -> ProjectionIntent:
+def _intent(
+    identity: dict,
+    *,
+    event_seq: int = 11,
+    event_kind: str = "reconcile",
+) -> ProjectionIntent:
     now = datetime(2026, 9, 10, tzinfo=timezone.utc)
     return ProjectionIntent(
         event_seq=event_seq,
         object_id="boom",
         video_id="video-1",
-        event_kind="reconcile",
+        event_kind=event_kind,
         source_identity=copy.deepcopy(identity),
         status="pending",
         error=None,
@@ -427,16 +576,24 @@ class PipelineReconciliationTests(unittest.TestCase):
             projected_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
         )
 
-    def test_pending_intent_with_same_identity_is_applied_without_new_reservation(self) -> None:
+    def test_cached_pending_intent_is_revalidated_by_reservation_before_apply(self) -> None:
         source = _derive(self.fixture.entry, self.sam3, self.fixture.output_root)
-        pending = _intent(source.identity)
+        pending = _intent(source.identity, event_kind="annotation_saved")
+        reserved = _intent(
+            source.identity, event_seq=12, event_kind="annotation_saved"
+        )
+        reservations: list[dict] = []
+
+        def reserve(**kwargs):
+            reservations.append(kwargs)
+            return reserved, None
 
         with patch.object(
             pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
         ), patch.object(
             pipeline_reconcile,
-            "reserve_intent",
-            side_effect=AssertionError("intent igual nao deve ser reservado novamente"),
+            "reserve_repair_intent",
+            side_effect=reserve,
         ), patch.object(
             pipeline_reconcile,
             "apply_intent",
@@ -446,7 +603,8 @@ class PipelineReconciliationTests(unittest.TestCase):
                 self.ctx, "video-1", intent=pending
             )
 
-        self.assertEqual(record.event_seq, 11)
+        self.assertEqual(record.event_seq, 12)
+        self.assertEqual(reservations[0]["snapshot"], record.snapshot)
         self.assertEqual(record.snapshot["pipeline_stage"], "completed")
         self.assertEqual(self.ctx.store.loads, 1)
 
@@ -464,7 +622,15 @@ class PipelineReconciliationTests(unittest.TestCase):
 
         def reserve(**kwargs):
             events.append("reserve")
-            return _intent(kwargs["source_identity"])
+            return _intent(kwargs["source_identity"]), None
+
+        @contextmanager
+        def publication():
+            events.append("publication-enter")
+            try:
+                yield
+            finally:
+                events.append("publication-exit")
 
         def apply(intent, snapshot):
             events.append("apply")
@@ -475,11 +641,45 @@ class PipelineReconciliationTests(unittest.TestCase):
         ), patch.object(
             pipeline_reconcile, "video_fence", fence, create=True
         ), patch.object(
-            pipeline_reconcile, "reserve_intent", side_effect=reserve
+            pipeline_reconcile, "reserve_repair_intent", side_effect=reserve
         ), patch.object(pipeline_reconcile, "apply_intent", side_effect=apply):
-            pipeline_reconcile.reconcile_video(self.ctx, "video-1")
+            pipeline_reconcile.reconcile_video(
+                self.ctx, "video-1", publication_fence=publication
+            )
 
-        self.assertEqual(events, ["enter", "reserve", "apply", "exit"])
+        self.assertEqual(
+            events,
+            [
+                "enter",
+                "publication-enter",
+                "reserve",
+                "apply",
+                "publication-exit",
+                "exit",
+            ],
+        )
+
+    def test_rejected_publication_fence_prevents_projection_write(self) -> None:
+        @contextmanager
+        def rejected():
+            raise RuntimeError("lease perdida")
+            yield  # pragma: no cover
+
+        with patch.object(
+            pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
+        ), patch.object(
+            pipeline_reconcile,
+            "reserve_repair_intent",
+            side_effect=AssertionError("nao deve reservar sem lease"),
+        ), patch.object(
+            pipeline_reconcile,
+            "apply_intent",
+            side_effect=AssertionError("nao deve aplicar sem lease"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease perdida"):
+                pipeline_reconcile.reconcile_video(
+                    self.ctx, "video-1", publication_fence=rejected
+                )
 
     def test_changed_source_reserves_a_new_event_instead_of_applying_old_pending(self) -> None:
         old = _intent({"schema_version": 1, "annotation": {"revision": 6}})
@@ -488,7 +688,7 @@ class PipelineReconciliationTests(unittest.TestCase):
 
         def reserve(**kwargs):
             newer_identity = kwargs["source_identity"]
-            return _intent(newer_identity, event_seq=12)
+            return _intent(newer_identity, event_seq=12), None
 
         def apply(intent, snapshot):
             applied_events.append(intent.event_seq)
@@ -496,7 +696,7 @@ class PipelineReconciliationTests(unittest.TestCase):
 
         with patch.object(
             pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
-        ), patch.object(pipeline_reconcile, "reserve_intent", side_effect=reserve), patch.object(
+        ), patch.object(pipeline_reconcile, "reserve_repair_intent", side_effect=reserve), patch.object(
             pipeline_reconcile, "apply_intent", side_effect=apply
         ):
             record = pipeline_reconcile.reconcile_video(
@@ -513,11 +713,11 @@ class PipelineReconciliationTests(unittest.TestCase):
         def reserve(**kwargs):
             digest = json.dumps(kwargs["source_identity"], sort_keys=True)
             reserved.setdefault(digest, _intent(kwargs["source_identity"]))
-            return reserved[digest]
+            return reserved[digest], None
 
         with patch.object(
             pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
-        ), patch.object(pipeline_reconcile, "reserve_intent", side_effect=reserve), patch.object(
+        ), patch.object(pipeline_reconcile, "reserve_repair_intent", side_effect=reserve), patch.object(
             pipeline_reconcile,
             "apply_intent",
             side_effect=lambda intent, snapshot: self._applied(intent, snapshot),
@@ -533,9 +733,9 @@ class PipelineReconciliationTests(unittest.TestCase):
         ctx = _context(self.fixture, present=False)
 
         def reserve(**kwargs):
-            return _intent(kwargs["source_identity"])
+            return _intent(kwargs["source_identity"]), None
 
-        with patch.object(pipeline_reconcile, "reserve_intent", side_effect=reserve), patch.object(
+        with patch.object(pipeline_reconcile, "reserve_repair_intent", side_effect=reserve), patch.object(
             pipeline_reconcile,
             "apply_intent",
             side_effect=lambda intent, snapshot: self._applied(intent, snapshot),
@@ -550,9 +750,9 @@ class PipelineReconciliationTests(unittest.TestCase):
         ctx = _context(self.fixture, archived=True)
 
         def reserve(**kwargs):
-            return _intent(kwargs["source_identity"])
+            return _intent(kwargs["source_identity"]), None
 
-        with patch.object(pipeline_reconcile, "reserve_intent", side_effect=reserve), patch.object(
+        with patch.object(pipeline_reconcile, "reserve_repair_intent", side_effect=reserve), patch.object(
             pipeline_reconcile,
             "apply_intent",
             side_effect=lambda intent, snapshot: self._applied(intent, snapshot),
@@ -563,6 +763,56 @@ class PipelineReconciliationTests(unittest.TestCase):
         self.assertEqual(record.snapshot["stage_status"], "archived")
         self.assertFalse(record.snapshot["complete"])
         self.assertEqual(ctx.store.loads, 0)
+
+    def test_archive_state_is_reloaded_from_registry_without_scanning_media(self) -> None:
+        ctx = _context(self.fixture, archived=False)
+        registry = SimpleNamespace(
+            ready=True,
+            get=lambda object_id: SimpleNamespace(archived=True),
+        )
+
+        with patch.object(pipeline_reconcile, "workspace", registry, create=True), patch.object(
+            pipeline_reconcile.sam3_queue,
+            "public",
+            side_effect=AssertionError("objeto arquivado nao deve ler fila ou midia"),
+        ), patch.object(
+            pipeline_reconcile,
+            "reserve_repair_intent",
+            side_effect=lambda **kwargs: (_intent(kwargs["source_identity"]), None),
+        ), patch.object(
+            pipeline_reconcile,
+            "apply_intent",
+            side_effect=lambda intent, snapshot: self._applied(intent, snapshot),
+        ):
+            record = pipeline_reconcile.reconcile_video(ctx, "video-1")
+
+        self.assertTrue(record.source_identity["object"]["archived"])
+        self.assertEqual(record.snapshot["stage_status"], "archived")
+        self.assertEqual(ctx.store.loads, 0)
+
+    def test_restore_state_is_reloaded_from_registry_before_reconciliation(self) -> None:
+        ctx = _context(self.fixture, archived=True)
+        registry = SimpleNamespace(
+            ready=True,
+            get=lambda object_id: SimpleNamespace(archived=False),
+        )
+
+        with patch.object(pipeline_reconcile, "workspace", registry, create=True), patch.object(
+            pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
+        ), patch.object(
+            pipeline_reconcile,
+            "reserve_repair_intent",
+            side_effect=lambda **kwargs: (_intent(kwargs["source_identity"]), None),
+        ), patch.object(
+            pipeline_reconcile,
+            "apply_intent",
+            side_effect=lambda intent, snapshot: self._applied(intent, snapshot),
+        ):
+            record = pipeline_reconcile.reconcile_video(ctx, "video-1")
+
+        self.assertNotIn("object", record.source_identity)
+        self.assertEqual(record.snapshot["pipeline_stage"], "completed")
+        self.assertEqual(ctx.store.loads, 1)
 
     def test_apply_failure_keeps_intent_pending_with_sanitized_failure_path(self) -> None:
         pending = _intent({})
@@ -576,8 +826,8 @@ class PipelineReconciliationTests(unittest.TestCase):
             pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
         ), patch.object(
             pipeline_reconcile,
-            "reserve_intent",
-            side_effect=lambda **kwargs: _intent(kwargs["source_identity"]),
+            "reserve_repair_intent",
+            side_effect=lambda **kwargs: (_intent(kwargs["source_identity"]), None),
         ), patch.object(
             pipeline_reconcile, "apply_intent", side_effect=RuntimeError("database down")
         ), patch.object(pipeline_reconcile, "fail_intent", side_effect=fail):
@@ -595,7 +845,7 @@ class PipelineReconciliationTests(unittest.TestCase):
             pipeline_reconcile.sam3_queue, "public", return_value=self.sam3
         ), patch.object(
             pipeline_reconcile,
-            "reserve_intent",
+            "reserve_repair_intent",
             side_effect=RuntimeError("database down before reserve"),
         ), patch.object(pipeline_reconcile, "fail_intent") as fail:
             with self.assertRaisesRegex(RuntimeError, "before reserve"):
@@ -604,6 +854,98 @@ class PipelineReconciliationTests(unittest.TestCase):
                 )
 
         fail.assert_not_called()
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "TEST_DATABASE_URL ausente")
+class PipelineReconcilePostgresTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import psycopg
+
+        self.psycopg = psycopg
+        self.url = os.environ["TEST_DATABASE_URL"]
+        self.schema = "pipeline_reconcile_test_" + uuid.uuid4().hex
+        migration = (
+            Path(__file__).resolve().parents[4]
+            / "migrations"
+            / "005_video_pipeline_projection.sql"
+        ).read_text(encoding="utf-8")
+        with psycopg.connect(self.url, autocommit=True) as connection:
+            connection.execute(f'CREATE SCHEMA "{self.schema}"')
+            connection.execute(f'SET search_path TO "{self.schema}"')
+            connection.execute(migration)
+
+    def tearDown(self) -> None:
+        with self.psycopg.connect(self.url, autocommit=True) as connection:
+            connection.execute(f'DROP SCHEMA IF EXISTS "{self.schema}" CASCADE')
+
+    def _connect(self):
+        return self.psycopg.connect(
+            self.url,
+            options=f"-c search_path={self.schema}",
+            connect_timeout=5,
+        )
+
+    def test_cached_old_pending_a_is_not_reused_after_b_was_applied(self) -> None:
+        fixture = _CanonicalVideo(Path(tempfile.mkdtemp()))
+        ctx = _context(fixture)
+        sam3 = {
+            "state": "done",
+            "annotation_revision": 7,
+            "run_id": "generation-a",
+        }
+        source_a = _derive(fixture.entry, sam3, fixture.output_root)
+        cached_a = projection_store.reserve_intent(
+            object_id="boom",
+            video_id="video-1",
+            event_kind="reconcile",
+            source_identity=source_a.identity,
+            connect=self._connect,
+        )
+        b = projection_store.reserve_intent(
+            object_id="boom",
+            video_id="video-1",
+            event_kind="mutation",
+            source_identity={"identity": "b"},
+            connect=self._connect,
+        )
+        projection_store.apply_intent(
+            b,
+            {"pipeline_stage": "triage", "complete": False},
+            connect=self._connect,
+        )
+
+        with patch.object(
+            pipeline_reconcile.sam3_queue, "public", return_value=sam3
+        ), patch.object(
+            pipeline_reconcile,
+            "video_fence",
+            side_effect=lambda *_: nullcontext(),
+        ), patch.object(
+            pipeline_reconcile,
+            "reserve_repair_intent",
+            side_effect=lambda **kwargs: projection_store.reserve_repair_intent(
+                **kwargs, connect=self._connect
+            ),
+        ), patch.object(
+            pipeline_reconcile,
+            "apply_intent",
+            side_effect=lambda intent, snapshot: projection_store.apply_intent(
+                intent, snapshot, connect=self._connect
+            ),
+        ), patch.object(
+            pipeline_reconcile,
+            "fail_intent",
+            side_effect=lambda intent, error: projection_store.fail_intent(
+                intent, error, connect=self._connect
+            ),
+        ):
+            repaired = pipeline_reconcile.reconcile_video(
+                ctx, "video-1", intent=cached_a
+            )
+
+        self.assertGreater(repaired.event_seq, b.event_seq)
+        self.assertEqual(repaired.source_identity, source_a.identity)
+        self.assertTrue(repaired.snapshot["complete"])
 
 
 if __name__ == "__main__":
