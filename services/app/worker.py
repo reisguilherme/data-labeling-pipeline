@@ -19,6 +19,7 @@ from typing import Callable
 
 from pipeline_core.jobs import PostgresJobQueue
 from pipeline_core.storage import MinioBlobStore
+from server.pipeline_projection_jobs import run_projection_reconcile
 
 
 class Cancelled(RuntimeError):
@@ -1179,6 +1180,8 @@ def main() -> int:
                 result = run_video_export(job, queue, token)
             elif job["kind"] == "video_export_cleanup":
                 result = run_video_export_cleanup(job, queue, token)
+            elif job["kind"] == "pipeline_projection_reconcile":
+                result = run_projection_reconcile(job)
             else:
                 raise ValueError(f"job CPU sem handler registrado: {job['kind']}")
             if lease_errors:

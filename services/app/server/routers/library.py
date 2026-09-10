@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from starlette.responses import FileResponse, Response
 
-from .. import media
+from .. import durable_jobs, media, pipeline_projection
 from ..deps import get_object
 from ..locks import locks
-from ..pipeline_state import inspect_pipeline_entry
+from ..pipeline_state import PipelineSnapshot, derive_pipeline_source, inspect_pipeline_entry
 from ..sam3 import queue as sam3_queue
 from ..singleflight import AsyncSingleFlight
 from ..workspace import ObjectContext
@@ -18,6 +20,8 @@ from ..workspace import ObjectContext
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["library"])
 _listing_singleflight = AsyncSingleFlight()
 _STORE_ENTRY_UNSET = object()
+_REPAIR_LIMIT = 20
+log = logging.getLogger(__name__)
 
 
 def video_payload(
@@ -28,6 +32,7 @@ def video_payload(
     sam3=None,
     *,
     store_entry=_STORE_ENTRY_UNSET,
+    pipeline=None,
 ) -> dict:
     entry = (
         ctx.store.entry(video.relpath)
@@ -36,7 +41,8 @@ def video_payload(
     )
     status = entry.get("status", "pending") if entry else "pending"
     intervals = entry.get("intervals", []) if entry else []
-    pipeline = inspect_pipeline_entry(entry, sam3, ctx.output_root)
+    if pipeline is None:
+        pipeline = inspect_pipeline_entry(entry, sam3, ctx.output_root)
     return {
         "video_id": video.video_id,
         "relpath": video.relpath,
@@ -65,6 +71,41 @@ def video_payload(
     }
 
 
+def _verified_snapshot(record, source):
+    """Accept only a current, exactly matching and well-formed projection."""
+    if record is None:
+        return None, "missing"
+    state = getattr(record, "projection_status", "stale")
+    if state != "current":
+        return None, "pending" if state == "pending" else "stale"
+    if record.source_identity != source.identity:
+        return None, "stale"
+    value = record.snapshot
+    try:
+        counts = [value[key] for key in ("expected_frames", "reviewed_frames", "edited_frames")]
+        if any(type(count) is not int or count < 0 for count in counts):
+            return None, "stale"
+        if value["pipeline_stage"] not in {"triage", "sam3", "review", "completed", "discarded"}:
+            return None, "stale"
+        if not isinstance(value["stage_status"], str) or type(value["artifacts_valid"]) is not bool:
+            return None, "stale"
+        if not isinstance(value["validation_status"], str) or not isinstance(value["inconsistencies"], list):
+            return None, "stale"
+        if value["pipeline_stage"] == "completed" or value.get("complete"):
+            if not (value["pipeline_stage"] == "completed" and value["stage_status"] == "validated"
+                    and value.get("complete") is True and value["artifacts_valid"] is True
+                    and value["validation_status"] == "manifest" and counts[0] > 0 and counts[1] >= counts[0]):
+                return None, "stale"
+        return PipelineSnapshot(
+            stage=value["pipeline_stage"], status=value["stage_status"],
+            expected_frames=counts[0], reviewed_frames=counts[1], edited_frames=counts[2],
+            artifacts_valid=value["artifacts_valid"], validation_status=value["validation_status"],
+            inconsistencies=tuple(value["inconsistencies"]),
+        ), "current"
+    except (KeyError, TypeError):
+        return None, "stale"
+
+
 def _build_video_listing(
     ctx: ObjectContext,
     search: str | None = None,
@@ -75,17 +116,43 @@ def _build_video_listing(
     sam3_state = sam3_queue.map_for(ctx.object_id)
     videos = ctx.index.all()
     store_entries, counts = ctx.store.listing_snapshot(len(videos))
-    items = [
-        video_payload(
+    try:
+        projections = pipeline_projection.get_many(ctx.object_id, [v.video_id for v in videos])
+    except Exception:
+        log.warning("Pipeline projection lookup unavailable for object %s", ctx.object_id)
+        projections = {}
+    items = []
+    repairs = []
+    for video in videos:
+        entry = store_entries.get(video.relpath)
+        sam3 = sam3_state.get(video.relpath)
+        source = derive_pipeline_source(entry, sam3, ctx.output_root)
+        record = projections.get(video.video_id)
+        pipeline, projection_status = _verified_snapshot(record, source)
+        if pipeline is None:
+            pipeline = source.snapshot
+            if pipeline.stage == "completed":
+                pipeline = replace(pipeline, stage="review", status="projection_pending")
+            if len(repairs) < _REPAIR_LIMIT:
+                repairs.append({"video_id": video.video_id, "source_identity": source.identity})
+        item = video_payload(
             ctx,
             video,
             ctx.index.cached_probe(video.video_id),
             held.get(video.video_id),
-            sam3_state.get(video.relpath),
-            store_entry=store_entries.get(video.relpath),
+            sam3,
+            store_entry=entry,
+            pipeline=pipeline,
         )
-        for video in videos
-    ]
+        item["projection_status"] = projection_status
+        projected_at = getattr(record, "projected_at", None)
+        item["projected_at"] = projected_at.isoformat() if projected_at else None
+        items.append(item)
+    if repairs:
+        try:
+            durable_jobs.enqueue_projection_reconciles(ctx.object_id, repairs)
+        except Exception:
+            log.warning("Pipeline projection repair queue unavailable for object %s", ctx.object_id)
     pipeline_counts: dict[str, int] = {}
     pipeline_status_counts: dict[str, int] = {}
     for item in items:

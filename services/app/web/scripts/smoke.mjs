@@ -448,6 +448,8 @@ const SCENARIOS = {
       pipeline_counts: { review: 1 },
       videos: [
         video("rev-b", "em-progresso", "done", {
+          projection_status: "stale",
+          projected_at: "2026-09-10T00:00:00Z",
           pipeline_stage: "review",
           stage_status: "in_progress",
           interval_count: 2,
@@ -460,6 +462,7 @@ const SCENARIOS = {
       ["Detalhes do vídeo", "detalhes abrem em contexto próprio"],
       ["4 de 12 frames revisados", "painel explica o progresso"],
       ["1 frame editado", "painel mostra correções"],
+      ["Atualização pendente", "projeção desatualizada tem indicador sem bloquear a revisão"],
       ["2 trechos", "painel mostra intervalos"],
       ["Fechar detalhes", "painel possui fechamento explícito"],
     ],
@@ -497,6 +500,8 @@ const SCENARIOS = {
           stage_status: "ready",
         }),
         video("validated", "validado-final", "done", {
+          projection_status: "current",
+          projected_at: "2026-09-10T00:00:00Z",
           pipeline_stage: "completed",
           stage_status: "validated",
           stage_progress: { expected_frames: 7, reviewed_frames: 7, edited_frames: 1, artifacts_valid: true, inconsistencies: [] },
@@ -505,6 +510,7 @@ const SCENARIOS = {
     },
     expect: [
       ["validado-final", "vÃ­deo integralmente revisado aparece em ConcluÃ­dos"],
+      ["7/7", "projeção atual preserva contagens verificadas"],
     ],
     reject: [
       ["apenas-triado", "vÃ­deo apenas triado nÃ£o aparece em ConcluÃ­dos"],

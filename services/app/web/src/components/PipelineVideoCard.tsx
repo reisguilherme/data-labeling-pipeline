@@ -1,5 +1,6 @@
 import type { PipelineStage, VideoListItem } from "../api/types";
 import { formatDuration } from "../lib/format";
+import { projectionNeedsRefresh } from "../store/library";
 
 const STATUS_LABELS: Record<string, string> = {
   pending: "Pendente",
@@ -15,6 +16,7 @@ const STATUS_LABELS: Record<string, string> = {
   waiting: "Aguardando",
   inconsistent: "Com inconsistência",
   validated: "Validado",
+  projection_pending: "Revisado",
 };
 
 function primaryLabel(video: VideoListItem, stage: PipelineStage): string {
@@ -65,6 +67,9 @@ export function PipelineVideoCard({
       <div className="flex flex-1 flex-col gap-3 p-3">
         <div>
           <h3 className="truncate text-sm font-medium text-zinc-100" title={video.relpath}>{video.name}</h3>
+          {projectionNeedsRefresh(video) && (
+            <p className="mt-1 text-xs text-amber-300" title="O estado está sendo atualizado. Você pode continuar trabalhando.">Atualização pendente</p>
+          )}
           <p className="mt-1 text-xs text-zinc-400">
             {video.interval_count} {video.interval_count === 1 ? "trecho" : "trechos"}
             {video.lock && ` · ${video.lock.user} está triando`}

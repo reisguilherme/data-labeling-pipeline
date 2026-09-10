@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from server.routers import library
 from server.store import AnnotationStore
+from server.pipeline_state import PipelineSource, PipelineSnapshot
 
 
 class _FakeIndex:
@@ -158,10 +159,9 @@ class LibraryResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             def blocking_pipeline(*_args: object, **_kwargs: object) -> object:
                 pipeline_started.set()
                 release_pipeline.wait(timeout=2)
-                return SimpleNamespace(
-                    stage="ready",
-                    status="ready",
-                    public_progress=lambda: {},
+                return PipelineSource(
+                    identity={},
+                    snapshot=PipelineSnapshot(stage="triage", status="pending"),
                 )
 
             def release_after_writer_observation() -> None:
@@ -179,7 +179,7 @@ class LibraryResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(library.locks, "map_for", return_value={}),
                 patch.object(library.sam3_queue, "map_for", return_value={}),
-                patch.object(library, "inspect_pipeline_entry", blocking_pipeline),
+                patch.object(library, "derive_pipeline_source", blocking_pipeline),
             ):
                 listing = asyncio.create_task(library.list_videos(ctx=ctx))
                 started = await asyncio.wait_for(

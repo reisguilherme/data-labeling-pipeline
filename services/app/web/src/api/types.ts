@@ -369,6 +369,8 @@ export interface VideoListItem {
   pipeline_stage: PipelineStage;
   stage_status: string;
   stage_progress: StageProgress;
+  projection_status?: "current" | "stale" | "missing" | "pending";
+  projected_at?: string | null;
 }
 
 export interface VideoListResponse {

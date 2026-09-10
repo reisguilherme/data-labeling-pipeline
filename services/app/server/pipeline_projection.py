@@ -104,6 +104,7 @@ class ProjectionRecord:
     source_identity: dict[str, Any]
     snapshot: dict[str, Any]
     projected_at: datetime | None
+    projection_status: str = "current"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -210,6 +211,7 @@ def _record_from_row(row: tuple[Any, ...]) -> ProjectionRecord:
         source_identity=copy.deepcopy(row[3] or {}),
         snapshot=copy.deepcopy(row[4] or {}),
         projected_at=row[5],
+        projection_status=row[6] if len(row) > 6 else "current",
     )
 
 
@@ -443,10 +445,29 @@ def get_many(
         with connection.cursor() as cursor:
             _configure_transaction(cursor)
             cursor.execute(
-                f"""
-                SELECT {_RECORD_COLUMNS}
-                  FROM video_pipeline_projection
-                 WHERE object_id = %s AND video_id = ANY(%s)
+                """
+                WITH requested AS (
+                    SELECT %s::text AS object_id, unnest(%s::text[]) AS video_id
+                )
+                SELECT r.object_id, r.video_id, COALESCE(p.event_seq, latest.event_seq),
+                       COALESCE(p.source_identity, latest.source_identity),
+                       COALESCE(p.snapshot, '{}'::jsonb), p.projected_at,
+                       CASE WHEN latest.status = 'pending'
+                                 AND (p.event_seq IS NULL OR latest.event_seq > p.event_seq)
+                            THEN 'pending'
+                            WHEN applied.status = 'applied' AND latest.event_seq = p.event_seq
+                            THEN 'current' ELSE 'stale' END
+                  FROM requested r
+                  LEFT JOIN video_pipeline_projection p
+                    ON p.object_id = r.object_id AND p.video_id = r.video_id
+                  LEFT JOIN video_pipeline_projection_events applied ON applied.event_seq = p.event_seq
+                  LEFT JOIN LATERAL (
+                      SELECT event_seq, status, source_identity FROM video_pipeline_projection_events e
+                       WHERE e.object_id = r.object_id AND e.video_id = r.video_id
+                         AND e.status <> 'superseded'
+                       ORDER BY event_seq DESC LIMIT 1
+                  ) latest ON TRUE
+                 WHERE p.event_seq IS NOT NULL OR latest.status = 'pending'
                 """,
                 (object_id, ids),
             )

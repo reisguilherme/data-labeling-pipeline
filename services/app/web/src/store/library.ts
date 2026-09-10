@@ -6,6 +6,10 @@ import type { PipelineStage, Status, VideoListItem } from "../api/types";
 type StatusFilter = Status | "all";
 type Sort = "name" | "mtime" | "size" | "status";
 
+export function projectionNeedsRefresh(video: VideoListItem): boolean {
+  return video.projection_status != null && video.projection_status !== "current";
+}
+
 /**
  * Filtro puro, fora da store.
  *

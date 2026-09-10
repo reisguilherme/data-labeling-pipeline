@@ -5,7 +5,7 @@ import { Spinner } from "../components/ui";
 import { formatDuration } from "../lib/format";
 import type { OperationsStage } from "../lib/routes";
 import { navigate } from "../lib/routes";
-import { useLibrary } from "../store/library";
+import { projectionNeedsRefresh, useLibrary } from "../store/library";
 import { useSession } from "../store/session";
 
 const STAGE_COPY: Record<Exclude<OperationsStage, "overview">, { title: string; description: string }> = {
@@ -206,6 +206,8 @@ function VideoDetails({
       </div>
 
       <dl className="mt-5 grid grid-cols-2 gap-x-3 gap-y-4 text-xs">
+        {projectionNeedsRefresh(video) && <Detail label="Atualização" value="Atualização pendente — você pode continuar trabalhando" />}
+        {video.projected_at && <Detail label="Última atualização" value={new Date(video.projected_at).toLocaleString()} />}
         <Detail label="Estado" value={video.stage_status} />
         <Detail label="Duração" value={video.duration_sec == null ? "—" : formatDuration(video.duration_sec)} />
         <Detail label="Intervalos" value={`${video.interval_count} ${intervalLabel}`} />

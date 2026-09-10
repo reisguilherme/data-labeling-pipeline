@@ -17,9 +17,11 @@ def enabled() -> bool:
     return bool(os.environ.get("DATABASE_URL"))
 
 
-def _connect():
+def _connect(*, connect_timeout: int | None = None):
     import psycopg
 
+    if connect_timeout is not None:
+        return psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=connect_timeout)
     return psycopg.connect(os.environ["DATABASE_URL"])
 
 
@@ -88,6 +90,37 @@ def _advisory_key(object_id: str, video_id: str) -> int:
         f"video:{object_id}:{video_id}".encode("utf-8"), digest_size=8
     ).digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def enqueue_projection_reconciles(object_id: str, requests: list[dict]) -> int:
+    """Enqueue at most 20 metadata repairs with one bounded bulk statement."""
+    if not enabled() or not requests:
+        return 0
+    rows = {}
+    for request in requests[:20]:
+        body = {"object_id": object_id, "video_id": request["video_id"],
+                "source_identity": request["source_identity"]}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        key = "pipeline-projection:" + hashlib.sha256(canonical.encode()).hexdigest()
+        rows[key] = {"key": key, "payload": body}
+    with _connect(connect_timeout=1) as connection, connection.cursor() as cursor:
+        cursor.execute("SET LOCAL lock_timeout = '500ms'")
+        cursor.execute("SET LOCAL statement_timeout = '1000ms'")
+        cursor.execute(
+            """
+            INSERT INTO jobs(kind, worker_kind, state, priority, payload, progress, idempotency_key)
+            SELECT 'pipeline_projection_reconcile', 'cpu', 'queued', 90, item.payload, '{}'::jsonb, item.key
+              FROM jsonb_to_recordset(%s::jsonb) AS item(key text, payload jsonb)
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+                state='queued', payload=EXCLUDED.payload, result=NULL, error=NULL,
+                attempts=0, worker_id=NULL, lease_token=NULL, lease_expires_at=NULL,
+                cancel_requested=FALSE, progress='{}'::jsonb, started_at=NULL,
+                finished_at=NULL, updated_at=now()
+            WHERE jobs.state IN ('done','error','cancelled')
+            """,
+            (json.dumps(list(rows.values())),),
+        )
+        return cursor.rowcount
 
 
 def _annotation_advisory_key(object_id: str) -> int:
