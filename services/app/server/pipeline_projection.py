@@ -40,7 +40,17 @@ _ASSIGNED_SECRET = re.compile(
     '''
 )
 _JSON_SECRET = re.compile(
-    r'(?i)(["\'](?:password|passwd|token|secret|api[_-]?key)["\']\s*:\s*["\'])(.*?)(["\'])'
+    r'''(?ix)
+    (?P<prefix>
+        ["'](?:password|passwd|token|secret|api[_-]?key)["']\s*:\s*
+    )
+    (?P<quote>["'])
+    (?:
+        \\.
+        | (?!(?P=quote)).
+    )*
+    (?P=quote)
+    '''
 )
 
 
@@ -110,7 +120,13 @@ def sanitize_error(error: object) -> str:
     value = _URI_CREDENTIALS.sub(r"\1[REDACTED]\3", value)
     value = _BEARER_TOKEN.sub(r"\1[REDACTED]", value)
     value = _ASSIGNED_SECRET.sub(r"\1[REDACTED]", value)
-    value = _JSON_SECRET.sub(r"\1[REDACTED]\3", value)
+    value = _JSON_SECRET.sub(
+        lambda match: (
+            f'{match.group("prefix")}{match.group("quote")}'
+            f'[REDACTED]{match.group("quote")}'
+        ),
+        value,
+    )
     return value[:_MAX_ERROR_LENGTH]
 
 

@@ -93,6 +93,21 @@ class PipelineProjectionUnitTests(unittest.TestCase):
         self.assertNotIn("secret value", sanitized)
         self.assertEqual(sanitized.count("[REDACTED]"), 2)
 
+    def test_escaped_quotes_inside_json_secrets_do_not_leak_the_tail(self) -> None:
+        message = (
+            r'''db rejected {"password":"\"SYNTHETIC_SECRET_TAIL"} and '''
+            r'''{'token':'\'SYNTHETIC_SINGLE_TAIL'}'''
+        )
+
+        sanitized = sanitize_error(message)
+
+        self.assertEqual(
+            sanitized,
+            '''db rejected {"password":"[REDACTED]"} and {'token':'[REDACTED]'}''',
+        )
+        self.assertNotIn("SYNTHETIC_SECRET_TAIL", sanitized)
+        self.assertNotIn("SYNTHETIC_SINGLE_TAIL", sanitized)
+
     def test_every_transaction_sets_finite_database_timeouts(self) -> None:
         class Cursor:
             def __init__(self) -> None:
