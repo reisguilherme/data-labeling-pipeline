@@ -91,7 +91,12 @@ class MulticlassDatasetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (out / "mask_review.json").write_text(
-                json.dumps({"frames": {"0": {"revision": 1, "status": "ok"}}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "frames": {"0": {"revision": 1, "status": "ok"}},
+                    }
+                ),
                 encoding="utf-8",
             )
             entry = {

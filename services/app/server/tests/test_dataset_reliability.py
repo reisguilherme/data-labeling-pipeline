@@ -140,6 +140,15 @@ class DatasetSnapshotTests(unittest.TestCase):
             task="detection",
         )
 
+    def test_collect_rejects_an_export_root_outside_the_object_output(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        entry = self.ctx.store.doc["videos"]["bucket/video.mp4"]
+        entry["export"]["root"] = str(outside)
+
+        with self.assertRaisesRegex(ValueError, "fora da raiz"):
+            dataset.collect(self.ctx, dataset.Filters(), self.workspace)
+
     def test_snapshot_freezes_review_and_run_identity_without_decoding_pngs(self) -> None:
         with patch.object(dataset, "_mask_state", side_effect=AssertionError("PNG lido no POST")):
             snapshot = self._snapshot()

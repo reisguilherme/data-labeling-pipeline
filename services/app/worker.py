@@ -782,14 +782,33 @@ def run_global_dataset_export(job: dict, queue: PostgresJobQueue, token: str) ->
     if store is not None:
         prefix = f"global/{name}/generations/{snapshot['snapshot_id']}"
         stored = 0
-        for path in sorted(out_dir.rglob("*")):
-            if path.is_file():
-                store.put_file(
-                    "datasets",
-                    f"{prefix}/{path.relative_to(out_dir).as_posix()}",
-                    path,
+        files = sorted(path for path in out_dir.rglob("*") if path.is_file())
+        manifest_path = out_dir / "dataset_manifest.json"
+        if not manifest_path.is_file():
+            raise RuntimeError("dataset global publicado sem manifesto")
+        # The manifest is the generation commit marker for MinIO readers.  A
+        # failed upload may leave immutable blobs behind, but never a manifest
+        # that advertises an incomplete generation.
+        files = [path for path in files if path != manifest_path] + [manifest_path]
+        for index, path in enumerate(files):
+            if not queue.update_progress(
+                str(job["id"]),
+                token,
+                {
+                    "current": index,
+                    "total": len(files),
+                    "message": "sincronizando dataset global",
+                },
+            ):
+                raise Cancelled(
+                    "lease perdido durante upload do dataset global"
                 )
-                stored += 1
+            store.put_file(
+                "datasets",
+                f"{prefix}/{path.relative_to(out_dir).as_posix()}",
+                path,
+            )
+            stored += 1
         result["minio_prefix"] = f"datasets/{prefix}"
         result["minio_files"] = stored
     return result

@@ -385,40 +385,43 @@ async def global_export(
     ):
         raise HTTPException(422, "nome de dataset inválido")
     out_dir = workspace.root / "_datasets" / name
-    try:
-        await asyncio.to_thread(
-            dataset_module.reserve_dataset_target,
+    job_payload = {
+        "name": name,
+        "object_ids": sorted(set(payload.object_ids)),
+        "format": payload.format,
+        "task": payload.task,
+        "val_fraction": payload.val_fraction,
+        "test_fraction": payload.test_fraction,
+        "filters": {
+            "flags": flags,
+            "videos": selections,
+            "include_empty": payload.filters.include_empty,
+            "reviewed_only": True,
+        },
+        "snapshot": snapshot,
+        "client_id": client_id,
+        "user": user.user_id,
+        "message": f"exportando dataset global {payload.task} {payload.format}",
+    }
+
+    def reserve_and_create_job() -> str:
+        with dataset_module.dataset_target_job_reservation(
             workspace.root / "_datasets",
             name,
             snapshot["snapshot_id"],
-        )
+        ):
+            return durable_jobs.create(
+                kind="dataset_export_global",
+                object_id="global",
+                priority=70,
+                payload=job_payload,
+                idempotency_key=f"dataset-export-global:{name}",
+            )
+
+    try:
+        job_id = await asyncio.to_thread(reserve_and_create_job)
     except dataset_module.DatasetTargetConflict as exc:
         raise HTTPException(409, str(exc)) from exc
-    job_id = await asyncio.to_thread(
-        durable_jobs.create,
-        kind="dataset_export_global",
-        object_id="global",
-        priority=70,
-        payload={
-            "name": name,
-            "object_ids": sorted(set(payload.object_ids)),
-            "format": payload.format,
-            "task": payload.task,
-            "val_fraction": payload.val_fraction,
-            "test_fraction": payload.test_fraction,
-            "filters": {
-                "flags": flags,
-                "videos": selections,
-                "include_empty": payload.filters.include_empty,
-                "reviewed_only": True,
-            },
-            "snapshot": snapshot,
-            "client_id": client_id,
-            "user": user.user_id,
-            "message": f"exportando dataset global {payload.task} {payload.format}",
-        },
-        idempotency_key=f"dataset-export-global:{name}",
-    )
     return {"job_id": job_id, "name": name, "out_dir": out_dir.as_posix()}
 
 

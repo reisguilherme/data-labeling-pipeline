@@ -15,14 +15,22 @@ from typing import Iterable
 GLOBAL_SNAPSHOT_SCHEMA_VERSION = 1
 
 
-def _multiclass_snapshot_digest(snapshot: dict) -> str:
-    """Hash source identity, excluding observational capture timestamps."""
+def _stable_multiclass_snapshot(snapshot: dict) -> dict:
+    """Return the source identity without observational capture timestamps."""
+
     stable = deepcopy(snapshot)
     stable.pop("snapshot_id", None)
     stable.pop("created_at", None)
     for item in stable.get("objects") or []:
         source = item.get("dataset_snapshot") or {}
         source.pop("created_at", None)
+    return stable
+
+
+def _multiclass_snapshot_digest(snapshot: dict) -> str:
+    """Hash source identity, excluding observational capture timestamps."""
+
+    stable = _stable_multiclass_snapshot(snapshot)
     payload = json.dumps(
         stable,
         ensure_ascii=False,
@@ -379,13 +387,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _copy_published_artifact(source: Path, destination: Path) -> None:
+    """Materialize output bytes so later source edits cannot mutate a dataset."""
+
+    if destination.exists():
+        raise FileExistsError(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
 def _merge_yolo(
     parts: list[tuple[object, Path, dict]],
     out_dir: Path,
     records: list[dict],
 ) -> tuple[dict, list[dict]]:
-    from .dataset import _link_or_copy
-
     counts = {"images": 0, "annotations": 0, "empty": 0, "edited": 0}
     warnings: list[dict] = []
     splits: set[str] = set()
@@ -408,7 +423,7 @@ def _merge_yolo(
             splits.add(split)
             for image in sorted(split_dir.glob("*.jpg")):
                 destination = out_dir / "images" / split / image.name
-                _link_or_copy(image, destination)
+                _copy_published_artifact(image, destination)
                 source_label = part / "labels" / split / f"{image.stem}.txt"
                 target_label = out_dir / "labels" / split / f"{image.stem}.txt"
                 target_label.parent.mkdir(parents=True, exist_ok=True)
@@ -443,8 +458,6 @@ def _merge_coco(
     *,
     generated_at: str,
 ) -> tuple[dict, list[dict]]:
-    from .dataset import _link_or_copy
-
     buckets: dict[str, dict] = {}
     counts = {"images": 0, "annotations": 0, "empty": 0, "edited": 0}
     warnings: list[dict] = []
@@ -477,7 +490,10 @@ def _merge_coco(
             image_ids: dict[int, int] = {}
             for image in document.get("images") or []:
                 source = part / split / image["file_name"]
-                _link_or_copy(source, out_dir / split / image["file_name"])
+                _copy_published_artifact(
+                    source,
+                    out_dir / split / image["file_name"],
+                )
                 image_id = len(bucket["images"]) + 1
                 image_ids[int(image["id"])] = image_id
                 bucket["images"].append({**image, "id": image_id, "object_id": ctx.object_id})
@@ -761,7 +777,16 @@ def export_multiclass_snapshot_atomic(
             raise ValueError("classes do manifesto global divergentes")
         if manifest.get("split") != split:
             raise ValueError("splits do manifesto global divergentes")
-        if manifest.get("source_snapshot") != snapshot:
+        source_snapshot = manifest.get("source_snapshot")
+        try:
+            validate_multiclass_snapshot(source_snapshot)
+        except ValueError as exc:
+            raise ValueError("snapshot fonte do manifesto global divergente") from exc
+        if (
+            source_snapshot.get("snapshot_id") != snapshot.get("snapshot_id")
+            or _stable_multiclass_snapshot(source_snapshot)
+            != _stable_multiclass_snapshot(snapshot)
+        ):
             raise ValueError("snapshot fonte do manifesto global divergente")
 
     datasets_root = workspace_root / "_datasets"
@@ -785,11 +810,17 @@ def export_multiclass_snapshot_atomic(
     if not staging_root.is_dir():
         raise ValueError("staging global de dataset invalido")
     owner_key = hashlib.sha256(str(owner).encode("utf-8")).hexdigest()[:16]
+    job_id = str(owner).split(":", 1)[0]
+    job_key = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
     name_key = hashlib.sha256(out_dir.name.encode("utf-8")).hexdigest()[:16]
-    staging = (
-        staging_root
-        / f"{name_key}-{snapshot['snapshot_id'][:16]}-{owner_key}"
-    )
+    attempt_prefix = f"{name_key}-{snapshot['snapshot_id'][:16]}-{job_key}-"
+    staging = staging_root / f"{attempt_prefix}{owner_key}"
+    for previous in list(staging_root.iterdir()):
+        if previous == staging or not previous.name.startswith(attempt_prefix):
+            continue
+        if previous.is_symlink() or not previous.is_dir():
+            raise ValueError("staging global de dataset invalido")
+        shutil.rmtree(previous)
     if staging.exists():
         if staging.is_symlink() or not staging.is_dir():
             raise ValueError("staging global de dataset invalido")

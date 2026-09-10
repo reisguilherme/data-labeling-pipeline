@@ -37,6 +37,11 @@ from pipeline_core.review_store import (
     FrameMaskState,
     MaskInstance,
 )
+from pipeline_core.sam3_runs import (
+    Sam3GenerationError,
+    resolve_export_root,
+    resolve_segment_dir,
+)
 from pipeline_core.segmentation import coco_rle, yolo_polygons
 
 from .review import (
@@ -216,7 +221,7 @@ def _effective_prompt_identity(
     _, raw_prompt = _read_json_payload(prompt_path)
     assert raw_prompt is not None
     override_path = effective_prompt_override_path(
-        paths.segment_dir, migrate_legacy=True
+        paths.segment_dir, migrate_legacy=False
     )
     override, raw_override = (
         _read_json_payload(override_path)
@@ -615,12 +620,10 @@ def collect(ctx, filters: Filters, workspace_root: Path | None) -> list[Candidat
         if wanted_ids and entry.get("video_id") not in wanted_ids:
             continue
 
-        root = Path(export["root"])
-        if not root.is_dir():
-            candidate_root = ctx.output_root / root.name
-            if not candidate_root.is_dir():
-                continue
-            root = candidate_root
+        try:
+            root = resolve_export_root(ctx.output_root, export["root"])
+        except Sam3GenerationError as exc:
+            raise ValueError(str(exc)) from exc
 
         intervals = {i.get("segment"): i for i in entry.get("intervals") or []}
 
@@ -630,7 +633,11 @@ def collect(ctx, filters: Filters, workspace_root: Path | None) -> list[Candidat
             if not flags_match(flags, filters.flags):
                 continue
 
-            live_paths = SegmentPaths(root / segment)
+            try:
+                segment_dir = resolve_segment_dir(root, segment)
+            except Sam3GenerationError as exc:
+                raise ValueError(str(exc)) from exc
+            live_paths = SegmentPaths(segment_dir)
             annotation_dir = live_paths.out_dir
             paths = _freeze_segment_paths(live_paths.segment_dir, annotation_dir)
             has_masks = (paths.out_dir / "masks").is_dir()
@@ -1320,12 +1327,13 @@ def _dataset_reservation_lock(datasets_root: Path):
 
 def reserve_dataset_target(datasets_root: Path, name: str, snapshot_id: str) -> Path:
     with _dataset_reservation_lock(datasets_root):
-        return _reserve_dataset_target_locked(datasets_root, name, snapshot_id)
+        out_dir, _ = _reserve_dataset_target_locked(datasets_root, name, snapshot_id)
+        return out_dir
 
 
 def _reserve_dataset_target_locked(
     datasets_root: Path, name: str, snapshot_id: str
-) -> Path:
+) -> tuple[Path, bool]:
     """Atomically reserve one human-readable target for one immutable snapshot."""
     name = _safe_dataset_name(name)
     if not isinstance(snapshot_id, str) or _SHA256.fullmatch(snapshot_id) is None:
@@ -1337,7 +1345,7 @@ def _reserve_dataset_target_locked(
     if out_dir.exists():
         if _published_manifest(out_dir, snapshot_id) is None:
             raise DatasetTargetConflict(f"ja existe um dataset chamado '{name}'")
-        return out_dir
+        return out_dir, False
 
     path = _reservation_path(datasets_root, name)
     record = {"name": name, "snapshot_id": snapshot_id}
@@ -1351,7 +1359,7 @@ def _reserve_dataset_target_locked(
             raise DatasetTargetConflict(f"reserva invalida para '{name}'") from exc
         if current != record:
             raise DatasetTargetConflict(f"dataset '{name}' ja esta reservado")
-        return out_dir
+        return out_dir, False
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
@@ -1360,7 +1368,30 @@ def _reserve_dataset_target_locked(
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    return out_dir
+    return out_dir, True
+
+
+@contextmanager
+def dataset_target_job_reservation(
+    datasets_root: Path,
+    name: str,
+    snapshot_id: str,
+):
+    """Keep target reservation and durable-job creation in one critical section."""
+
+    name = _safe_dataset_name(name)
+    with _dataset_reservation_lock(datasets_root):
+        out_dir, created = _reserve_dataset_target_locked(
+            datasets_root,
+            name,
+            snapshot_id,
+        )
+        try:
+            yield out_dir
+        except BaseException:
+            if created:
+                _reservation_path(datasets_root, name).unlink(missing_ok=True)
+            raise
 
 
 def release_dataset_target(datasets_root: Path, name: str) -> None:
