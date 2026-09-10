@@ -39,6 +39,9 @@ _ASSIGNED_SECRET = re.compile(
     )
     '''
 )
+# Keep escapes disjoint from plain content so backtracking cannot promote an
+# escaped quote to a terminator. A truncated value consumes the remaining error,
+# including a possible trailing backslash, since its safe boundary is unknown.
 _JSON_SECRET = re.compile(
     r'''(?ix)
     (?P<prefix>
@@ -47,9 +50,9 @@ _JSON_SECRET = re.compile(
     (?P<quote>["'])
     (?:
         \\.
-        | (?!(?P=quote)).
+        | (?!(?P=quote)|\\).
     )*
-    (?P=quote)
+    (?:(?P=quote)|\\?\Z)
     '''
 )
 

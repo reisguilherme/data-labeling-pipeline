@@ -164,6 +164,32 @@ class PipelineProjectionPostgresTests(unittest.TestCase):
         self.assertEqual(current.event_seq, second_a.event_seq)
         self.assertEqual(current.snapshot["identity"], "a-restored")
 
+    def test_failed_intent_never_persists_unterminated_json_secret_tails(self) -> None:
+        intent = reserve_intent(
+            object_id="boom",
+            video_id="video-1",
+            event_kind="reconcile",
+            source_identity={"revision": 1},
+            connect=self._connect,
+        )
+        for message in (
+            r'''db rejected {"password":"\"SYNTHETIC_SECRET_TAIL}''',
+            r"""db rejected {'token':'\'SYNTHETIC_SECRET_TAIL}""",
+        ):
+            with self.subTest(message=message):
+                failed = fail_intent(intent, message, connect=self._connect)
+                with self._connect() as connection:
+                    persisted = connection.execute(
+                        "SELECT last_error FROM video_pipeline_projection_events "
+                        "WHERE event_seq = %s",
+                        (intent.event_seq,),
+                    ).fetchone()[0]
+
+                self.assertNotIn("SYNTHETIC_SECRET_TAIL", persisted)
+                self.assertIn("[REDACTED]", persisted)
+                self.assertEqual(failed.error, persisted)
+                self.assertEqual(failed.status, "pending")
+
     def test_pending_scan_wraps_to_older_failures_after_resume_cursor(self) -> None:
         older = reserve_intent(
             object_id="boom",

@@ -108,6 +108,24 @@ class PipelineProjectionUnitTests(unittest.TestCase):
         self.assertNotIn("SYNTHETIC_SECRET_TAIL", sanitized)
         self.assertNotIn("SYNTHETIC_SINGLE_TAIL", sanitized)
 
+    def test_unterminated_json_secrets_are_redacted_through_end_of_error(self) -> None:
+        messages = (
+            r'''db rejected {"password":"\"SYNTHETIC_SECRET_TAIL}''',
+            r"""db rejected {'token':'\'SYNTHETIC_SECRET_TAIL}""",
+            r'''db rejected {"password":"SYNTHETIC_SECRET_TAIL}''',
+            r"""db rejected {'token':'SYNTHETIC_SECRET_TAIL}""",
+            r'''db rejected {"password":"\"SYNTHETIC_SECRET_TAIL}''' + "\\",
+            r"""db rejected {'token':'\'SYNTHETIC_SECRET_TAIL}""" + "\\",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                sanitized = sanitize_error(message)
+
+                self.assertNotIn("SYNTHETIC_SECRET_TAIL", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+                self.assertTrue(sanitized.startswith("db rejected {"))
+
     def test_every_transaction_sets_finite_database_timeouts(self) -> None:
         class Cursor:
             def __init__(self) -> None:
