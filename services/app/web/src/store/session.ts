@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "../api/client";
 import { getObject, setObject } from "../api/scope";
+import { useLibrary } from "./library";
 import type { AppConfig, ObjectInfo, UserInfo } from "../api/types";
 
 /**
@@ -32,6 +33,8 @@ interface SessionState {
   }) => Promise<ObjectInfo>;
 }
 
+let sessionGeneration = 0;
+
 export const useSession = create<SessionState>((set, get) => ({
   config: null,
   user: null,
@@ -42,9 +45,11 @@ export const useSession = create<SessionState>((set, get) => ({
   error: null,
 
   boot: async () => {
+    const generation = ++sessionGeneration;
     set({ loading: true, error: null });
     try {
       const config = await api.config();
+      if (generation !== sessionGeneration) return;
       // Retoma o objeto da aba (localStorage), caindo no último usado no
       // servidor. Sempre VALIDADO contra a lista: um objeto renomeado ou
       // removido não pode deixar o app preso numa tela morta pedindo dados de
@@ -61,12 +66,16 @@ export const useSession = create<SessionState>((set, get) => ({
         loading: false,
       });
     } catch (error) {
-      set({ loading: false, error: (error as Error).message });
+      if (generation === sessionGeneration) {
+        set({ loading: false, error: (error as Error).message });
+      }
     }
   },
 
   refreshConfig: async () => {
+    const generation = sessionGeneration;
     const config = await api.config();
+    if (generation !== sessionGeneration) return;
     set({
       config,
       user: config.user,
@@ -76,7 +85,9 @@ export const useSession = create<SessionState>((set, get) => ({
   },
 
   login: async (userId) => {
+    const generation = sessionGeneration;
     const user = await api.login(userId);
+    if (generation !== sessionGeneration) return;
     set({ user });
   },
 
@@ -87,19 +98,23 @@ export const useSession = create<SessionState>((set, get) => ({
   },
 
   logout: async () => {
+    sessionGeneration += 1;
     await api.logout();
-    set({ user: null, activeObject: null });
+    useLibrary.getState().reset();
     setObject(null);
+    set({ user: null, activeObject: null, error: null });
   },
 
   openObject: (objectId) => {
     const found = get().objects.find((o) => o.object_id === objectId);
     if (!found) return;
+    if (get().activeObject?.object_id !== objectId) useLibrary.getState().reset();
     setObject(objectId);
     set({ activeObject: found });
   },
 
   closeObject: () => {
+    useLibrary.getState().reset();
     setObject(null);
     set({ activeObject: null });
   },

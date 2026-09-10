@@ -32,7 +32,6 @@ export default function App() {
   const activeObject = useSession((state) => state.activeObject);
   const openObject = useSession((state) => state.openObject);
   const videos = useLibrary((state) => state.videos);
-  const refresh = useLibrary((state) => state.refresh);
   const [route, setRoute] = useState<AppRoute>(() => parseRoute(window.location.pathname));
 
   useEffect(() => { void boot(); }, [boot]);
@@ -51,11 +50,6 @@ export default function App() {
     if (!config || !activeObject || window.location.pathname !== "/") return;
     navigate({ page: "operations", objectId: activeObject.object_id, stage: "triage" }, true);
   }, [config, activeObject]);
-
-  useEffect(() => {
-    if (route.page !== "editor" || activeObject?.object_id !== route.objectId) return;
-    if (!videos.some((video) => video.video_id === route.videoId)) void refresh();
-  }, [route, activeObject?.object_id, videos, refresh]);
 
   const activeVideo = useMemo(
     () => route.page === "editor" ? videos.find((video) => video.video_id === route.videoId) ?? null : null,

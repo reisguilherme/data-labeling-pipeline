@@ -377,6 +377,25 @@ const SCENARIOS = {
     expect: [["Arquivar objeto", "arquivo permanece uma acao visivel"]],
     html: [["border-red-900", "arquivo e destacado como acao destrutiva"]],
   },
+  "objects-load-retry": {
+    url: "/objects",
+    config: { ...CONFIG, last_object_id: null },
+    objects: { objects: [OBJECT] },
+    failObjectsOnce: true,
+    action: "retry-objects",
+    expect: [["Boom", "lista de objetos reaparece depois da tentativa"]],
+  },
+  "objects-logout-failure": {
+    url: "/objects",
+    config: { ...CONFIG, last_object_id: null },
+    objects: { objects: [OBJECT] },
+    failLogout: true,
+    action: "logout-objects",
+    expect: [
+      ["falha controlada ao sair", "falha de logout fica visível"],
+      ["Objetos e classes", "falha mantém a tela atual utilizável"],
+    ],
+  },
   overview: {
     url: "/objects/boom/overview",
     config: CONFIG,
@@ -420,6 +439,26 @@ const SCENARIOS = {
       ["Aguardando", "filtro de aguardando estÃ¡ visÃ­vel"],
       ["Em andamento", "filtro de trabalho iniciado estÃ¡ visÃ­vel"],
     ],
+  },
+  "app-shell-logout": {
+    url: "/objects/boom/review",
+    config: CONFIG,
+    videos: VIDEOS,
+    action: "logout-app-shell",
+    expect: [["Quem está triando", "logout retorna para a identificação"]],
+    expectedRequests: [[/\/api\/session\/logout$/, "logout chegou ao backend"]],
+  },
+  "object-switch-stale-library": {
+    url: "/objects/boom/triage",
+    config: { ...CONFIG, objects: [OBJECT, MIC_OBJECT] },
+    initialWait: 100,
+    action: "switch-object-during-library-load",
+    staleLibrary: {
+      boom: { ...VIDEOS, label: "boom", videos: [video("boom-only", "somente-boom")] },
+      microfone: { ...VIDEOS, label: "microphone", videos: [video("mic-only", "somente-microfone")] },
+    },
+    expect: [["somente-microfone", "resposta do novo objeto permanece visível"]],
+    reject: [["somente-boom", "resposta lenta do objeto anterior foi descartada"]],
   },
   "completed-gate": {
     url: "/objects/boom/completed",
@@ -862,6 +901,7 @@ if (!scenario) {
 
 const routes = [
   [/\/api\/config$/, scenario.config],
+  [/\/api\/session\/logout$/, { ok: true }],
   [/\/api\/objects\?include_archived=true$/, scenario.objects ?? { objects: [OBJECT] }],
   [/\/api\/objects$/, scenario.objects ?? { objects: [OBJECT] }],
   [/\/api\/users$/, { users: [USER] }],
@@ -913,6 +953,7 @@ const unhandledRejections = [];
 let frameStageMounts = 0;
 let maskFrameRequests = 0;
 let videosRequests = 0;
+let objectsRequests = 0;
 let mutationAcked = false;
 let navigatedBeforeMutationAck = false;
 let recoveryOverlayBeforeLoad = false;
@@ -946,6 +987,41 @@ window.fetch = async (input, init = {}) => {
   const url = String(input);
   requests.push(url);
   requestLog.push({ url, method: init.method ?? "GET", body: init.body });
+  if (scenario.failLogout && init.method === "POST" && /\/api\/session\/logout$/.test(url)) {
+    return {
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      json: async () => ({ detail: "falha controlada ao sair" }),
+    };
+  }
+  if (
+    scenario.staleLibrary &&
+    (init.method ?? "GET") === "GET" &&
+    /\/api\/objects\/(boom|microfone)\/videos(?:\?|$)/.test(url)
+  ) {
+    const objectId = url.match(/\/api\/objects\/(boom|microfone)\/videos/)?.[1];
+    if (objectId === "boom") await new Promise((resolve) => setTimeout(resolve, 700));
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => scenario.staleLibrary[objectId],
+    };
+  }
+  if (
+    scenario.failObjectsOnce &&
+    (init.method ?? "GET") === "GET" &&
+    /\/api\/objects\?include_archived=true$/.test(url) &&
+    objectsRequests++ === 0
+  ) {
+    return {
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      json: async () => ({ detail: "falha controlada ao listar objetos" }),
+    };
+  }
   if (init.method === "POST" && /\/session\/active-video$/.test(url)) {
     const activeVideo = JSON.parse(init.body ?? "{}").video_id ?? null;
     if (activeVideo === null && scenario.delayActiveVideoNull) {
@@ -1226,6 +1302,35 @@ if (scenario.action === "open-purge") {
   );
   action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
   await new Promise((resolve) => setTimeout(resolve, 100));
+}
+if (scenario.action === "retry-objects") {
+  const retry = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.toLowerCase().includes("tentar novamente"),
+  );
+  retry?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+if (scenario.action === "logout-app-shell") {
+  const action = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.toLowerCase().includes("sair"),
+  );
+  action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+if (scenario.action === "logout-objects") {
+  const action = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.toLowerCase().includes("sair"),
+  );
+  action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+if (scenario.action === "switch-object-during-library-load") {
+  const selector = window.document.querySelector("#object-switcher");
+  if (selector) {
+    selector.value = "microfone";
+    selector.dispatchEvent(new window.Event("change", { bubbles: true }));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 900));
 }
 if (scenario.action === "propagate-sam3") {
   requests.length = 0;
@@ -1647,6 +1752,9 @@ if (scenario.action === "submit-triage-failure") {
   check(window.location.pathname.includes("/aaa/"), "falha de mutacao preserva o video atual", window.location.pathname);
   check(!requestLog.some((request) => /\/videos\/aaa\/export$/.test(request.url)), "falha de mutacao nao enfileira exportacao");
   check(text.includes("falha controlada ao salvar"), "erro de salvamento continua visivel");
+}
+if (scenario.action === "retry-objects") {
+  check(objectsRequests === 2, "erro de objetos oferece uma tentativa real", `${objectsRequests} requests`);
 }
 
 for (const [needle, label] of scenario.expect ?? []) {

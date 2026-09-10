@@ -1,4 +1,4 @@
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AppRoute } from "../lib/routes";
 import { navigate } from "../lib/routes";
 import { useLibrary } from "../store/library";
@@ -18,6 +18,9 @@ export function AppShell({
   const objects = useSession((state) => state.objects);
   const user = useSession((state) => state.user);
   const openObject = useSession((state) => state.openObject);
+  const logout = useSession((state) => state.logout);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const pipelineCounts = useLibrary((state) => state.pipelineCounts);
   const videos = useLibrary((state) => state.videos);
   const refresh = useLibrary((state) => state.refresh);
@@ -72,6 +75,32 @@ export function AppShell({
           <span className="flex items-center gap-2 text-xs text-zinc-400">
             <span className="h-2 w-2 rounded-full" style={{ backgroundColor: user.color }} />
             <span className="hidden sm:inline">{user.display_name}</span>
+          </span>
+        )}
+        {user && (
+          <button
+            type="button"
+            disabled={loggingOut}
+            title={logoutError ?? undefined}
+            onClick={async () => {
+              setLoggingOut(true);
+              setLogoutError(null);
+              try {
+                await logout();
+                navigate({ page: "objects" }, true);
+              } catch (error) {
+                setLogoutError((error as Error).message);
+                setLoggingOut(false);
+              }
+            }}
+            className="rounded-md border border-zinc-800 px-2.5 py-1.5 text-xs text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 disabled:cursor-wait disabled:opacity-50"
+          >
+            {loggingOut ? "saindo…" : "sair"}
+          </button>
+        )}
+        {logoutError && (
+          <span role="alert" className="max-w-64 truncate text-xs text-red-300">
+            {logoutError}
           </span>
         )}
       </header>

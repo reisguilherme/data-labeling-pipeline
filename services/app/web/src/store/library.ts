@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api } from "../api/client";
+import { getObject } from "../api/scope";
 import type { PipelineStage, Status, VideoListItem } from "../api/types";
 
 type StatusFilter = Status | "all";
@@ -43,6 +44,7 @@ interface LibraryState {
   refresh: () => Promise<void>;
   refreshSam3: () => Promise<boolean>;
   rescan: () => Promise<void>;
+  reset: () => void;
   setSearch: (value: string) => void;
   setStatusFilter: (value: StatusFilter) => void;
   setSort: (value: Sort) => void;
@@ -51,6 +53,28 @@ interface LibraryState {
   nextPending: (afterVideoId?: string) => VideoListItem | null;
   neighbours: (videoId: string) => { prev: VideoListItem | null; next: VideoListItem | null };
 }
+
+let scopeGeneration = 0;
+let listingRequest = 0;
+
+function requestFence(): { generation: number; objectId: string | null } {
+  return { generation: scopeGeneration, objectId: getObject() };
+}
+
+function fenceIsCurrent(fence: { generation: number; objectId: string | null }): boolean {
+  return fence.generation === scopeGeneration && fence.objectId === getObject();
+}
+
+const EMPTY_LIBRARY = {
+  videos: [],
+  counts: {},
+  pipelineCounts: {},
+  pipelineStatusCounts: {},
+  label: "",
+  loading: false,
+  scanning: false,
+  error: null,
+} satisfies Partial<LibraryState>;
 
 export const useLibrary = create<LibraryState>((set, get) => ({
   videos: [],
@@ -67,9 +91,12 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   sort: "name",
 
   refresh: async () => {
+    const fence = requestFence();
+    const request = ++listingRequest;
     set({ loading: true, error: null });
     try {
       const data = await api.videos({ sort: get().sort });
+      if (!fenceIsCurrent(fence) || request !== listingRequest) return;
       set({
         videos: data.videos,
         counts: data.counts,
@@ -78,9 +105,10 @@ export const useLibrary = create<LibraryState>((set, get) => ({
         label: data.label,
       });
     } catch (error) {
+      if (!fenceIsCurrent(fence) || request !== listingRequest) return;
       set({ error: (error as Error).message });
     } finally {
-      set({ loading: false });
+      if (fenceIsCurrent(fence) && request === listingRequest) set({ loading: false });
     }
   },
 
@@ -93,11 +121,13 @@ export const useLibrary = create<LibraryState>((set, get) => ({
    * frame.
    */
   refreshSam3: async () => {
+    const fence = requestFence();
     try {
       const wasActive = get().videos.some(
         (video) => video.sam3 && ["queued", "leased", "running"].includes(video.sam3.state),
       );
       const data = await api.sam3Queue();
+      if (!fenceIsCurrent(fence)) return false;
       set((state) => ({
         videos: state.videos.map((video) =>
           video.sam3 === (data.videos[video.video_id] ?? null)
@@ -113,9 +143,12 @@ export const useLibrary = create<LibraryState>((set, get) => ({
   },
 
   rescan: async () => {
+    const fence = requestFence();
+    const request = ++listingRequest;
     set({ scanning: true, error: null });
     try {
       const data = await api.rescan();
+      if (!fenceIsCurrent(fence) || request !== listingRequest) return;
       set({
         videos: data.videos,
         counts: data.counts,
@@ -124,10 +157,17 @@ export const useLibrary = create<LibraryState>((set, get) => ({
         label: data.label,
       });
     } catch (error) {
+      if (!fenceIsCurrent(fence) || request !== listingRequest) return;
       set({ error: (error as Error).message });
     } finally {
-      set({ scanning: false });
+      if (fenceIsCurrent(fence) && request === listingRequest) set({ scanning: false });
     }
+  },
+
+  reset: () => {
+    scopeGeneration += 1;
+    listingRequest += 1;
+    set({ ...EMPTY_LIBRARY, search: "", statusFilter: "all", sort: "name" });
   },
 
   setSearch: (search) => set({ search }),

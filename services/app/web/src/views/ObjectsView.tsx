@@ -13,27 +13,49 @@ export function ObjectsView({ onOpen }: { onOpen: (objectId: string) => void }) 
   const addObject = useSession((state) => state.addObject);
   const refreshConfig = useSession((state) => state.refreshConfig);
   const activeObject = useSession((state) => state.activeObject);
-  const [objects, setObjects] = useState<ObjectInfo[]>([]);
+  const sessionObjects = useSession((state) => state.objects);
+  const [objects, setObjects] = useState<ObjectInfo[]>(sessionObjects);
   const [tab, setTab] = useState<Tab>("active");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadingObjects, setLoadingObjects] = useState(true);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [purging, setPurging] = useState<ObjectInfo | null>(null);
   const [confirmation, setConfirmation] = useState("");
   const purgeDialogRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const mountedRef = useRef(true);
+  const loadGenerationRef = useRef(0);
 
   const load = async () => {
+    const generation = ++loadGenerationRef.current;
+    setLoadingObjects(true);
+    setError(null);
     try {
       const data = await api.objects(true);
+      if (!mountedRef.current || generation !== loadGenerationRef.current) return;
       setObjects(data.objects);
       setSelectedId((current) => current ?? data.objects.find((item) => !item.archived)?.object_id ?? data.objects[0]?.object_id ?? null);
     } catch (exc) {
-      setError((exc as Error).message);
+      if (mountedRef.current && generation === loadGenerationRef.current) {
+        setError((exc as Error).message);
+      }
+    } finally {
+      if (mountedRef.current && generation === loadGenerationRef.current) {
+        setLoadingObjects(false);
+      }
     }
   };
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    void load();
+    return () => {
+      mountedRef.current = false;
+      loadGenerationRef.current += 1;
+    };
+  }, []);
   useEffect(() => {
     if (!purging) return;
     const dialog = purgeDialogRef.current;
@@ -79,7 +101,27 @@ export function ObjectsView({ onOpen }: { onOpen: (objectId: string) => void }) 
           <p className="text-xs text-zinc-400">O que vamos anotar? Edite nomes sem alterar o identificador histórico.</p>
         </div>
         <div className="flex-1" />
-        {user && <button type="button" onClick={() => void logout()} className="text-xs text-zinc-400 hover:text-zinc-200">{user.display_name} · sair</button>}
+        {user && (
+          <button
+            type="button"
+            disabled={loggingOut}
+            onClick={async () => {
+              setLoggingOut(true);
+              setError(null);
+              try {
+                await logout();
+                navigate({ page: "objects" }, true);
+              } catch (exc) {
+                if (mountedRef.current) setError((exc as Error).message);
+              } finally {
+                if (mountedRef.current) setLoggingOut(false);
+              }
+            }}
+            className="text-xs text-zinc-400 hover:text-zinc-200 disabled:cursor-wait disabled:opacity-50"
+          >
+            {user.display_name} · {loggingOut ? "saindo…" : "sair"}
+          </button>
+        )}
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
@@ -89,6 +131,9 @@ export function ObjectsView({ onOpen }: { onOpen: (objectId: string) => void }) 
             <TabButton active={tab === "archived"} onClick={() => setTab("archived")}>Arquivados</TabButton>
           </div>
           <div className="mt-4 space-y-2 overflow-y-auto">
+            {loadingObjects && objects.length === 0 && (
+              <p className="flex items-center gap-2 p-3 text-xs text-zinc-400"><Spinner /> Carregando objetos…</p>
+            )}
             {visible.map((object) => (
               <button
                 type="button"
@@ -100,14 +145,21 @@ export function ObjectsView({ onOpen }: { onOpen: (objectId: string) => void }) 
                 <span className="mt-1 block truncate text-[11px] text-zinc-400">{object.object_id} · {object.label}</span>
               </button>
             ))}
-            {visible.length === 0 && <p className="p-3 text-xs text-zinc-400">Nenhum objeto nesta lista.</p>}
+            {!loadingObjects && visible.length === 0 && <p className="p-3 text-xs text-zinc-400">Nenhum objeto nesta lista.</p>}
           </div>
           <button type="button" onClick={() => { setCreating(true); setSelectedId(null); }} className="mt-4 w-full rounded-lg border border-dashed border-zinc-700 px-3 py-2 text-sm text-zinc-400 hover:border-zinc-500 hover:text-zinc-200">+ novo objeto</button>
         </aside>
 
         <main className="min-w-0 flex-1 overflow-y-auto p-5 lg:p-8">
           <div className="mx-auto max-w-3xl">
-            {error && <p className="mb-4 rounded-lg border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}
+            {error && (
+              <div className="mb-4 flex items-center gap-3 rounded-lg border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">
+                <span className="flex-1">{error}</span>
+                <Button variant="ghost" disabled={loadingObjects} onClick={() => void load()}>
+                  {loadingObjects ? <Spinner /> : null} tentar novamente
+                </Button>
+              </div>
+            )}
             {creating ? (
               <CreateObjectForm
                 busy={busy}
