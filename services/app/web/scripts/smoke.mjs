@@ -440,6 +440,31 @@ const SCENARIOS = {
       ["Em andamento", "filtro de trabalho iniciado estÃ¡ visÃ­vel"],
     ],
   },
+  "operations-details": {
+    url: "/objects/boom/review",
+    config: CONFIG,
+    videos: {
+      ...VIDEOS,
+      pipeline_counts: { review: 1 },
+      videos: [
+        video("rev-b", "em-progresso", "done", {
+          pipeline_stage: "review",
+          stage_status: "in_progress",
+          interval_count: 2,
+          stage_progress: { expected_frames: 12, reviewed_frames: 4, edited_frames: 1, artifacts_valid: true, inconsistencies: [] },
+        }),
+      ],
+    },
+    action: "open-operation-details",
+    expect: [
+      ["Detalhes do vídeo", "detalhes abrem em contexto próprio"],
+      ["4 de 12 frames revisados", "painel explica o progresso"],
+      ["1 frame editado", "painel mostra correções"],
+      ["2 trechos", "painel mostra intervalos"],
+      ["Fechar detalhes", "painel possui fechamento explícito"],
+    ],
+    expectPath: "/objects/boom/review",
+  },
   "app-shell-logout": {
     url: "/objects/boom/review",
     config: CONFIG,
@@ -1332,6 +1357,13 @@ if (scenario.action === "switch-object-during-library-load") {
   }
   await new Promise((resolve) => setTimeout(resolve, 900));
 }
+if (scenario.action === "open-operation-details") {
+  const action = [...window.document.querySelectorAll("button")].find(
+    (element) => element.textContent?.trim() === "Detalhes",
+  );
+  action?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
 if (scenario.action === "propagate-sam3") {
   requests.length = 0;
   const action = [...window.document.querySelectorAll("button")].find(
@@ -1755,6 +1787,13 @@ if (scenario.action === "submit-triage-failure") {
 }
 if (scenario.action === "retry-objects") {
   check(objectsRequests === 2, "erro de objetos oferece uma tentativa real", `${objectsRequests} requests`);
+}
+if (scenario.action === "open-operation-details") {
+  check(
+    window.location.pathname === "/objects/boom/review",
+    "detalhes não executam a ação principal do card",
+    window.location.pathname,
+  );
 }
 
 for (const [needle, label] of scenario.expect ?? []) {
