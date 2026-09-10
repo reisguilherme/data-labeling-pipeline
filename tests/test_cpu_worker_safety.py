@@ -1271,21 +1271,21 @@ class CpuWorkerSafetyTests(unittest.TestCase):
             )
 
             test_workspace = Workspace()
-            purge_reached_save = threading.Event()
-            release_save = threading.Event()
+            purge_reached_registry_write = threading.Event()
+            release_registry_write = threading.Event()
             purge_errors: list[BaseException] = []
 
             with patch.object(settings, "workspace_root", root), patch.object(
                 settings, "legacy", None
             ):
                 test_workspace.load()
-                original_save = test_workspace.save
+                original_registry_write = test_workspace._write_registry_unlocked
 
-                def blocked_save() -> None:
-                    purge_reached_save.set()
-                    if not release_save.wait(timeout=2):
-                        raise TimeoutError("purge save was not released")
-                    original_save()
+                def blocked_registry_write() -> None:
+                    purge_reached_registry_write.set()
+                    if not release_registry_write.wait(timeout=2):
+                        raise TimeoutError("purge registry write was not released")
+                    original_registry_write()
 
                 job = {
                     "id": "purge-1",
@@ -1312,7 +1312,9 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                 ), patch(
                     "server.workspace.workspace", test_workspace
                 ), patch.object(
-                    test_workspace, "save", side_effect=blocked_save
+                    test_workspace,
+                    "_write_registry_unlocked",
+                    side_effect=blocked_registry_write,
                 ), patch(
                     "services.app.worker.MinioBlobStore.from_env", return_value=None
                 ), patch(
@@ -1328,8 +1330,8 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                     purge_thread.start()
                     try:
                         self.assertTrue(
-                            purge_reached_save.wait(timeout=1),
-                            f"purge did not reach save: {purge_errors!r}",
+                            purge_reached_registry_write.wait(timeout=1),
+                            f"purge did not reach registry write: {purge_errors!r}",
                         )
                         with patch.object(
                             test_workspace, "load", wraps=test_workspace.load
@@ -1346,7 +1348,7 @@ class CpuWorkerSafetyTests(unittest.TestCase):
                             invalidate.assert_not_called()
                             context.assert_not_called()
                     finally:
-                        release_save.set()
+                        release_registry_write.set()
                         purge_thread.join(timeout=2)
 
             self.assertFalse(purge_thread.is_alive())
