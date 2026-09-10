@@ -1160,11 +1160,27 @@ def _inspect_pipeline_entry(
             continue
         frames = review["frames"]
         for frame in range(frame_count):
-            reviewed = frames.get(str(frame)) or {}
-            if reviewed.get("status") in {"ok", "edited"}:
-                reviewed_frames += 1
-                if reviewed.get("status") == "edited":
-                    edited_frames += 1
+            frame_key = str(frame)
+            if frame_key not in frames:
+                continue
+            reviewed = frames[frame_key]
+            if not isinstance(reviewed, dict):
+                inconsistencies.append(
+                    f"{segment_name}: frame de revisao invalido"
+                )
+                continue
+            review_status = reviewed.get("status")
+            if not isinstance(review_status, str) or review_status not in {
+                "ok",
+                "edited",
+            }:
+                inconsistencies.append(
+                    f"{segment_name}: status de revisao invalido"
+                )
+                continue
+            reviewed_frames += 1
+            if review_status == "edited":
+                edited_frames += 1
 
         frames_written = _schema_int(run.get("frames_written"))
         if "frames_written" not in run:

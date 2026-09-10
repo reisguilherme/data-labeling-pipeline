@@ -294,6 +294,28 @@ class PipelineSourceIdentityTests(unittest.TestCase):
             source.identity["segments"][0]["mask_review"]["state"], "invalid"
         )
 
+    def test_review_frame_array_is_invalid_without_escaping_derivation(self) -> None:
+        _write_json(
+            self.fixture.active_output / "mask_review.json",
+            {"schema_version": 1, "frames": {"0": [{}]}},
+        )
+
+        source = _derive(self.fixture.entry, self.sam3, self.fixture.output_root)
+
+        self.assertEqual(source.snapshot.validation_status, "invalid")
+        self.assertFalse(source.snapshot_dict["complete"])
+
+    def test_review_frame_status_array_is_invalid_without_escaping_derivation(self) -> None:
+        _write_json(
+            self.fixture.active_output / "mask_review.json",
+            {"schema_version": 1, "frames": {"0": {"status": []}}},
+        )
+
+        source = _derive(self.fixture.entry, self.sam3, self.fixture.output_root)
+
+        self.assertEqual(source.snapshot.validation_status, "invalid")
+        self.assertFalse(source.snapshot_dict["complete"])
+
     def test_non_positive_review_revision_is_invalid_not_legacy(self) -> None:
         malformed = copy.deepcopy(self.fixture.review)
         malformed["frames"]["0"]["revision"] = -1
