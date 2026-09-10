@@ -302,7 +302,7 @@ async def put_one(
     async with _video_mutation_lock(
         ctx, video_id, client_id, payload.lock_token, force
     ):
-        entry = await ctx.store.mutate(apply)
+        entry = await ctx.store.mutate_threaded(apply)
     await _cancel_stale_exports(ctx, video_id, entry["annotation_revision"])
     return {**entry, **await asyncio.to_thread(mutation.complete)}
 
@@ -443,7 +443,7 @@ async def mark_no_object(
     async with _video_mutation_lock(
         ctx, video_id, client_id, payload.lock_token, force
     ):
-        entry = await ctx.store.mutate(apply)
+        entry = await ctx.store.mutate_threaded(apply)
     revision = entry["annotation_revision"]
     if revision_changed:
         await _cancel_stale_exports(ctx, video_id, revision)
@@ -485,7 +485,7 @@ async def mark_no_object(
         async with _video_mutation_lock(
             ctx, video_id, client_id, payload.lock_token, True
         ):
-            entry = await ctx.store.mutate(
+            entry = await ctx.store.mutate_threaded(
                 lambda doc: _update_cleanup_marker(
                     doc, video.relpath, revision, updated_cleanup, cleanup_job_id
                 )
@@ -500,7 +500,7 @@ async def mark_no_object(
         async with _video_mutation_lock(
             ctx, video_id, client_id, payload.lock_token, True
         ):
-            entry = await ctx.store.mutate(
+            entry = await ctx.store.mutate_threaded(
                 lambda doc: _update_cleanup_marker(
                     doc, video.relpath, revision, updated_cleanup, None
                 )

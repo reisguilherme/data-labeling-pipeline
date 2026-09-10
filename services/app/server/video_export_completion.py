@@ -290,7 +290,7 @@ async def finalize_video_export(
             }
             return entry, False
 
-        entry, replayed = await ctx.store.mutate(apply)
+        entry, replayed = await ctx.store.mutate_threaded(apply)
 
         # This deliberately runs for replays too: persistence and queueing span
         # two stores, so a retry must heal a crash between the two operations.

@@ -158,26 +158,71 @@ class AnnotationStore:
             await asyncio.to_thread(self._flush)
         return result
 
-    def _flush(self) -> None:
+    async def mutate_threaded(self, fn: Callable[[dict], Any]) -> Any:
+        """Run a blocking callback on a private snapshot, serialized with writers.
+
+        Readers keep the last committed document throughout the callback and I/O.
+        Cancellation waits for the thread (including its possible commit) before
+        releasing the writer and caller's outer fences; it cannot stop a thread.
+        """
+        async with self._lock:
+            def commit() -> Any:
+                with self._state_lock:
+                    candidate = copy.deepcopy(self._doc)
+                result = fn(candidate)
+                # Copy before publishing: an unsupported callback result must not
+                # turn a successful disk commit into an apparent failed mutation.
+                committed_result = copy.deepcopy(result)
+                self._flush(candidate)
+                return committed_result
+
+            operation = asyncio.create_task(asyncio.to_thread(commit))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # A second cancel must not let an active thread escape its locks.
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                if not operation.cancelled():
+                    try:
+                        operation.result()
+                    except BaseException:
+                        pass
+                raise
+
+    def _flush(self, candidate: dict | None = None) -> None:
         path = self.annotations_path
         try:
             total = self._total_provider() or None
         except Exception:  # noqa: BLE001
             total = None
 
-        with self._state_lock:
-            self._doc["schema_version"] = SCHEMA_VERSION
-            self._doc["generated_by"] = f"{APP_NAME} {APP_VERSION}"
-            self._doc["flag_groups_version"] = FLAG_GROUPS_VERSION
-            self._doc["object_id"] = self.object_id
-            self._doc["label"] = self.label
+        def serialize(target: dict) -> str:
+            target["schema_version"] = SCHEMA_VERSION
+            target["generated_by"] = f"{APP_NAME} {APP_VERSION}"
+            target["flag_groups_version"] = FLAG_GROUPS_VERSION
+            target["object_id"] = self.object_id
+            target["label"] = self.label
             # Caminhos com "/" mantêm o JSON legível/portável para a Spark.
-            self._doc["videos_root"] = self.videos_root.as_posix()
-            self._doc["output_root"] = self.output_root.as_posix()
-            self._doc["updated_at"] = iso()
-            self._doc["videos"] = dict(sorted(self._doc["videos"].items()))
-            self._doc["counts"] = self._counts_for(self._doc["videos"], total)
-            payload = json.dumps(self._doc, ensure_ascii=False, indent=2)
+            target["videos_root"] = self.videos_root.as_posix()
+            target["output_root"] = self.output_root.as_posix()
+            target["updated_at"] = iso()
+            target["videos"] = dict(sorted(target["videos"].items()))
+            target["counts"] = self._counts_for(target["videos"], total)
+            return json.dumps(target, ensure_ascii=False, indent=2)
+
+        if candidate is None:
+            with self._state_lock:
+                payload = serialize(self._doc)
+        else:
+            # `candidate` is private to the writer thread. Serializing it without
+            # the state lock keeps reads of the last committed document responsive.
+            payload = serialize(candidate)
 
         # O asyncio.Lock do writer permanece adquirido até o fim deste método,
         # preservando a ordem dos replaces. O lock de estado fica livre durante
@@ -192,13 +237,22 @@ class AnnotationStore:
 
         # tmp no MESMO diretório: os.replace só é atômico dentro de um volume.
         tmp = path.with_name("annotations.json.tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
         with self._state_lock:
+            if candidate is not None:
+                self._doc = candidate
             self._saves += 1
             snapshot_due = self._saves % _HISTORY_EVERY == 0
         if snapshot_due:
