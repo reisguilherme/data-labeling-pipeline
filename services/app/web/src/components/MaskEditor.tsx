@@ -210,14 +210,22 @@ export function MaskEditor({
     const canvas = canvasRef.current;
     if (!canvas) return;
     const bounds = canvas.getBoundingClientRect();
+    const ratioX = (event.clientX - bounds.left) / bounds.width;
+    const ratioY = (event.clientY - bounds.top) / bounds.height;
     setCursor({
-      x: event.clientX - bounds.left,
-      y: event.clientY - bounds.top,
-      size: (brushSize / canvas.width) * bounds.width,
+      // O cursor é filho do mesmo plano que recebe zoom. Logo sua posição deve
+      // estar em pixels locais não transformados; usar pixels da tela faria o
+      // zoom ser aplicado duas vezes e afastaria o pincel da máscara.
+      x: ratioX * canvas.clientWidth,
+      y: ratioY * canvas.clientHeight,
+      size: (brushSize / canvas.width) * canvas.clientWidth,
     });
   };
 
   const pointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // Alt+arraste pertence ao viewport. Deixar o evento seguir para o pai sem
+    // tocar no canvas evita pintar a máscara enquanto a imagem é deslocada.
+    if (event.altKey) return;
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
@@ -228,10 +236,13 @@ export function MaskEditor({
     if (tool === "move" || spaceHeld) {
       let lastX = event.clientX;
       let lastY = event.clientY;
+      const camera = canvas.closest<HTMLElement>("[data-review-camera-plane]");
+      const cameraWidth = Math.max(camera?.clientWidth ?? canvas.clientWidth, 1);
+      const cameraHeight = Math.max(camera?.clientHeight ?? canvas.clientHeight, 1);
       const move = (moveEvent: PointerEvent) => {
         const state = useReview.getState();
-        const dx = (moveEvent.clientX - lastX) / bounds.width / state.zoom;
-        const dy = (moveEvent.clientY - lastY) / bounds.height / state.zoom;
+        const dx = (moveEvent.clientX - lastX) / cameraWidth / state.zoom;
+        const dy = (moveEvent.clientY - lastY) / cameraHeight / state.zoom;
         lastX = moveEvent.clientX;
         lastY = moveEvent.clientY;
         state.nudgePan(-dx, -dy);

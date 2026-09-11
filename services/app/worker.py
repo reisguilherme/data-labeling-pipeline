@@ -671,6 +671,150 @@ def run_video_export_cleanup(job: dict, queue: PostgresJobQueue, token: str) -> 
     }
 
 
+def run_mask_review_sync(job: dict, queue: PostgresJobQueue, token: str) -> dict:
+    """Replica e indexa uma revisão já confirmada no armazenamento canônico."""
+
+    from pipeline_core.sam3_runs import (
+        active_segment_output,
+        resolve_export_root,
+        resolve_segment_dir,
+    )
+    from pipeline_core.storage import object_key_for
+    from server.pipeline_state import REVIEW_CERTIFICATION_FILENAME
+    from server.sam3_run_index import index_revisions
+
+    ctx = _context(job)
+    payload = job["payload"]
+    video_id = str(payload.get("video_id") or "")
+    relpath = str(payload.get("relpath") or "")
+    segment = str(payload.get("segment") or "")
+    requested = payload.get("frames") or []
+    if not video_id or not relpath or not segment or not isinstance(requested, list):
+        raise ValueError("job de sincronização da revisão inválido")
+
+    video = ctx.index.get(video_id)
+    if video is None or video.relpath != relpath:
+        raise ValueError("vídeo da revisão não corresponde ao índice atual")
+    ctx.store.load()
+    entry = ctx.store.entry(relpath) or {}
+    export = entry.get("export") or {}
+    segments = export.get("segments") or []
+    if segment not in segments:
+        raise ValueError("segmento da revisão não pertence mais ao vídeo")
+    root = resolve_export_root(ctx.output_root, export.get("root"))
+    segment_dir = resolve_segment_dir(root, segment)
+    out = active_segment_output(segment_dir)
+    manifest_path = out / "mask_review.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    frames = manifest.get("frames")
+    if not isinstance(frames, dict):
+        raise ValueError("manifesto canônico de revisão inválido")
+
+    revisions: list[tuple[int, dict]] = []
+    for requested_frame in requested:
+        if not isinstance(requested_frame, dict):
+            raise ValueError("frame solicitado para sincronização é inválido")
+        frame = requested_frame.get("frame")
+        revision = requested_frame.get("revision")
+        if type(frame) is not int or frame < 0 or type(revision) is not int or revision <= 0:
+            raise ValueError("identidade de revisão inválida")
+        current = frames.get(str(frame))
+        if not isinstance(current, dict):
+            raise ValueError(f"revisão ausente no frame {frame}")
+        candidates = list(current.get("history") or [])
+        candidates.append({key: value for key, value in current.items() if key != "history"})
+        selected = next(
+            (
+                candidate
+                for candidate in reversed(candidates)
+                if isinstance(candidate, dict) and candidate.get("revision") == revision
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(f"revisão {revision} ausente no frame {frame}")
+        revisions.append((frame, selected))
+
+    if not queue.update_progress(
+        str(job["id"]),
+        token,
+        {"current": 0, "total": 2, "message": "indexando revisão"},
+    ):
+        raise Cancelled("cancelamento solicitado")
+    index_error: Exception | None = None
+    try:
+        index_revisions(
+            object_id=ctx.object_id,
+            relpath=relpath,
+            segment_dir=segment_dir,
+            revisions=revisions,
+            user=payload.get("user"),
+        )
+    except Exception as exc:  # o espelho MinIO ainda deve ser tentado
+        # Runs importados podem não possuir uma annotation_run normalizada no
+        # PostgreSQL. A revisão no workspace continua canônica e auditável.
+        if not (
+            isinstance(exc, RuntimeError)
+            and "run SAM3 normalizado nao encontrado" in str(exc)
+        ):
+            index_error = exc
+
+    if not queue.update_progress(
+        str(job["id"]),
+        token,
+        {"current": 1, "total": 2, "message": "espelhando revisão"},
+    ):
+        raise Cancelled("cancelamento solicitado")
+
+    mirrored = 0
+    blob_store = MinioBlobStore.from_env()
+    workspace_root = Path(os.environ.get("MST_WORKSPACE", "/workspace"))
+    if blob_store is not None:
+        uploaded: set[Path] = set()
+        resolved_out = out.resolve()
+        for _, revision_entry in revisions:
+            for instance in revision_entry.get("instances") or []:
+                relative = instance.get("path") if isinstance(instance, dict) else None
+                if not isinstance(relative, str) or not relative.startswith("reviews/"):
+                    continue
+                path = out / relative
+                resolved = path.resolve()
+                if not resolved.is_relative_to(resolved_out) or path.is_symlink() or not path.is_file():
+                    raise ValueError("artefato de revisão fora da geração ativa")
+                if resolved in uploaded:
+                    continue
+                blob_store.put_file("masks", object_key_for(workspace_root, path), path)
+                uploaded.add(resolved)
+                mirrored += 1
+        blob_store.put_file(
+            "masks", object_key_for(workspace_root, manifest_path), manifest_path
+        )
+        mirrored += 1
+        certificate_path = root / REVIEW_CERTIFICATION_FILENAME
+        if certificate_path.is_file() and not certificate_path.is_symlink():
+            blob_store.put_file(
+                "masks",
+                object_key_for(workspace_root, certificate_path),
+                certificate_path,
+            )
+            mirrored += 1
+
+    if index_error is not None:
+        raise index_error
+    queue.update_progress(
+        str(job["id"]),
+        token,
+        {"current": 2, "total": 2, "message": "revisão sincronizada"},
+    )
+    return {
+        "video_id": video_id,
+        "segment": segment,
+        "frames": len(revisions),
+        "mirrored": mirrored,
+        "review_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    }
+
+
 def run_dataset_export(job: dict, queue: PostgresJobQueue, token: str) -> dict:
     from server import durable_jobs
     from server.dataset import (
@@ -1231,6 +1375,8 @@ def main() -> int:
                 result = run_video_export(job, queue, token)
             elif job["kind"] == "video_export_cleanup":
                 result = run_video_export_cleanup(job, queue, token)
+            elif job["kind"] == "mask_review_sync":
+                result = run_mask_review_sync(job, queue, token)
             elif job["kind"] == "pipeline_projection_reconcile":
                 result = run_projection_reconcile(job)
             else:

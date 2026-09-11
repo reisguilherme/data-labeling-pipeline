@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../api/client";
+import { ApiError, api } from "../api/client";
 import type { MaskReviewDraft, MaskReviewFrame, VideoListItem } from "../api/types";
 import { BboxCanvas } from "../components/BboxCanvas";
 import { MaskEditor } from "../components/MaskEditor";
@@ -41,12 +41,14 @@ export function ReviewView({
   const imageWidth = useReview((s) => s.imageWidth);
   const imageHeight = useReview((s) => s.imageHeight);
   const refreshPipeline = useLibrary((s) => s.refresh);
+  const applyPipelineSnapshot = useLibrary((s) => s.applyPipelineSnapshot);
 
   const [rect, setRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const [panning, setPanning] = useState(false);
   const [maskFrame, setMaskFrame] = useState<MaskReviewFrame | null>(null);
   const [maskLoading, setMaskLoading] = useState(false);
   const [maskUnavailable, setMaskUnavailable] = useState(false);
+  const [maskLoadError, setMaskLoadError] = useState<string | null>(null);
   const [maskStates, setMaskStates] = useState<Record<number, MaskReviewFrame>>({});
   const [drafts, setDrafts] = useState<Record<number, MaskReviewDraft>>({});
   const [visited, setVisited] = useState<Set<number>>(() => new Set());
@@ -56,6 +58,7 @@ export function ReviewView({
   const [adjustmentControlsTarget, setAdjustmentControlsTarget] = useState<HTMLElement | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const pendingReviewRef = useRef(false);
+  const navigationCommittedRef = useRef(false);
 
   const stagedReviewed = useMemo(() => {
     const reviewed = new Set(frames.filter((frame) => frame.status).map((frame) => frame.frame));
@@ -89,10 +92,12 @@ export function ReviewView({
   useEffect(() => () => void flush(), [flush]);
 
   useEffect(() => {
+    navigationCommittedRef.current = false;
     setMaskStates({});
     setDrafts({});
     setVisited(new Set());
     setCommitError(null);
+    setMaskLoadError(null);
   }, [video.video_id, segment]);
 
   useEffect(() => {
@@ -101,6 +106,7 @@ export function ReviewView({
     setMaskFrame(null);
     setMaskLoading(true);
     setMaskUnavailable(false);
+    setMaskLoadError(null);
     void api
       .maskReviewFrame(video.video_id, segment, current, exportVersion)
       .then((data) => {
@@ -110,10 +116,15 @@ export function ReviewView({
         setVisited((framesSeen) => new Set(framesSeen).add(current));
         setMaskLoading(false);
       })
-      .catch(() => {
+      .catch((exception: unknown) => {
         if (!active) return;
         setMaskFrame(null);
-        setMaskUnavailable(true);
+        if (exception instanceof ApiError && exception.code === "mask_run_unavailable") {
+          setMaskUnavailable(true);
+        } else {
+          setMaskUnavailable(false);
+          setMaskLoadError((exception as Error).message || "não foi possível carregar a máscara");
+        }
         setMaskLoading(false);
       });
     return () => {
@@ -124,7 +135,7 @@ export function ReviewView({
   const hasPendingReview = Object.keys(drafts).length > 0 || [...visited].some(
     (frame) => !maskStates[frame]?.status,
   );
-  pendingReviewRef.current = hasPendingReview;
+  pendingReviewRef.current = hasPendingReview && !navigationCommittedRef.current;
   const canLeaveReview = useCallback(
     () => !hasPendingReview || window.confirm(DISCARD_REVIEW_MESSAGE),
     [hasPendingReview],
@@ -142,6 +153,7 @@ export function ReviewView({
   useEffect(() => {
     if (!hasPendingReview) return;
     const warnBeforeClose = (event: BeforeUnloadEvent) => {
+      if (navigationCommittedRef.current) return;
       event.preventDefault();
       event.returnValue = "";
     };
@@ -249,8 +261,14 @@ export function ReviewView({
 
   const saveSegment = useCallback(async () => {
     setCommitError(null);
+    navigationCommittedRef.current = false;
+    if (maskLoadError) {
+      setCommitError("Recarregue o frame antes de salvar: " + maskLoadError);
+      return;
+    }
     if (maskUnavailable) {
       await useReview.getState().confirmRest();
+      navigationCommittedRef.current = true;
       pendingReviewRef.current = false;
       void refreshPipeline();
       onBack();
@@ -280,34 +298,51 @@ export function ReviewView({
 
     setCommitting(true);
     try {
-      if (updates.length > 0) {
-        await api.saveMaskReviewBatch(
-          video.video_id,
-          segment ?? "",
-          updates,
-          exportVersion,
-        );
-      }
-      const progress = await api.videoReview(video.video_id);
-      // setState so aparece no proximo render; a ref precisa ser zerada antes
-      // da navegacao pos-save para o guard nao pedir descarte outra vez.
-      pendingReviewRef.current = false;
+      const result = await api.saveMaskReviewBatch(
+        video.video_id,
+        segment ?? "",
+        updates,
+        exportVersion,
+      );
+
+      // O lote já foi confirmado no manifesto canônico. Um diagnóstico de
+      // certificação não pode deixar drafts antigos que causariam conflito na
+      // próxima tentativa.
       setVisited(new Set());
       setDrafts({});
-      void refreshPipeline();
-      if (progress.complete) {
-        onBack();
+      if (result.completion_error) {
+        await open(video.video_id, segment ?? "");
+        setCommitError(`Revisão salva, mas não concluída: ${result.completion_error}`);
         return;
       }
-      const next = progress.segments.find((item) => !item.complete);
-      if (next) await open(video.video_id, next.segment);
+
+      navigationCommittedRef.current = true;
+      pendingReviewRef.current = false;
+      if (result.pipeline) {
+        applyPipelineSnapshot(video.video_id, result.pipeline);
+      }
+      if (result.video.complete) {
+        onBack();
+        if (result.projection_pending) {
+          window.setTimeout(() => void refreshPipeline(), 2500);
+        } else {
+          void refreshPipeline();
+        }
+        return;
+      }
+      const next = result.video.segments.find((item) => !item.complete);
+      if (next) {
+        navigationCommittedRef.current = false;
+        await open(video.video_id, next.segment);
+      }
       else onBack();
     } catch (exception) {
+      navigationCommittedRef.current = false;
       setCommitError((exception as Error).message);
     } finally {
       setCommitting(false);
     }
-  }, [drafts, exportVersion, frameCount, maskStates, maskUnavailable, onBack, open, refreshPipeline, segment, stagedReviewed, video.video_id, visited]);
+  }, [applyPipelineSnapshot, drafts, exportVersion, frameCount, maskLoadError, maskStates, maskUnavailable, onBack, open, refreshPipeline, segment, stagedReviewed, video.video_id, visited]);
 
   const onWheel = useCallback((event: React.WheelEvent) => {
     const container = event.currentTarget.getBoundingClientRect();
@@ -417,8 +452,10 @@ export function ReviewView({
         <span className="tnum text-xs text-zinc-600">{zoom.toFixed(1)}×</span>
       </header>
 
-      {error && (
-        <div className="shrink-0 bg-red-950/60 px-4 py-1.5 text-xs text-red-300">{error}</div>
+      {(error || maskLoadError) && (
+        <div className="shrink-0 bg-red-950/60 px-4 py-1.5 text-xs text-red-300">
+          {error || maskLoadError}
+        </div>
       )}
 
       <div className="flex min-h-0 flex-1 bg-zinc-950">
@@ -437,14 +474,15 @@ export function ReviewView({
           onPointerDown={startPan}
         >
         <div
-          className="h-full w-full"
+          data-review-camera-plane
+          className="relative h-full w-full"
           style={{ transform, transformOrigin: "center center" }}
         >
           <img
             ref={imgRef}
             src={src}
             alt={`frame ${current}`}
-            className="h-full w-full object-contain"
+            className="absolute inset-0 block h-full w-full select-none object-contain"
             draggable={false}
             onLoad={measure}
           />
@@ -461,6 +499,7 @@ export function ReviewView({
                     toolControlsTarget={toolControlsTarget}
                     adjustmentControlsTarget={adjustmentControlsTarget}
                     onDraftChange={(draft) => {
+                      navigationCommittedRef.current = false;
                       setDrafts((currentDrafts) => ({ ...currentDrafts, [current]: draft }));
                     }}
                   />
@@ -549,7 +588,7 @@ export function ReviewView({
         <Button
           variant="primary"
           onClick={() => void saveSegment()}
-          disabled={committing || maskLoading}
+          disabled={committing || maskLoading || Boolean(maskLoadError)}
         >
           {committing ? "Salvando…" : "Salvar trecho"}
         </Button>

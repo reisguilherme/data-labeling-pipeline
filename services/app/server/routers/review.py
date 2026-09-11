@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -11,13 +12,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
 
-from .. import review as review_module
+from .. import durable_jobs, review as review_module
 from ..deps import current_client, current_user, get_object
 from ..locks import locks
 from ..pipeline_mutation import reserve_mutation
+from ..pipeline_state import certify_completed_review
 from ..mask_api import decode_mask_edits, serialize_frame_state
 from ..review import SegmentPaths
-from ..sam3_run_index import index_revision, index_revisions
+from ..sam3 import queue as sam3_queue
+from ..sam3_run_index import index_revision
 from ..users import User
 from ..video_fence import async_video_fence, video_fence
 from ..workspace import ObjectContext, workspace
@@ -31,6 +34,17 @@ from pipeline_core.sam3_runs import (
 )
 
 router = APIRouter(prefix="/api/objects/{object_id}", tags=["review"])
+log = logging.getLogger(__name__)
+
+
+def _mask_run_unavailable() -> HTTPException:
+    return HTTPException(
+        409,
+        {
+            "code": "mask_run_unavailable",
+            "detail": "run legado sem máscaras; reprocesse com o SAM3",
+        },
+    )
 
 
 def _review_identity(frames: dict) -> dict:
@@ -289,7 +303,9 @@ class MaskBatchFrameIn(MaskFrameIn):
 
 class MaskBatchIn(BaseModel):
     export_version: str = Field(min_length=8, max_length=128)
-    frames: list[MaskBatchFrameIn] = Field(min_length=1)
+    # Lote vazio é uma finalização idempotente: útil quando os frames já foram
+    # persistidos, mas a projeção ainda não foi promovida para Concluídos.
+    frames: list[MaskBatchFrameIn] = Field(default_factory=list)
 
 
 def _mask_url(ctx: ObjectContext, video_id: str, segment: str, frame: int, obj_id: int) -> str:
@@ -315,7 +331,7 @@ async def mask_review_state(
         if not (0 <= frame < _frame_count(paths)):
             raise HTTPException(404, "frame não existe neste segmento")
         if not (paths.out_dir / "masks").is_dir():
-            raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
+            raise _mask_run_unavailable()
         state = _mask_store(paths).get_frame(frame)
     return serialize_frame_state(
         state,
@@ -378,7 +394,7 @@ def save_mask_review(
             if not (0 <= frame < _frame_count(paths)):
                 raise HTTPException(404, "frame não existe neste segmento")
             if not (paths.out_dir / "masks").is_dir():
-                raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
+                raise _mask_run_unavailable()
             def before_commit(entry):
                 nonlocal mutation
                 mutation = reserve_mutation(ctx, video_id, "mask_review_saved", {
@@ -417,9 +433,13 @@ def save_mask_review_batch(
     user: User = Depends(current_user),
     client_id: str = Depends(current_client),
 ) -> dict:
-    """Publica a revisão humana de um trecho em uma única operação."""
+    """Confirma o lote localmente e delega índices/espelhos ao worker CPU."""
     frame_numbers = [item.frame for item in payload.frames]
     mutation = None
+    sync_frames: list[dict] = []
+    sync_review_sha256 = ""
+    certified_source = None
+    completion_error: str | None = None
     if len(set(frame_numbers)) != len(frame_numbers):
         raise HTTPException(422, "o lote contém frames duplicados")
     try:
@@ -437,49 +457,70 @@ def save_mask_review_batch(
         ]
         with _locked_export(
             ctx, video_id, client_id, payload.export_version
-        ) as (root, segments, video), ExitStack() as publication:
+        ) as (root, segments, video):
             paths = _segment_paths(root, segments, segment)
             frame_count = _frame_count(paths)
             invalid = [frame for frame in frame_numbers if frame >= frame_count]
             if invalid:
                 raise HTTPException(404, f"frame não existe neste segmento: {invalid[0]}")
             if not (paths.out_dir / "masks").is_dir():
-                raise HTTPException(409, "run legado sem mascaras; reprocesse com o SAM3")
+                raise _mask_run_unavailable()
 
             store = _mask_store(paths)
-            pending_index: list[tuple[int, dict]] = []
+            prospective: list[tuple[int, dict]] = []
 
-            def index_batch(frame: int, entry: dict) -> None:
+            def reserve_batch(frame: int, entry: dict) -> None:
                 nonlocal mutation
-                pending_index.append((frame, entry))
-                if len(pending_index) == len(updates):
+                prospective.append((frame, entry))
+                if len(prospective) == len(updates):
                     mutation = reserve_mutation(ctx, video_id, "mask_review_saved", {
                         "export_version": payload.export_version, "segment": segment,
-                        "frames": _review_identity(dict(pending_index)),
+                        "frames": _review_identity(dict(prospective)),
                     })
-                    index_revisions(
-                        object_id=ctx.object_id,
-                        relpath=video.relpath,
-                        segment_dir=paths.segment_dir,
-                        revisions=pending_index,
-                        user=user.user_id,
-                        publication_guard=publication,
-                    )
 
-            states = store.save_frames(
-                updates,
-                user=user.user_id,
-                before_commit=index_batch,
-            )
+            if updates:
+                states = store.save_frames(
+                    updates,
+                    user=user.user_id,
+                    before_commit=reserve_batch,
+                    # MinIO é réplica, não o commit da revisão. A cópia é feita
+                    # por um job durável depois que a resposta interativa sai.
+                    mirror=False,
+                )
+            else:
+                states = []
+                mutation = reserve_mutation(
+                    ctx,
+                    video_id,
+                    "mask_review_finalized",
+                    {
+                        "export_version": payload.export_version,
+                        "segment": segment,
+                        "frames": {},
+                    },
+                )
 
             import json
 
             manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+            manifest_frames = manifest.get("frames") or {}
             reviewed = sum(
                 1
-                for entry in (manifest.get("frames") or {}).values()
+                for entry in manifest_frames.values()
                 if entry.get("status") in {"ok", "edited"}
             )
+            sync_frames = [
+                {
+                    "frame": state.frame,
+                    "revision": state.revision,
+                }
+                for state in states
+            ]
+            sync_review_sha256 = hashlib.sha256(
+                store.manifest_path.read_bytes()
+            ).hexdigest()
+            names = review_module.class_names(workspace.root) if workspace.root else []
+            video_progress = review_module.progress_for(root, segments, names)
             response = {
                 "frames": [
                     {
@@ -492,12 +533,81 @@ def save_mask_review_batch(
                 "reviewed": reviewed,
                 "frame_count": frame_count,
                 "complete": reviewed >= frame_count and frame_count > 0,
+                "video": video_progress,
             }
+
+            if video_progress["complete"]:
+                try:
+                    certified_source = certify_completed_review(
+                        ctx.store.entry(video.relpath),
+                        sam3_queue.public(ctx.object_id, video.relpath),
+                        ctx.output_root,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    # O lote já está salvo. Devolver sucesso com diagnóstico
+                    # evita induzir o operador a repetir e gerar conflito 409.
+                    completion_error = str(exc)
     except RevisionConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     except (MaskValidationError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    return {**response, **mutation.complete()}
+
+    sync_job_id = None
+    if sync_frames:
+        try:
+            sync_job_id = durable_jobs.enqueue_mask_review_sync(
+                object_id=ctx.object_id,
+                video_id=video_id,
+                relpath=video.relpath,
+                segment=segment,
+                frames=sync_frames,
+                review_sha256=sync_review_sha256,
+                user=user.user_id,
+            )
+        except Exception:  # a revisão local já foi confirmada
+            log.warning(
+                "não foi possível agendar o espelho da revisão %s/%s",
+                video_id,
+                segment,
+                exc_info=True,
+            )
+
+    projection = mutation.complete() if mutation is not None else {
+        "projection_pending": False,
+        "projection_event_seq": None,
+    }
+    if projection["projection_pending"]:
+        try:
+            durable_jobs.enqueue_projection_reconciles(
+                ctx.object_id,
+                [
+                    {
+                        "video_id": video_id,
+                        "source_identity": (
+                            certified_source.identity
+                            if certified_source is not None
+                            else {
+                                "segment": segment,
+                                "review_sha256": sync_review_sha256,
+                            }
+                        ),
+                    }
+                ],
+            )
+        except Exception:
+            log.warning(
+                "não foi possível reagendar a projeção de %s",
+                video_id,
+                exc_info=True,
+            )
+    return {
+        **response,
+        **projection,
+        "pipeline": certified_source.snapshot_dict if certified_source else None,
+        "completion_error": completion_error,
+        "sync_job_id": sync_job_id,
+        "sync_pending": bool(sync_frames and sync_job_id is None),
+    }
 
 
 # --------------------------------------------------------------------------

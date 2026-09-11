@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -405,6 +407,7 @@ def _export_root(entry: dict, output_root: Path) -> Path | None:
 _SCHEMA_VERSION = 1
 _ARTIFACT_FORMAT = "png-1bit-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+REVIEW_CERTIFICATION_FILENAME = ".review-certification.json"
 
 
 @dataclass(frozen=True)
@@ -874,8 +877,108 @@ def derive_pipeline_source(
         current=current,
         resolved_root=root,
     )
+
+    # A execução antiga não possuía todos os manifestos/checksums exigidos pela
+    # arquitetura atual. Depois que uma revisão humana termina, fazemos uma
+    # auditoria profunda uma única vez e gravamos este certificado pequeno. A
+    # listagem normal continua metadata-only, mas qualquer mudança posterior no
+    # prompt, run, geração, anotação ou mask_review invalida o certificado.
+    base_source_digest = _metadata_digest(identity)
+    certificate_identity = {"state": "missing", "sha256": None}
+    certificate_valid = False
+    if root is not None:
+        certificate_identity, certificate = _manifest_identity(
+            root / REVIEW_CERTIFICATION_FILENAME
+        )
+        certificate_valid = bool(
+            certificate is not None
+            and certificate_identity.get("state") == "valid"
+            and certificate.get("schema_version") == _SCHEMA_VERSION
+            and certificate.get("kind") == "human-review-deep-audit-v1"
+            and certificate.get("source_digest") == base_source_digest
+            and certificate.get("expected_frames") == snapshot.expected_frames
+            and certificate.get("reviewed_frames") == snapshot.reviewed_frames
+            and certificate.get("edited_frames") == snapshot.edited_frames
+            and snapshot.expected_frames > 0
+            and snapshot.reviewed_frames >= snapshot.expected_frames
+            and not snapshot.inconsistencies
+            and not invalid
+        )
+    if certificate_identity.get("state") != "missing":
+        identity["review_certification"] = certificate_identity
+    if certificate_valid:
+        snapshot = replace(
+            snapshot,
+            stage="completed",
+            status="validated",
+            artifacts_valid=True,
+            validation_status="manifest",
+        )
+        audit = []
+
     snapshot = _projection_downgrade(snapshot, invalid=invalid, audit=audit)
     return PipelineSource(identity=identity, snapshot=snapshot)
+
+
+def certify_completed_review(
+    entry: dict | None,
+    sam3: dict | None,
+    output_root: Path,
+) -> PipelineSource:
+    """Certifica um vídeo totalmente revisado sem alterar máscaras ou revisões.
+
+    Runs atuais, que já têm manifesto completo, não precisam de nova leitura de
+    PNGs. Runs migrados em ``audit_required`` passam pela auditoria profunda e
+    recebem um certificado atômico ligado à identidade canônica vigente.
+    """
+
+    source = derive_pipeline_source(entry, sam3, output_root)
+    if source.snapshot.stage == "completed" and source.snapshot.artifacts_valid:
+        return source
+    if (
+        source.snapshot.expected_frames <= 0
+        or source.snapshot.reviewed_frames < source.snapshot.expected_frames
+    ):
+        raise ValueError("a revisão do vídeo ainda não está completa")
+
+    audited = audit_pipeline_entry(entry, sam3, output_root)
+    if audited.stage != "completed" or not audited.artifacts_valid:
+        detail = audited.inconsistencies[0] if audited.inconsistencies else (
+            "os artefatos SAM3 não passaram na auditoria profunda"
+        )
+        raise ValueError(detail)
+
+    raw_entry = entry if isinstance(entry, dict) else {}
+    root = _export_root(raw_entry, output_root)
+    if root is None:
+        raise ValueError("raiz do export ausente para certificar a revisão")
+
+    base_identity = {
+        key: value
+        for key, value in source.identity.items()
+        if key != "review_certification"
+    }
+    certificate = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "human-review-deep-audit-v1",
+        "source_digest": _metadata_digest(base_identity),
+        "expected_frames": audited.expected_frames,
+        "reviewed_frames": audited.reviewed_frames,
+        "edited_frames": audited.edited_frames,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    target = root / REVIEW_CERTIFICATION_FILENAME
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(
+        json.dumps(certificate, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+
+    certified = derive_pipeline_source(entry, sam3, output_root)
+    if certified.snapshot.stage != "completed" or not certified.snapshot.artifacts_valid:
+        raise RuntimeError("a certificação publicada não corresponde ao estado revisado")
+    return certified
 
 
 def inspect_pipeline_entry(

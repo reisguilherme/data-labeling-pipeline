@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import { api } from "../api/client";
 import { getObject } from "../api/scope";
-import type { PipelineStage, Status, VideoListItem } from "../api/types";
+import type {
+  PipelineProjectionSnapshot,
+  PipelineStage,
+  Status,
+  VideoListItem,
+} from "../api/types";
 
 type StatusFilter = Status | "all";
 type Sort = "name" | "mtime" | "size" | "status";
@@ -47,6 +52,7 @@ interface LibraryState {
 
   refresh: () => Promise<void>;
   refreshSam3: () => Promise<boolean>;
+  applyPipelineSnapshot: (videoId: string, snapshot: PipelineProjectionSnapshot) => void;
   rescan: () => Promise<void>;
   reset: () => void;
   setSearch: (value: string) => void;
@@ -67,6 +73,20 @@ function requestFence(): { generation: number; objectId: string | null } {
 
 function fenceIsCurrent(fence: { generation: number; objectId: string | null }): boolean {
   return fence.generation === scopeGeneration && fence.objectId === getObject();
+}
+
+function summarizePipeline(videos: VideoListItem[]): {
+  pipelineCounts: Partial<Record<PipelineStage, number>>;
+  pipelineStatusCounts: Record<string, number>;
+} {
+  const pipelineCounts: Partial<Record<PipelineStage, number>> = {};
+  const pipelineStatusCounts: Record<string, number> = {};
+  for (const video of videos) {
+    pipelineCounts[video.pipeline_stage] = (pipelineCounts[video.pipeline_stage] ?? 0) + 1;
+    const key = `${video.pipeline_stage}:${video.stage_status}`;
+    pipelineStatusCounts[key] = (pipelineStatusCounts[key] ?? 0) + 1;
+  }
+  return { pipelineCounts, pipelineStatusCounts };
 }
 
 const EMPTY_LIBRARY = {
@@ -144,6 +164,29 @@ export const useLibrary = create<LibraryState>((set, get) => ({
     } catch {
       return false;
     }
+  },
+
+  applyPipelineSnapshot: (videoId, snapshot) => {
+    set((state) => {
+      const videos = state.videos.map((video) =>
+        video.video_id !== videoId
+          ? video
+          : {
+              ...video,
+              pipeline_stage: snapshot.pipeline_stage,
+              stage_status: snapshot.stage_status,
+              stage_progress: {
+                expected_frames: snapshot.expected_frames,
+                reviewed_frames: snapshot.reviewed_frames,
+                edited_frames: snapshot.edited_frames,
+                artifacts_valid: snapshot.artifacts_valid,
+                inconsistencies: snapshot.inconsistencies,
+              },
+              projection_status: "current" as const,
+            },
+      );
+      return { videos, ...summarizePipeline(videos) };
+    });
   },
 
   rescan: async () => {

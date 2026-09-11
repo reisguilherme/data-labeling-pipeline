@@ -535,6 +535,8 @@ def _revision_transaction(
     labels = {int(item["obj_id"]): str(item["label"]) for item in prompt.get("objects") or []}
 
     with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute("SET LOCAL lock_timeout = '3000ms'")
+        cursor.execute("SET LOCAL statement_timeout = '30000ms'")
         lookup = """
             SELECT run.id, project.id
               FROM annotation_runs run

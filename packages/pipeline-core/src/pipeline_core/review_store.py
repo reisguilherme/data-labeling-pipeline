@@ -165,6 +165,7 @@ class FileMaskReviewStore:
         *,
         user: str | None = None,
         before_commit: Callable[[int, dict], None] | None = None,
+        mirror: bool = True,
     ) -> list[FrameMaskState]:
         """Valida e persiste vários frames com uma única troca do manifesto."""
         if not updates:
@@ -283,7 +284,7 @@ class FileMaskReviewStore:
             )
             os.replace(temporary_manifest, self.manifest_path)
 
-            store = MinioBlobStore.from_env()
+            store = MinioBlobStore.from_env() if mirror else None
             workspace = os.environ.get("MST_WORKSPACE")
             if store is not None and workspace:
                 for _, _, writes in prepared:

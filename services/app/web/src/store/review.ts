@@ -243,6 +243,7 @@ export const useReview = create<ReviewState>((set, get) => {
         });
       } catch (error) {
         set({ error: (error as Error).message });
+        throw error;
       }
     },
 

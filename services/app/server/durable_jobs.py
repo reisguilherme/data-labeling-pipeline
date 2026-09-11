@@ -123,6 +123,62 @@ def enqueue_projection_reconciles(object_id: str, requests: list[dict]) -> int:
         return cursor.rowcount
 
 
+def enqueue_mask_review_sync(
+    *,
+    object_id: str,
+    video_id: str,
+    relpath: str,
+    segment: str,
+    frames: list[dict],
+    review_sha256: str,
+    user: str | None,
+) -> str | None:
+    """Agenda o índice/espelho da revisão sem prender a resposta interativa."""
+
+    if not enabled() or not frames:
+        return None
+    body = {
+        "object_id": object_id,
+        "video_id": video_id,
+        "relpath": relpath,
+        "segment": segment,
+        "frames": frames,
+        "review_sha256": review_sha256,
+        "user": user,
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    key = "mask-review-sync:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    with _connect(connect_timeout=2) as connection, connection.cursor() as cursor:
+        cursor.execute("SET LOCAL lock_timeout = '750ms'")
+        cursor.execute("SET LOCAL statement_timeout = '1500ms'")
+        cursor.execute(
+            """
+            INSERT INTO jobs(kind, worker_kind, state, priority, payload, progress,
+                             idempotency_key)
+            VALUES ('mask_review_sync', 'cpu', 'queued', 60, %s::jsonb, '{}'::jsonb, %s)
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+                state='queued', payload=EXCLUDED.payload, result=NULL, error=NULL,
+                attempts=0, worker_id=NULL, lease_token=NULL, lease_expires_at=NULL,
+                cancel_requested=FALSE, progress='{}'::jsonb, started_at=NULL,
+                finished_at=NULL, updated_at=now()
+            WHERE jobs.state IN ('done','error','cancelled')
+            RETURNING id::text
+            """,
+            (json.dumps(body, ensure_ascii=False), key),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return row[0]
+        cursor.execute(
+            "SELECT id::text FROM jobs WHERE idempotency_key = %s",
+            (key,),
+        )
+        existing = cursor.fetchone()
+        return existing[0] if existing is not None else None
+
+
 def _annotation_advisory_key(object_id: str) -> int:
     digest = hashlib.blake2b(
         f"annotations:{object_id}".encode("utf-8"), digest_size=8

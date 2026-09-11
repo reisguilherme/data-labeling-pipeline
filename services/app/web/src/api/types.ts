@@ -9,6 +9,13 @@ export interface StageProgress {
   inconsistencies: string[];
 }
 
+export interface PipelineProjectionSnapshot extends StageProgress {
+  pipeline_stage: PipelineStage;
+  stage_status: string;
+  validation_status: "manifest" | "invalid" | "audit_required" | "not_applicable";
+  complete: boolean;
+}
+
 export interface FlagOption {
   id: string;
   label: string;
@@ -194,6 +201,25 @@ export interface MaskReviewBatchResult {
   reviewed: number;
   frame_count: number;
   complete: boolean;
+  video: {
+    frame_count: number;
+    reviewed: number;
+    edited: number;
+    complete: boolean;
+    segments: {
+      segment: string;
+      frame_count: number;
+      reviewed: number;
+      edited: number;
+      complete: boolean;
+    }[];
+  };
+  pipeline: PipelineProjectionSnapshot | null;
+  completion_error: string | null;
+  projection_pending: boolean;
+  projection_event_seq: number | null;
+  sync_job_id: string | null;
+  sync_pending: boolean;
 }
 
 export interface Sam3Preview {
